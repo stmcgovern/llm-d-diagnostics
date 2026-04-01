@@ -1,0 +1,16 @@
+experiment,sub,phase,timestamp,ttft_ms,total_ms,status_code,note
+exp4,4a,pre-d1,17:13:25,185.4,185.4,200,decode-1 before kill
+exp4,4a,pre-d2,17:13:26,179.1,179.1,200,decode-2 before kill
+exp4,4a,during-d2,17:13:27,156.1,156.2,200,decode-2 while decode-1 dead
+exp4,4a,during-d1,17:13:38,0.0,10002.3,000command terminated with exit code 28,decode-1 just killed
+exp4,4a,post-d1,17:15:50,989.8,989.9,200,decode-1 after recovery (130s)
+exp4,4b,pre,17:15:51,149.8,149.8,200,before prefill kill
+exp4,4b,during,17:16:02,0.0,10002.9,000command terminated with exit code 28,prefill dead
+exp4,4b,post-1,17:18:50,924.9,924.9,200,first request after prefill recovery
+exp4,4b,post-2,17:18:52,901.2,901.2,200,decode-2 after prefill recovery
+exp4,4d,2gpu-1,17:18:58,173.0,173.0,200,decode-1 only (decode-2 scaled down)
+exp4,4d,2gpu-2,17:18:59,85.7,85.8,200,decode-1 only (decode-2 scaled down)
+exp4,4d,2gpu-3,17:19:00,155.6,155.6,200,decode-1 only (decode-2 scaled down)
+exp4,4d,2gpu-4,17:19:00,147.3,147.3,200,decode-1 only (decode-2 scaled down)
+exp4,4d,2gpu-5,17:19:01,148.1,148.2,200,decode-1 only (decode-2 scaled down)
+exp4,4d,restored,17:21:38,929.6,929.6,200,decode-2 after scale-up (156s)

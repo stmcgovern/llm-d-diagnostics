@@ -1,0 +1,72 @@
+{
+  "toolkit": {
+    "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "namespace": "smcgover",
+    "sim_mode": false,
+    "baseline_url": "http://vllm-prefill-svc:8100/v1/completions",
+    "disagg_d1_url": "https://vllm-decode-svc:8000/v1/completions",
+    "disagg_d2_url": "https://vllm-decode-2-svc:8000/v1/completions",
+    "prefill_host": "vllm-prefill-svc.smcgover.svc.cluster.local:8100",
+    "warmup": 3,
+    "runs": 20,
+    "max_tokens": 20,
+    "data_dir": "/opt/toolkit/data",
+    "python_version": "3.12.13",
+    "platform": "Linux-5.14.0-570.86.1.el9_6.x86_64-x86_64-with"
+  },
+  "experiments": {
+    "exp1": {
+      "started_at": "2026-04-01T17:00:00+0000",
+      "prompt_lengths": [10, 50, 100, 500, 1000],
+      "runs": 20,
+      "note": "metadata reconstructed from CSV"
+    },
+    "exp1b": {
+      "started_at": "2026-04-01T17:10:00+0000",
+      "prompt_tokens": 50,
+      "runs": 30,
+      "note": "metadata reconstructed from CSV"
+    },
+    "exp2": {
+      "started_at": "2026-04-01T17:20:00+0000",
+      "concurrency_levels": [1, 2, 4, 8, 16],
+      "runs": 20,
+      "note": "metadata reconstructed from CSV"
+    },
+    "exp3": {
+      "started_at": "2026-04-01T17:30:00+0000",
+      "trials": 10,
+      "heavy_prompt_tokens": 1000,
+      "light_prompt_tokens": 10,
+      "note": "metadata reconstructed from CSV"
+    },
+    "exp4": {
+      "started_at": "2026-04-01T17:40:00+0000",
+      "sub_experiments": ["4a", "4b", "4d"],
+      "note": "metadata reconstructed from CSV"
+    },
+    "exp5": {
+      "started_at": "2026-04-02T03:16:00+0000",
+      "sweep_lengths": [10, 50, 100, 250, 500, 1000, 2000],
+      "runs": 30
+    },
+    "exp6": {
+      "started_at": "2026-04-02T03:32:47+0000",
+      "qps_levels": [1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0],
+      "duration_s": 30,
+      "prompt_tokens": 50,
+      "slo_mult": 2.0
+    },
+    "exp7": {
+      "started_at": "2026-04-02T03:29:29+0000",
+      "qps": 4.0,
+      "duration_s": 60,
+      "short_tokens": 10,
+      "long_tokens": 500,
+      "short_max": 20,
+      "long_max": 50,
+      "long_pct": 20,
+      "gpu_sample_interval": 2.0
+    }
+  }
+}

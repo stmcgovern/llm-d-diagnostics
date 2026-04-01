@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-decode-direct-svc
+  labels:
+    app: vllm-decode
+    app.kubernetes.io/part-of: vllm-disagg
+spec:
+  clusterIP: None
+  selector:
+    app: vllm-decode
+  ports:
+  - name: vllm
+    port: 8001
+    targetPort: 8001
+    protocol: TCP

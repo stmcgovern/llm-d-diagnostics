@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.claude/*
+!.claude/skills/
+!.claude/CLAUDE.md
+**/exp4-logs/
+**/run-info.json

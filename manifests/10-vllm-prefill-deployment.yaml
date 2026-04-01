@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-prefill
+  labels:
+    app: vllm-prefill
+    app.kubernetes.io/part-of: vllm-disagg
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-prefill
+  template:
+    metadata:
+      labels:
+        app: vllm-prefill
+        app.kubernetes.io/part-of: vllm-disagg
+    spec:
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.18.1
+        command:
+        - python3
+        - -m
+        - vllm.entrypoints.openai.api_server
+        args:
+        - --model
+        - TinyLlama/TinyLlama-1.1B-Chat-v1.0
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "8100"
+        - --dtype
+        - float16
+        - --gpu-memory-utilization
+        - "0.8"
+        - --max-model-len
+        - "2048"
+        - --trust-remote-code
+        - --kv-transfer-config
+        - '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'
+        env:
+        - name: HF_HOME
+          value: /model-cache/hf-cache
+        - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        ports:
+        - containerPort: 8100
+          name: http
+          protocol: TCP
+        - containerPort: 5600
+          name: nixl
+          protocol: TCP
+        resources:
+          requests:
+            cpu: "4"
+            memory: 16Gi
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "4"
+            memory: 16Gi
+            nvidia.com/gpu: "1"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8100
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8100
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 5
+        volumeMounts:
+        - name: model-cache
+          mountPath: /model-cache
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: model-cache
+      - name: dshm
+        emptyDir:
+          medium: Memory
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app.kubernetes.io/part-of
+                  operator: In
+                  values:
+                  - vllm-disagg
+              topologyKey: kubernetes.io/hostname
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30

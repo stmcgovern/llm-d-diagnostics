@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""
+Experiment 2: Throughput Under Load
+
+Measures how throughput scales with concurrency. Uses ThreadPoolExecutor
+for precise wall-clock timing of concurrent batches.
+
+Configs:
+    BASELINE:  all requests to prefill vLLM (1 GPU)
+    DISAGG-1D: all requests through decode-1 sidecar (2 GPUs)
+    DISAGG-2D: round-robin decode-1 and decode-2 (3 GPUs)
+
+Usage: python3 /scripts/toolkit/exp2_throughput.py
+
+Additional env vars:
+    CONCURRENCY_LEVELS   Comma-separated (default: 1,2,4,8,16)
+    TOTAL_REQUESTS       Requests per config per concurrency (default: 20)
+"""
+
+import os
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(__file__))
+from client import (
+    BASELINE_URL, DISAGG_D1_URL, DISAGG_D2_URL, MODEL,
+    WARMUP, DATA_DIR, PREFILL_HOST,
+    build_prompt, send_request, CSVWriter,
+    progress, dot, print_config, env, write_run_info,
+)
+
+TOTAL_REQUESTS = int(env("TOTAL_REQUESTS", "20"))
+MAX_TOKENS = int(env("MAX_TOKENS", "30"))
+CONCURRENCY_LEVELS = [int(x) for x in env("CONCURRENCY_LEVELS", "1,2,4,8,16").split(",")]
+
+PROMPT_TOKENS = int(env("PROMPT_TOKENS", "50"))
+PROMPT = build_prompt(PROMPT_TOKENS)
+
+DISAGG_HEADERS = {"x-prefiller-host-port": PREFILL_HOST}
+
+FIELDS = [
+    "experiment", "config", "run", "concurrency",
+    "ttft_ms", "total_ms", "status_code", "target", "error",
+]
+
+
+def send_one(url, headers, tag):
+    """Worker function for thread pool."""
+    r = send_request(url, PROMPT, MAX_TOKENS, extra_headers=headers)
+    return r, tag
+
+
+def main():
+    outfile = os.path.join(DATA_DIR, "exp2-results.csv")
+    write_run_info("exp2", {"concurrency_levels": CONCURRENCY_LEVELS,
+                            "total_requests": TOTAL_REQUESTS,
+                            "prompt_tokens": PROMPT_TOKENS})
+    writer = CSVWriter(outfile, FIELDS)
+
+    progress("=== Experiment 2: Throughput Under Load ===")
+    print_config()
+    progress(f"  Concurrency levels: {CONCURRENCY_LEVELS}")
+    progress(f"  Requests per config: {TOTAL_REQUESTS}")
+    progress(f"  Output: {outfile}")
+    progress("")
+
+    for concurrency in CONCURRENCY_LEVELS:
+        progress(f"--- Concurrency: {concurrency} ---")
+
+        for config_name in ["BASELINE", "DISAGG-1D", "DISAGG-2D"]:
+            progress(f"  {config_name}: ", end="")
+
+            # Warm-up (sequential, exercise all endpoints)
+            for i in range(WARMUP):
+                if config_name == "BASELINE":
+                    send_request(BASELINE_URL, PROMPT, MAX_TOKENS)
+                elif config_name == "DISAGG-2D" and i % 2 == 1:
+                    send_request(DISAGG_D2_URL, PROMPT, MAX_TOKENS,
+                                 extra_headers=DISAGG_HEADERS)
+                else:
+                    send_request(DISAGG_D1_URL, PROMPT, MAX_TOKENS,
+                                 extra_headers=DISAGG_HEADERS)
+
+            # Measured runs in batches of `concurrency`
+            wall_start = time.monotonic()
+            run = 0
+
+            while run < TOTAL_REQUESTS:
+                batch_size = min(concurrency, TOTAL_REQUESTS - run)
+                futures = []
+
+                with ThreadPoolExecutor(max_workers=batch_size) as pool:
+                    for i in range(batch_size):
+                        run += 1
+                        run_num = run  # capture current value for this future
+                        if config_name == "BASELINE":
+                            f = pool.submit(send_one, BASELINE_URL, None, "d1")
+                        elif config_name == "DISAGG-1D":
+                            f = pool.submit(send_one, DISAGG_D1_URL,
+                                            DISAGG_HEADERS, "d1")
+                        else:  # DISAGG-2D: round-robin
+                            if run % 2 == 1:
+                                f = pool.submit(send_one, DISAGG_D1_URL,
+                                                DISAGG_HEADERS, "d1")
+                            else:
+                                f = pool.submit(send_one, DISAGG_D2_URL,
+                                                DISAGG_HEADERS, "d2")
+                        futures.append((f, run_num))
+
+                    for future, run_num in futures:
+                        r, tag = future.result()
+                        writer.write({
+                            "experiment": "exp2",
+                            "config": config_name,
+                            "run": run_num,
+                            "concurrency": concurrency,
+                            "ttft_ms": r.ttft_ms,
+                            "total_ms": r.total_ms,
+                            "status_code": r.status,
+                            "target": tag,
+                            "error": r.error,
+                        })
+
+                dot()
+
+            wall_s = time.monotonic() - wall_start
+            throughput = TOTAL_REQUESTS / wall_s
+
+            progress(f" {wall_s:.1f}s | {throughput:.1f} req/s")
+
+        progress("")
+
+    writer.close()
+    progress(f"=== Experiment 2 Complete === ({outfile})")
+
+
+if __name__ == "__main__":
+    main()

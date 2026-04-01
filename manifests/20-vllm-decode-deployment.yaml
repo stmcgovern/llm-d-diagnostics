@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-decode
+  labels:
+    app: vllm-decode
+    app.kubernetes.io/part-of: vllm-disagg
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-decode
+  template:
+    metadata:
+      labels:
+        app: vllm-decode
+        app.kubernetes.io/part-of: vllm-disagg
+    spec:
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.18.1
+        command:
+        - python3
+        - -m
+        - vllm.entrypoints.openai.api_server
+        args:
+        - --model
+        - TinyLlama/TinyLlama-1.1B-Chat-v1.0
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "8001"
+        - --dtype
+        - float16
+        - --gpu-memory-utilization
+        - "0.8"
+        - --max-model-len
+        - "2048"
+        - --trust-remote-code
+        - --kv-transfer-config
+        - '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'
+        env:
+        - name: HF_HOME
+          value: /model-cache/hf-cache
+        ports:
+        - containerPort: 8001
+          name: vllm
+          protocol: TCP
+        resources:
+          requests:
+            cpu: "4"
+            memory: 16Gi
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "4"
+            memory: 16Gi
+            nvidia.com/gpu: "1"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 5
+        volumeMounts:
+        - name: model-cache
+          mountPath: /model-cache
+        - name: dshm
+          mountPath: /dev/shm
+      - name: routing-sidecar
+        image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.6.1
+        args:
+        - "-port=8000"
+        - "-vllm-port=8001"
+        - "-connector=nixlv2"
+        - "-enable-ssrf-protection=false"
+        ports:
+        - containerPort: 8000
+          name: https
+          protocol: TCP
+        resources:
+          requests:
+            cpu: "100m"
+            memory: 128Mi
+          limits:
+            cpu: "500m"
+            memory: 256Mi
+        readinessProbe:
+          httpGet:
+            path: /v1/models
+            port: 8000
+            scheme: HTTPS
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: model-cache
+      - name: dshm
+        emptyDir:
+          medium: Memory
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app.kubernetes.io/part-of
+                  operator: In
+                  values:
+                  - vllm-disagg
+              topologyKey: kubernetes.io/hostname
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30

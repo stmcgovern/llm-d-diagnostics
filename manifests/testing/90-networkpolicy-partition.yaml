@@ -1,0 +1,62 @@
+## Network partition test: blocks all traffic between prefill and decode pods.
+## Apply:  oc apply -f 90-networkpolicy-partition.yaml
+## Remove: oc delete -f 90-networkpolicy-partition.yaml
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: block-prefill-to-decode
+spec:
+  podSelector:
+    matchLabels:
+      app: vllm-prefill
+  policyTypes:
+  - Egress
+  egress:
+  # Allow DNS
+  - to: []
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+  # Allow everything EXCEPT decode pods
+  - to:
+    - podSelector:
+        matchExpressions:
+        - key: app
+          operator: NotIn
+          values:
+          - vllm-decode
+          - vllm-decode-2
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: block-decode-to-prefill
+spec:
+  podSelector:
+    matchExpressions:
+    - key: app
+      operator: In
+      values:
+      - vllm-decode
+      - vllm-decode-2
+  policyTypes:
+  - Egress
+  egress:
+  # Allow DNS
+  - to: []
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+  # Allow everything EXCEPT prefill pods
+  - to:
+    - podSelector:
+        matchExpressions:
+        - key: app
+          operator: NotIn
+          values:
+          - vllm-prefill
