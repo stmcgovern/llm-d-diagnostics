@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vllm-prefill-pdb
+  labels:
+    app.kubernetes.io/part-of: vllm-disagg
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: vllm-prefill

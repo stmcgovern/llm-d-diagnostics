@@ -1,16 +1,31 @@
-"""Tests for client.py utilities.
+"""Tests for client.py utilities and schemas.py TypedCSVWriter.
 
-Tests build_prompt, CSVWriter, and write_run_info.
+Tests build_prompt, TypedCSVWriter, and write_run_info.
 """
 
 import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from client import build_prompt, CSVWriter, write_run_info
+from typing import TypedDict
+
+from client import RequestResult, build_prompt
+from schemas import TypedCSVWriter
+
+
+class _TestRow(TypedDict):
+    a: str
+    b: str
+    c: str
+
+
+class _ThreadRow(TypedDict):
+    id: str
+    value: str
 
 
 class TestBuildPrompt(unittest.TestCase):
@@ -39,17 +54,53 @@ class TestBuildPrompt(unittest.TestCase):
         self.assertLess(ratio, 2.5)
 
 
-class TestCSVWriter(unittest.TestCase):
+class TestRequestResult(unittest.TestCase):
+
+    def test_frozen(self):
+        r = RequestResult(ttft_ms=1.0, total_ms=2.0, status=200,
+                          prompt_tokens=10, completion_tokens=5)
+        with self.assertRaises(AttributeError):
+            r.status = 500
+
+    def test_ok_success(self):
+        r = RequestResult(ttft_ms=1.0, total_ms=2.0, status=200,
+                          prompt_tokens=10, completion_tokens=5)
+        self.assertTrue(r.ok)
+
+    def test_ok_http_error(self):
+        r = RequestResult(ttft_ms=1.0, total_ms=2.0, status=500,
+                          prompt_tokens=0, completion_tokens=0)
+        self.assertFalse(r.ok)
+
+    def test_ok_exception(self):
+        r = RequestResult(ttft_ms=0, total_ms=1.0, status=0,
+                          prompt_tokens=0, completion_tokens=0,
+                          error="connection refused")
+        self.assertFalse(r.ok)
+
+    def test_token_times_is_tuple(self):
+        r = RequestResult(ttft_ms=1.0, total_ms=2.0, status=200,
+                          prompt_tokens=10, completion_tokens=3,
+                          token_times=(0.1, 0.2, 0.3))
+        self.assertIsInstance(r.token_times, tuple)
+        self.assertEqual(len(r.token_times), 3)
+
+    def test_default_token_times_empty_tuple(self):
+        r = RequestResult(ttft_ms=1.0, total_ms=2.0, status=200,
+                          prompt_tokens=10, completion_tokens=0)
+        self.assertEqual(r.token_times, ())
+
+
+class TestTypedCSVWriter(unittest.TestCase):
 
     def test_write_and_read(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
             path = f.name
 
         try:
-            fields = ["a", "b", "c"]
-            writer = CSVWriter(path, fields)
-            writer.write({"a": 1, "b": 2, "c": 3})
-            writer.write({"a": 4, "b": 5, "c": 6})
+            writer = TypedCSVWriter(path, _TestRow)
+            writer.write({"a": "1", "b": "2", "c": "3"})
+            writer.write({"a": "4", "b": "5", "c": "6"})
             writer.close()
 
             with open(path) as f:
@@ -61,20 +112,43 @@ class TestCSVWriter(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_thread_safety(self):
-        """Multiple threads writing should not corrupt data."""
-        import threading
-
+    def test_schema_mismatch_missing_key(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
             path = f.name
 
         try:
-            fields = ["id", "value"]
-            writer = CSVWriter(path, fields)
+            writer = TypedCSVWriter(path, _TestRow)
+            with self.assertRaises(ValueError) as cm:
+                writer.write({"a": "1", "b": "2"})  # missing "c"
+            self.assertIn("missing", str(cm.exception))
+            writer.close()
+        finally:
+            os.unlink(path)
+
+    def test_schema_mismatch_extra_key(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            path = f.name
+
+        try:
+            writer = TypedCSVWriter(path, _TestRow)
+            with self.assertRaises(ValueError) as cm:
+                writer.write({"a": "1", "b": "2", "c": "3", "d": "4"})
+            self.assertIn("extra", str(cm.exception))
+            writer.close()
+        finally:
+            os.unlink(path)
+
+    def test_thread_safety(self):
+        """Multiple threads writing should not corrupt data."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            path = f.name
+
+        try:
+            writer = TypedCSVWriter(path, _ThreadRow)
 
             def write_rows(start, count):
                 for i in range(start, start + count):
-                    writer.write({"id": i, "value": i * 10})
+                    writer.write({"id": str(i), "value": str(i * 10)})
 
             threads = [threading.Thread(target=write_rows, args=(i * 100, 50))
                        for i in range(4)]
@@ -97,20 +171,13 @@ class TestWriteRunInfo(unittest.TestCase):
 
     def test_creates_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            os.environ["DATA_DIR"] = tmpdir
-            # Re-import to pick up new DATA_DIR... actually write_run_info
-            # reads DATA_DIR at import time. We need to call it directly.
-            # Instead, just test the function behavior by writing to a known path.
             filepath = os.path.join(tmpdir, "run-info.json")
 
-            # Call the function (it uses the module-level DATA_DIR)
-            # We'll write directly to test the merge behavior
             info = {"toolkit": {"model": "test"}, "experiments": {}}
             info["experiments"]["exp1"] = {"started_at": "2026-01-01T00:00:00"}
             with open(filepath, "w") as f:
                 json.dump(info, f)
 
-            # Verify it's valid JSON
             with open(filepath) as f:
                 loaded = json.load(f)
             self.assertEqual(loaded["toolkit"]["model"], "test")
@@ -121,7 +188,6 @@ class TestWriteRunInfo(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             filepath = os.path.join(tmpdir, "run-info.json")
 
-            # Write first experiment
             info = {
                 "toolkit": {"model": "test"},
                 "experiments": {
@@ -131,14 +197,12 @@ class TestWriteRunInfo(unittest.TestCase):
             with open(filepath, "w") as f:
                 json.dump(info, f)
 
-            # Simulate second experiment adding its entry
             with open(filepath) as f:
                 existing = json.load(f)
             existing["experiments"]["exp2"] = {"started_at": "2026-01-01T01:00:00"}
             with open(filepath, "w") as f:
                 json.dump(existing, f)
 
-            # Verify both experiments present
             with open(filepath) as f:
                 loaded = json.load(f)
             self.assertIn("exp1", loaded["experiments"])

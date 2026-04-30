@@ -26,8 +26,8 @@ Workload mix (configurable):
     20% long prompts  (500 tokens, 50 max output)
 
 Usage:
-    python3 scripts/toolkit/exp7_mixed_workload.py
-    QPS=4 DURATION_S=60 python3 scripts/toolkit/exp7_mixed_workload.py
+    python3 toolkit/exp7_mixed_workload.py
+    QPS=4 DURATION_S=60 python3 toolkit/exp7_mixed_workload.py
 
 Additional env vars:
     QPS             Target arrival rate (default: 4)
@@ -44,16 +44,35 @@ import math
 import os
 import random
 import sys
-import time
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(__file__))
 from client import (
-    BASELINE_URL, DISAGG_D1_URL, DISAGG_D2_URL, MODEL,
-    WARMUP, DATA_DIR, PREFILL_HOST,
-    build_prompt, send_streaming, send_request, CSVWriter,
-    progress, dot, print_config, env, write_run_info,
+    BASELINE_URL,
+    DATA_DIR,
+    DISAGG_D1_URL,
+    DISAGG_D2_URL,
+    PREFILL_HOST,
+    WARMUP,
+    build_prompt,
+    dot,
+    env,
+    print_config,
+    progress,
+    send_request,
+    send_streaming,
+    write_run_info,
+)
+from schemas import (
+    ConfigMixed,
+    Exp7GpuRow,
+    Exp7Row,
+    Priority,
+    TypedCSVWriter,
+    WorkloadClass,
+    priority_for,
 )
 
 QPS = float(env("QPS", "4"))
@@ -69,19 +88,6 @@ SHORT_PROMPT = build_prompt(SHORT_TOKENS)
 LONG_PROMPT = build_prompt(LONG_TOKENS)
 DISAGG_HEADERS = {"x-prefiller-host-port": PREFILL_HOST}
 
-FIELDS = [
-    "experiment", "config", "seq", "workload_class",
-    "prompt_tokens_target", "max_tokens",
-    "ttft_ms", "total_ms", "itl_mean_ms", "itl_p99_ms",
-    "status_code", "completion_tokens",
-    "scheduled_at_s", "depart_delay_ms",
-    "error",
-]
-
-GPU_FIELDS = [
-    "experiment", "config", "sample_time_s",
-    "gpu_index", "gpu_util_pct", "mem_util_pct",
-]
 
 
 def poisson_intervals(rate, duration_s, seed=None):
@@ -105,22 +111,23 @@ def poisson_intervals(rate, duration_s, seed=None):
 def pick_workload(seq, long_pct):
     """Deterministic workload assignment based on sequence number.
 
-    Uses a deterministic pattern rather than random sampling so that
-    the workload mix is reproducible. Exact when long_pct divides 100
-    evenly (e.g., 10, 20, 25, 50); approximate otherwise.
+    Uses a 100-element cycle: the first `long_pct` positions in each
+    cycle are "long", the rest are "short". This gives exact percentages
+    for any integer long_pct in [0, 100] and avoids confounding with
+    round-robin URL selection (which uses seq % 2).
     """
-    # Every 100/long_pct requests, one is long
     if long_pct <= 0:
-        return "short"
-    period = max(1, 100 // long_pct)
-    return "long" if seq % period == 0 else "short"
+        return WorkloadClass.SHORT
+    if long_pct >= 100:
+        return WorkloadClass.LONG
+    return WorkloadClass.LONG if (seq % 100) < long_pct else WorkloadClass.SHORT
 
 
 def compute_itl(token_times):
     """Compute inter-token latency statistics from token_times.
 
     Args:
-        token_times: list of timestamps (seconds from request start)
+        token_times: sequence of monotonic timestamps (seconds from request start)
     Returns:
         (itl_mean_ms, itl_p99_ms) or (0, 0) if insufficient tokens.
     """
@@ -147,16 +154,15 @@ def run_config(config_name, writer, gpu_writer):
     max_workers = min(max(int(QPS * 8), 16), 128)
 
     def pick_url(seq):
-        if config_name == "BASELINE":
+        if config_name == ConfigMixed.BASELINE:
             return BASELINE_URL
         return DISAGG_D1_URL if seq % 2 == 1 else DISAGG_D2_URL
 
     def headers():
-        return None if config_name == "BASELINE" else DISAGG_HEADERS
+        return None if config_name == ConfigMixed.BASELINE else DISAGG_HEADERS
 
     # GPU utilization sampler (runs in background thread)
     gpu_stop = threading.Event()
-    gpu_data = []
 
     def sample_gpu():
         """Sample GPU utilization via nvidia-smi.
@@ -199,8 +205,8 @@ def run_config(config_name, writer, gpu_writer):
 
     def do_request(scheduled_time, seq):
         wl = pick_workload(seq, LONG_PCT)
-        prompt = LONG_PROMPT if wl == "long" else SHORT_PROMPT
-        max_tok = LONG_MAX if wl == "long" else SHORT_MAX
+        prompt = LONG_PROMPT if wl == WorkloadClass.LONG else SHORT_PROMPT
+        max_tok = LONG_MAX if wl == WorkloadClass.LONG else SHORT_MAX
         url = pick_url(seq)
 
         # Wait until scheduled departure
@@ -215,13 +221,17 @@ def run_config(config_name, writer, gpu_writer):
 
         itl_mean, itl_p99 = compute_itl(r.token_times)
 
+        priority = priority_for(wl)
+
         row = {
             "experiment": "exp7",
             "config": config_name,
             "seq": seq,
             "workload_class": wl,
-            "prompt_tokens_target": LONG_TOKENS if wl == "long" else SHORT_TOKENS,
+            "priority": priority,
+            "prompt_tokens_target": LONG_TOKENS if wl == WorkloadClass.LONG else SHORT_TOKENS,
             "max_tokens": max_tok,
+            "pod": "service-lb",
             "ttft_ms": r.ttft_ms,
             "total_ms": r.total_ms,
             "itl_mean_ms": itl_mean,
@@ -236,7 +246,7 @@ def run_config(config_name, writer, gpu_writer):
         dot()
 
         with results_lock:
-            all_results.append((wl, r))
+            all_results.append((wl, priority, r))
 
         return r
 
@@ -274,31 +284,23 @@ def run_config(config_name, writer, gpu_writer):
     gpu_thread.join(timeout=5)
 
     # Summary
-    ok = sum(1 for wl, r in all_results if r.status == 200)
-    short_results = [r for wl, r in all_results if wl == "short" and r.status == 200]
-    long_results = [r for wl, r in all_results if wl == "long" and r.status == 200]
+    ok = sum(1 for wl, pri, r in all_results if r.status == 200)
+    high_results = [r for wl, pri, r in all_results if pri == Priority.HIGH and r.status == 200]
+    low_results = [r for wl, pri, r in all_results if pri == Priority.LOW and r.status == 200]
 
     progress(f" {ok}/{len(all_results)} OK (actual {actual_qps:.1f} req/s)")
 
-    if short_results:
-        short_itls = [compute_itl(r.token_times)[0] for r in short_results
-                      if len(r.token_times) >= 2]
-        short_ttfts = [r.ttft_ms for r in short_results]
-        if short_itls:
-            mean_itl = sum(short_itls) / len(short_itls)
-            progress(f"    Short: n={len(short_results)}, "
-                     f"TTFT p50={sorted(short_ttfts)[len(short_ttfts)//2]:.0f}ms, "
-                     f"ITL mean={mean_itl:.1f}ms")
-
-    if long_results:
-        long_itls = [compute_itl(r.token_times)[0] for r in long_results
-                     if len(r.token_times) >= 2]
-        long_ttfts = [r.ttft_ms for r in long_results]
-        if long_itls:
-            mean_itl = sum(long_itls) / len(long_itls)
-            progress(f"    Long:  n={len(long_results)}, "
-                     f"TTFT p50={sorted(long_ttfts)[len(long_ttfts)//2]:.0f}ms, "
-                     f"ITL mean={mean_itl:.1f}ms")
+    for label, results in [("High priority (short)", high_results),
+                           ("Low priority (long)", low_results)]:
+        if results:
+            itls = [compute_itl(r.token_times)[0] for r in results
+                    if len(r.token_times) >= 2]
+            ttfts = [r.ttft_ms for r in results]
+            if itls:
+                mean_itl = sum(itls) / len(itls)
+                progress(f"    {label}: n={len(results)}, "
+                         f"TTFT p50={sorted(ttfts)[len(ttfts)//2]:.0f}ms, "
+                         f"ITL mean={mean_itl:.1f}ms")
 
 
 def main():
@@ -311,8 +313,8 @@ def main():
         "long_pct": LONG_PCT,
         "gpu_sample_interval": GPU_SAMPLE_INTERVAL,
     })
-    writer = CSVWriter(outfile, FIELDS)
-    gpu_writer = CSVWriter(gpu_file, GPU_FIELDS)
+    writer = TypedCSVWriter(outfile, Exp7Row)
+    gpu_writer = TypedCSVWriter(gpu_file, Exp7GpuRow)
 
     progress("=== Experiment 7: Mixed Workload ===")
     print_config()
@@ -325,8 +327,8 @@ def main():
     progress("")
 
     configs = [
-        ("BASELINE",  "monolithic vLLM"),
-        ("DISAGG-2D", "disaggregated, 2 decode replicas"),
+        (ConfigMixed.BASELINE,  "monolithic vLLM"),
+        (ConfigMixed.DISAGG_2D, "disaggregated, 2 decode replicas"),
     ]
 
     for config_name, desc in configs:

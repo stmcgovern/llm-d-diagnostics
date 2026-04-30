@@ -63,7 +63,7 @@ spec:
         - "-port=8000"
         - "-vllm-port=8001"
         - "-connector=nixlv2"
-        - "-enable-ssrf-protection=false"
+        - "-enable-ssrf-protection=true"
         - "-secure-proxy=false"
         ports:
         - containerPort: 8000

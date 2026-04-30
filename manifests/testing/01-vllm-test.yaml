@@ -6,6 +6,8 @@ metadata:
     app: vllm-test
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: vllm-test
@@ -23,21 +25,24 @@ spec:
         - vllm.entrypoints.openai.api_server
         args:
         - --model
-        - TinyLlama/TinyLlama-1.1B-Chat-v1.0
+        - $(MODEL_NAME)
         - --host
         - "0.0.0.0"
         - --port
         - "8000"
         - --dtype
-        - float16
+        - $(DTYPE)
         - --gpu-memory-utilization
-        - "0.8"
+        - $(GPU_MEMORY_UTILIZATION)
         - --max-model-len
-        - "2048"
+        - $(MAX_MODEL_LEN)
         - --trust-remote-code
         env:
         - name: HF_HOME
           value: /model-cache/hf-cache
+        envFrom:
+        - configMapRef:
+            name: vllm-model-config
         ports:
         - containerPort: 8000
           name: http

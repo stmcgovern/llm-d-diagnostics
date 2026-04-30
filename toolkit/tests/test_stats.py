@@ -10,7 +10,17 @@ import unittest
 
 # Import from parent directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from analyze import stats, _t95, _T95, validate_completeness, safe_float, safe_int
+from analyze import (
+    _T95,
+    _t95,
+    compare_error_rates,
+    mann_whitney_u,
+    safe_float,
+    safe_int,
+    sample_adequacy,
+    stats,
+    validate_completeness,
+)
 
 
 class TestTDistributionTable(unittest.TestCase):
@@ -65,7 +75,10 @@ class TestStats(unittest.TestCase):
         self.assertEqual(s["n"], 1)
         self.assertAlmostEqual(s["median"], 5.0, places=1)
         self.assertAlmostEqual(s["mean"], 5.0, places=1)
-        self.assertEqual(s["std"], 0)
+        # With n=1, std and CI are undefined (reported as inf)
+        self.assertEqual(s["std"], float('inf'))
+        self.assertEqual(s["ci95_lo"], float('-inf'))
+        self.assertEqual(s["ci95_hi"], float('inf'))
 
     def test_known_dataset(self):
         """Test against hand-calculated values.
@@ -188,6 +201,120 @@ class TestValidateCompleteness(unittest.TestCase):
         ]
         warnings = validate_completeness(rows, ["config", "concurrency"])
         self.assertTrue(len(warnings) > 0)
+
+
+class TestStatsOutliersAndCV(unittest.TestCase):
+    """Verify new stats() fields: outliers, cv."""
+
+    def test_no_outliers_uniform(self):
+        s = stats([float(i) for i in range(20)])
+        self.assertEqual(s["outliers"], 0)
+
+    def test_outlier_detected(self):
+        # 19 values near 100, one extreme value at 1000
+        data = [100.0] * 19 + [1000.0]
+        s = stats(data)
+        self.assertGreater(s["outliers"], 0)
+
+    def test_cv_precise_measurement(self):
+        # Very tight distribution: CV should be low
+        data = [100.0, 100.1, 99.9, 100.0, 100.2]
+        s = stats(data)
+        self.assertLess(s["cv"], 0.01)
+
+    def test_cv_noisy_measurement(self):
+        # Wide distribution: CV should be high
+        data = [10.0, 50.0, 100.0, 200.0, 500.0]
+        s = stats(data)
+        self.assertGreater(s["cv"], 0.5)
+
+    def test_cv_single_value(self):
+        s = stats([42.0])
+        self.assertEqual(s["cv"], float('inf'))
+
+
+class TestMannWhitneyU(unittest.TestCase):
+    """Verify Mann-Whitney U rank-sum test."""
+
+    def test_identical_samples(self):
+        x = [1.0, 2.0, 3.0, 4.0, 5.0]
+        result = mann_whitney_u(x, x)
+        self.assertIsNotNone(result)
+        _, _, p, _ = result
+        self.assertGreater(p, 0.05)  # not significant
+
+    def test_clearly_different_samples(self):
+        x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        y = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0]
+        result = mann_whitney_u(x, y)
+        self.assertIsNotNone(result)
+        _, _, p, r_eff = result
+        self.assertLess(p, 0.01)  # highly significant
+        self.assertGreater(r_eff, 0.3)  # large effect
+
+    def test_too_few_samples(self):
+        result = mann_whitney_u([1.0, 2.0], [3.0, 4.0])
+        self.assertIsNone(result)
+
+    def test_effect_size_range(self):
+        x = list(range(20))
+        y = [v + 0.5 for v in range(20)]  # slight shift
+        result = mann_whitney_u(x, y)
+        self.assertIsNotNone(result)
+        _, _, _, r_eff = result
+        self.assertGreaterEqual(r_eff, 0.0)
+        self.assertLessEqual(r_eff, 1.0)
+
+
+class TestSampleAdequacy(unittest.TestCase):
+    """Verify sample adequacy warnings."""
+
+    def test_n_3_warns(self):
+        warnings = sample_adequacy(3)
+        self.assertTrue(any("too few" in w for w in warnings))
+
+    def test_n_50_warns_p99(self):
+        warnings = sample_adequacy(50)
+        self.assertTrue(any("p99" in w for w in warnings))
+
+    def test_n_200_no_p99_warning(self):
+        warnings = sample_adequacy(200)
+        self.assertFalse(any("p99" in w for w in warnings))
+
+    def test_context_prefix(self):
+        warnings = sample_adequacy(3, context="BASELINE/50tok")
+        self.assertTrue(any("BASELINE/50tok" in w for w in warnings))
+
+
+class TestCompareErrorRates(unittest.TestCase):
+    """Verify error rate comparison and survivorship bias detection."""
+
+    def test_equal_rates_no_warning(self):
+        rows = [
+            {"config": "A", "status_code": "200"},
+            {"config": "A", "status_code": "200"},
+            {"config": "B", "status_code": "200"},
+            {"config": "B", "status_code": "200"},
+        ]
+        rates, warning = compare_error_rates(rows)
+        self.assertAlmostEqual(rates["A"], 0.0)
+        self.assertAlmostEqual(rates["B"], 0.0)
+        self.assertIsNone(warning)
+
+    def test_unequal_rates_warns(self):
+        rows = [
+            {"config": "A", "status_code": "200"},
+            {"config": "A", "status_code": "200"},
+            {"config": "A", "status_code": "200"},
+            {"config": "B", "status_code": "200"},
+            {"config": "B", "status_code": "500"},
+            {"config": "B", "status_code": "500"},
+        ]
+        rates, warning = compare_error_rates(rows)
+        self.assertAlmostEqual(rates["A"], 0.0)
+        self.assertAlmostEqual(rates["B"], 2 / 3, places=2)
+        self.assertIsNotNone(warning)
+        self.assertIn("survivorship", warning.lower())
 
 
 class TestSafeConversions(unittest.TestCase):

@@ -1,0 +1,1074 @@
+llm-d Diagnostics — Analysis
+Data directory: clusters/rdu3-t4x3/data
+
+============================================================
+  Experiment 1: Single-Request Latency
+============================================================
+
+  Data quality:
+      9/300 truncated responses (<10 completion tokens, 3.0%)
+
+  Prompt |     Config |  Median TTFT |     Mean |    Std |             IQR |            95% CI | n
+  -------+------------+--------------+----------+--------+-----------------+-------------------+---
+      10 |   BASELINE |      202.2ms |  202.0 |   0.6 | [201.5,202.5] | [ 201.7, 202.3] | 20
+      10 |  DISAGG-D1 |      257.8ms |  237.9 |  51.8 | [254.2,261.0] | [ 213.6, 262.2] | 20
+      10 |  DISAGG-D2 |      255.2ms |  250.3 |  20.1 | [254.7,255.9] | [ 240.9, 259.8] | 20
+      50 |   BASELINE |      205.5ms |  197.1 |  38.1 | [204.9,206.0] | [ 179.3, 214.9] | 20
+      50 |  DISAGG-D1 |      262.9ms |  253.3 |  41.4 | [261.2,263.9] | [ 234.0, 272.7] | 20
+      50 |  DISAGG-D2 |      259.9ms |  260.1 |   2.4 | [258.9,260.6] | [ 259.0, 261.2] | 20
+     100 |   BASELINE |      207.8ms |  199.0 |  39.8 | [207.2,208.2] | [ 180.4, 217.6] | 20
+     100 |  DISAGG-D1 |      266.2ms |  251.1 |  43.5 | [262.7,269.0] | [ 230.7, 271.4] | 20
+     100 |  DISAGG-D2 |      261.9ms |  253.3 |  41.4 | [261.3,262.9] | [ 233.9, 272.7] | 20
+     500 |   BASELINE |      212.4ms |  212.4 |   1.0 | [211.9,212.8] | [ 211.9, 212.9] | 20
+     500 |  DISAGG-D1 |      273.0ms |  273.0 |   3.0 | [270.8,275.0] | [ 271.6, 274.4] | 20
+     500 |  DISAGG-D2 |      266.9ms |  248.4 |  57.5 | [266.0,268.0] | [ 221.5, 275.3] | 20
+    1000 |   BASELINE |      214.6ms |  207.3 |  22.8 | [212.7,215.4] | [ 196.6, 218.0] | 20
+    1000 |  DISAGG-D1 |      279.3ms |  277.6 |   9.9 | [277.8,280.9] | [ 272.9, 282.2] | 20
+    1000 |  DISAGG-D2 |      271.6ms |  271.2 |   2.3 | [270.6,272.6] | [ 270.1, 272.3] | 20
+
+  Overhead (disagg median - BASELINE median):
+       10 tok: DISAGG-D1=+55.6ms  DISAGG-D2=+53.0ms
+       50 tok: DISAGG-D1=+57.4ms  DISAGG-D2=+54.4ms
+      100 tok: DISAGG-D1=+58.4ms  DISAGG-D2=+54.1ms
+      500 tok: DISAGG-D1=+60.6ms  DISAGG-D2=+54.5ms
+     1000 tok: DISAGG-D1=+64.7ms  DISAGG-D2=+57.0ms
+    DISAGG-D1 overhead: 59.3 +/- 3.5ms (range 55.6-64.7)
+    DISAGG-D2 overhead: 54.6 +/- 1.5ms (range 53.0-57.0)
+    WARNING: DISAGG-D1 overhead variance (3.5ms) is 2.3x DISAGG-D2 (1.5ms). Investigate node asymmetry.
+
+============================================================
+  Experiment 1b: Latency Decomposition
+============================================================
+
+  Data quality:
+      2/120 truncated responses (<10 completion tokens, 1.7%)
+
+  A-prefill-direct:
+    All data: 208.6ms (n=30, IQR=[207.6,210.2], mean=207.1, 95%CI=[202.1,212.1])
+
+  B-decode-direct:
+    All data: 214.1ms (n=30, IQR=[212.2,216.3], mean=214.2, 95%CI=[213.1,215.3])
+
+  C-sidecar-only: (1 truncated excluded)
+    All data: 245.6ms (n=30, IQR=[244.6,246.6], mean=238.3, 95%CI=[226.5,250.1])
+    Trimmed:  245.6ms (n=29, IQR=[244.6,246.6], mean=243.5, 95%CI=[238.0,248.9])
+
+  D-disaggregated: (1 truncated excluded)
+    All data: 276.5ms (n=30, IQR=[274.8,278.3], mean=268.0, 95%CI=[254.1,281.9])
+    Trimmed:  276.7ms (n=29, IQR=[275.1,278.3], mean=274.2, 95%CI=[268.6,279.9])
+
+  Decomposition (difference of medians):
+    A (prefill direct):  208.6ms
+    B (decode direct):   214.1ms
+    C (sidecar only):    245.6ms
+    D (disaggregated):   276.7ms
+
+    T_sidecar    = C - B = 31.5ms
+    T_prefill_rt = D - C = 31.1ms  (includes NIXL transfer)
+    T_overhead   = D - A = 68.1ms
+    Sum check: 31.5 + 31.1 = 62.6ms vs T_overhead = 68.1ms (residual: 5.5ms)
+
+  Paired-difference decomposition (n=28 matched runs):
+    T_sidecar    = mean(C_i - B_i) = 29.0ms (95%CI [23.5, 34.5], median=31.5)
+    T_prefill_rt = mean(D_i - C_i) = 30.9ms (95%CI [22.9, 38.9], median=31.3)
+    T_overhead   = mean(D_i - A_i) = 67.2ms (95%CI [58.8, 75.6], median=68.0)
+
+    Validation: A ≈ B (same model, different GPU)
+      A: 207.1 +/- 13.3ms
+      B: 214.2 +/- 2.9ms
+      Difference: 5.5ms (2.6%) — OK
+
+============================================================
+  Experiment 2: Throughput Under Load
+============================================================
+
+  Data quality:
+    2/300 requests with <100ms total latency (likely truncated responses)
+
+    C |     Config |  Med Total |      P90 |     Mean |    Std | n |  Latency Ratio
+  ----+------------+------------+----------+----------+--------+---+---------------
+    1 |   BASELINE |      309ms |    312ms |    309ms |     2 | 20 |    1.00x (ref)
+    1 |  DISAGG-1D |      388ms |    394ms |    357ms |    96 | 20 |          1.26x
+    1 |  DISAGG-2D |      360ms |    392ms |    354ms |    60 | 20 |          1.16x
+    2 |   BASELINE |      329ms |    334ms |    329ms |     6 | 20 |    1.00x (ref)
+    2 |  DISAGG-1D |      475ms |    553ms |    478ms |    57 | 20 |          1.44x
+    2 |  DISAGG-2D |      442ms |    516ms |    423ms |   102 | 20 |          1.34x
+    4 |   BASELINE |      342ms |    344ms |    334ms |    29 | 20 |    1.00x (ref)
+    4 |  DISAGG-1D |     1181ms |   1300ms |   1149ms |   132 | 20 |          3.45x
+    4 |  DISAGG-2D |     1160ms |   1264ms |   1178ms |    63 | 20 |          3.39x
+    8 |   BASELINE |      352ms |    355ms |    325ms |    60 | 20 |    1.00x (ref)
+    8 |  DISAGG-1D |     4221ms |   4312ms |   3630ms |  1247 | 20 |         12.01x
+    8 |  DISAGG-2D |     4100ms |   4213ms |   3525ms |  1248 | 20 |         11.67x
+   16 |   BASELINE |      370ms |    378ms |    360ms |    22 | 20 |    1.00x (ref)
+   16 |  DISAGG-1D |    15830ms |  15875ms |  12772ms |  6020 | 20 |         42.78x
+   16 |  DISAGG-2D |    12034ms |  12341ms |   9870ms |  4602 | 20 |         32.53x
+
+  Note: Latency ratio >1 means disagg is slower than baseline.
+  Throughput numbers require wall-clock timing to be precise.
+
+============================================================
+  Experiment 3: Prefill Isolation
+============================================================
+
+  Data quality:
+      8/120 truncated responses (<10 completion tokens, 6.7%)
+  Completeness warnings:
+      config=BASELINE/weight=heavy: 10 rows (expected 50)
+      config=DISAGG-2D/weight=heavy: 10 rows (expected 50)
+
+  Decode Isolation (ITL — inter-token latency during mixed load):
+  This is the primary isolation metric: does a heavy prefill on the
+  shared GPU degrade token generation on the decode GPUs?
+
+      BASELINE heavy: 10.3ms (n=10, IQR=[10.3,10.4], mean=10.3, 95%CI=[10.3,10.4])
+      BASELINE light: 10.9ms (n=48, IQR=[10.7,11.0], mean=10.9, 95%CI=[10.8,11.0])
+     DISAGG-2D heavy: 10.7ms (n=9, IQR=[10.4,10.9], mean=10.7, 95%CI=[10.3,11.1])
+     DISAGG-2D light: 11.6ms (n=50, IQR=[10.9,12.0], mean=11.5, 95%CI=[11.2,11.7])
+
+  ITL isolation ratio (BL / DG for light requests): 0.940
+    >1 = disagg decode is faster (better isolation)
+    ≈1 = no difference (decode not affected either way)
+    <1 = disagg decode is slower
+    Observed: no meaningful difference (6% — within noise)
+
+  TTFT under mixed load (NOTE: with single-prefill topology, TTFT reflects
+  prefill queue contention, not decode isolation):
+
+      BASELINE heavy: 33.5ms (n=10, IQR=[32.4,43.1], mean=37.0, 95%CI=[31.8,42.2])
+      BASELINE light: 42.1ms (n=50, IQR=[40.0,44.7], mean=42.8, 95%CI=[41.7,43.9])
+     DISAGG-2D heavy: 1869.0ms (n=10, IQR=[1813.6,1917.6], mean=1823.2, 95%CI=[1684.0,1962.5])
+     DISAGG-2D light: 1891.5ms (n=50, IQR=[1815.9,1947.5], mean=1842.1, 95%CI=[1791.1,1893.2])
+
+  TTFT ratio (BL / DG for light requests): 0.022
+    Disagg light TTFT is 44.9x slower — expected with single
+    prefill pod (all requests queue through same sidecar+NIXL pipeline)
+
+============================================================
+  Experiment 4: Fault Tolerance
+============================================================
+
+  --- 4f ---
+    [pre-5s] OK ttft=175ms total=175ms — before 5s partition
+    [partition-on-5s] FAIL ttft=0ms total=0ms — partition applied for 5s
+    [during-5s-1] FAIL ttft=0ms total=10102ms — partition active (14s elapsed) [The read operation timed out]
+    [partition-off-5s] FAIL ttft=0ms total=0ms — partition removed after 5s
+    [post-5s-1s] OK ttft=263ms total=263ms — recovery probe +2s status=recovered
+    [post-5s-5s] OK ttft=247ms total=247ms — recovery probe +6s status=recovered
+    [post-5s-15s] OK ttft=201ms total=201ms — recovery probe +16s status=recovered
+    [post-5s-30s] OK ttft=254ms total=254ms — recovery probe +31s status=recovered
+    [post-d2-5s] OK ttft=892ms total=893ms — decode-2 after 5s partition
+    [verify-5s] OK ttft=171ms total=171ms — disagg verification after 5s partition
+    [pre-30s] OK ttft=246ms total=246ms — before 30s partition
+    [partition-on-30s] FAIL ttft=0ms total=0ms — partition applied for 30s
+    [during-30s-1] FAIL ttft=0ms total=10103ms — partition active (14s elapsed) [The read operation timed out]
+    [during-30s-2] FAIL ttft=0ms total=10103ms — partition active (30s elapsed) [The read operation timed out]
+    [during-30s-3] FAIL ttft=0ms total=10094ms — partition active (46s elapsed) [The read operation timed out]
+    [during-30s-4] FAIL ttft=0ms total=10050ms — partition active (62s elapsed) [The read operation timed out]
+    [during-30s-5] OK ttft=2721ms total=2721ms — partition active (71s elapsed)
+    [partition-off-30s] FAIL ttft=0ms total=0ms — partition removed after 30s
+    [post-30s-1s] FAIL ttft=0ms total=10105ms — recovery probe +12s status=still_failing [The read operation timed out]
+    [post-30s-5s] FAIL ttft=0ms total=10103ms — recovery probe +23s status=still_failing [The read operation timed out]
+    [post-30s-15s] FAIL ttft=0ms total=10054ms — recovery probe +34s status=still_failing [The read operation timed out]
+    [post-30s-30s] FAIL ttft=0ms total=10104ms — recovery probe +45s status=still_failing [The read operation timed out]
+    [post-d2-30s] OK ttft=95ms total=95ms — decode-2 after 30s partition
+    [verify-30s] OK ttft=1865ms total=1865ms — disagg verification after 30s partition
+    [pre-120s] OK ttft=227ms total=227ms — before 120s partition
+    [partition-on-120s] FAIL ttft=0ms total=0ms — partition applied for 120s
+    [during-120s-1] FAIL ttft=0ms total=10106ms — partition active (14s elapsed) [The read operation timed out]
+    [during-120s-2] FAIL ttft=0ms total=10094ms — partition active (30s elapsed) [The read operation timed out]
+    [during-120s-3] FAIL ttft=0ms total=10055ms — partition active (46s elapsed) [The read operation timed out]
+    [during-120s-4] FAIL ttft=0ms total=10107ms — partition active (62s elapsed) [The read operation timed out]
+    [during-120s-5] OK ttft=2627ms total=2627ms — partition active (70s elapsed)
+    [during-120s-6] FAIL ttft=0ms total=10104ms — partition active (86s elapsed) [The read operation timed out]
+    [during-120s-7] FAIL ttft=0ms total=10054ms — partition active (102s elapsed) [The read operation timed out]
+    [during-120s-8] FAIL ttft=0ms total=10104ms — partition active (118s elapsed) [The read operation timed out]
+    [during-120s-9] OK ttft=2646ms total=2646ms — partition active (126s elapsed)
+    [during-120s-10] FAIL ttft=0ms total=10054ms — partition active (142s elapsed) [The read operation timed out]
+    [during-120s-11] FAIL ttft=0ms total=10099ms — partition active (158s elapsed) [The read operation timed out]
+    [during-120s-12] FAIL ttft=0ms total=10055ms — partition active (174s elapsed) [The read operation timed out]
+    [during-120s-13] OK ttft=2571ms total=2571ms — partition active (182s elapsed)
+    [during-120s-14] FAIL ttft=0ms total=10104ms — partition active (198s elapsed) [The read operation timed out]
+    [during-120s-15] FAIL ttft=0ms total=10104ms — partition active (214s elapsed) [The read operation timed out]
+    [during-120s-16] FAIL ttft=0ms total=10106ms — partition active (230s elapsed) [The read operation timed out]
+    [during-120s-17] OK ttft=2554ms total=2554ms — partition active (238s elapsed)
+    [during-120s-18] FAIL ttft=0ms total=10103ms — partition active (254s elapsed) [The read operation timed out]
+    [during-120s-19] FAIL ttft=0ms total=10054ms — partition active (270s elapsed) [The read operation timed out]
+    [during-120s-20] FAIL ttft=0ms total=10100ms — partition active (286s elapsed) [The read operation timed out]
+    [during-120s-21] OK ttft=2562ms total=2562ms — partition active (294s elapsed)
+    [during-120s-22] FAIL ttft=0ms total=10103ms — partition active (310s elapsed) [The read operation timed out]
+    [during-120s-23] FAIL ttft=0ms total=10054ms — partition active (326s elapsed) [The read operation timed out]
+    [partition-off-120s] FAIL ttft=0ms total=0ms — partition removed after 120s
+    [post-120s-1s] FAIL ttft=0ms total=10105ms — recovery probe +12s status=still_failing [The read operation timed out]
+    [post-120s-5s] FAIL ttft=0ms total=10099ms — recovery probe +23s status=still_failing [The read operation timed out]
+    [post-120s-15s] OK ttft=8446ms total=8446ms — recovery probe +32s status=recovered
+    [post-120s-30s] OK ttft=248ms total=248ms — recovery probe +33s status=recovered
+    [post-d2-120s] OK ttft=254ms total=254ms — decode-2 after 120s partition
+    [verify-120s] OK ttft=246ms total=246ms — disagg verification after 120s partition
+    Summary: 21/56 OK, 35 failed
+    Recovery latency: 263ms vs pre-kill 175ms (1.5x — elevated)
+
+  --- 4h ---
+    [pre-1] OK ttft=245ms total=245ms — baseline run 1
+    [kill-1] FAIL ttft=0ms total=0ms — killed vllm-prefill-57d67d448f-ln628
+    [detect-A-1] FAIL ttft=0ms total=0ms — method=in-pod gap=361ms ±382ms probes=15 [The read operation timed out] (probes=15)
+    [probe-1] OK ttft=240ms total=240ms — probe seq=1
+    [probe-1] OK ttft=164ms total=164ms — probe seq=2
+    [probe-1] OK ttft=163ms total=163ms — probe seq=3
+    [probe-1] OK ttft=162ms total=162ms — probe seq=4
+    [probe-1] OK ttft=163ms total=163ms — probe seq=5
+    [probe-1] OK ttft=160ms total=160ms — probe seq=6
+    [probe-1] OK ttft=161ms total=161ms — probe seq=7
+    [probe-1] OK ttft=160ms total=160ms — probe seq=8
+    [probe-1] OK ttft=159ms total=159ms — probe seq=9
+    [probe-1] OK ttft=160ms total=160ms — probe seq=10
+    [probe-1] OK ttft=161ms total=161ms — probe seq=11
+    [probe-1] OK ttft=160ms total=160ms — probe seq=12
+    [probe-1] OK ttft=71ms total=71ms — probe seq=13
+    [probe-1] OK ttft=140ms total=140ms — probe seq=14
+    [probe-1] FAIL ttft=0ms total=5039ms — probe seq=15 [The read operation timed out]
+    [detect-C-1] FAIL ttft=0ms total=0ms — method=logs gap=0ms zero_skew [(APIServer pid=1) INFO 04-04 20:40:07 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyLlama/TinyLlama-1.1B-Chat-v1.0', 'trust_remote_code': True, 'dtype': 'float16', ']
+    [recover-1] OK ttft=166ms total=166ms — recovery gap=5402ms probes=1 (probes=1)
+    [pre-2] OK ttft=237ms total=237ms — baseline run 2
+    [kill-2] FAIL ttft=0ms total=0ms — killed vllm-prefill-57d67d448f-khr6k
+    [detect-A-2] FAIL ttft=0ms total=0ms — method=in-pod gap=-176ms ±382ms probes=12 [status=500] (probes=12)
+    [probe-2] OK ttft=230ms total=230ms — probe seq=1
+    [probe-2] OK ttft=91ms total=91ms — probe seq=2
+    [probe-2] OK ttft=76ms total=76ms — probe seq=3
+    [probe-2] OK ttft=160ms total=160ms — probe seq=4
+    [probe-2] OK ttft=162ms total=162ms — probe seq=5
+    [probe-2] OK ttft=163ms total=163ms — probe seq=6
+    [probe-2] OK ttft=165ms total=165ms — probe seq=7
+    [probe-2] OK ttft=162ms total=162ms — probe seq=8
+    [probe-2] OK ttft=160ms total=160ms — probe seq=9
+    [probe-2] OK ttft=161ms total=161ms — probe seq=10
+    [probe-2] OK ttft=160ms total=160ms — probe seq=11
+    [probe-2] FAIL ttft=68ms total=68ms — probe seq=12
+    [detect-C-2] FAIL ttft=0ms total=0ms — method=logs gap=0ms zero_skew [(APIServer pid=1) INFO 04-04 20:40:07 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyLlama/TinyLlama-1.1B-Chat-v1.0', 'trust_remote_code': True, 'dtype': 'float16', ']
+    [recover-2] OK ttft=0ms total=0ms — recovery gap=0ms probes=857 (probes=857)
+    [pre-3] OK ttft=220ms total=221ms — baseline run 3
+    [kill-3] FAIL ttft=0ms total=0ms — killed vllm-prefill-57d67d448f-6fhmr
+    [detect-A-3] FAIL ttft=0ms total=0ms — method=in-pod gap=-147ms ±382ms probes=11 [The read operation timed out] (probes=11)
+    [probe-3] OK ttft=221ms total=221ms — probe seq=1
+    [probe-3] OK ttft=159ms total=159ms — probe seq=2
+    [probe-3] OK ttft=159ms total=159ms — probe seq=3
+    [probe-3] OK ttft=160ms total=160ms — probe seq=4
+    [probe-3] OK ttft=158ms total=158ms — probe seq=5
+    [probe-3] OK ttft=158ms total=158ms — probe seq=6
+    [probe-3] OK ttft=160ms total=160ms — probe seq=7
+    [probe-3] OK ttft=159ms total=159ms — probe seq=8
+    [probe-3] OK ttft=162ms total=162ms — probe seq=9
+    [probe-3] OK ttft=162ms total=162ms — probe seq=10
+    [probe-3] FAIL ttft=0ms total=5039ms — probe seq=11 [The read operation timed out]
+    [detect-C-3] FAIL ttft=0ms total=0ms — method=logs gap=0ms zero_skew [(APIServer pid=1) INFO 04-04 20:52:48 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyLlama/TinyLlama-1.1B-Chat-v1.0', 'trust_remote_code': True, 'dtype': 'float16', ']
+    [recover-3] OK ttft=169ms total=169ms — recovery gap=4894ms probes=1 (probes=1)
+    Summary: 41/53 OK, 12 failed
+
+  --- 4i ---
+    [baseline] OK ttft=311ms total=534ms — baseline large prompt ttft=310.74ms tokens=1024 itl=12ms(p99=12ms) tokens=20
+    [during-700ms] OK ttft=30071ms total=30262ms — kill_delay=700ms effective_offset=35ms outcome=success timing=early in transfer pod=vllm-prefill-57d67d448f-5tf44 tokens=20 prompt_tokens=1024 itl=10ms(p99=15ms) tokens=20
+    [during-800ms] FAIL ttft=0ms total=30054ms — kill_delay=800ms effective_offset=135ms outcome=clean_error timing=early in transfer pod=vllm-prefill-57d67d448f-k762v tokens=0 prompt_tokens=1024 [The read operation timed out]
+    [during-900ms] FAIL ttft=0ms total=30075ms — kill_delay=900ms effective_offset=235ms outcome=clean_error timing=mid-to-late transfer pod=vllm-prefill-57d67d448f-zvqmh tokens=0 prompt_tokens=1024 [The read operation timed out]
+    [during-1000ms] OK ttft=30160ms total=30351ms — kill_delay=1000ms effective_offset=335ms outcome=success timing=likely after transfer pod=vllm-prefill-57d67d448f-rspxt tokens=20 prompt_tokens=1024 itl=10ms(p99=11ms) tokens=20
+    Summary: 3/5 OK, 2 failed
+
+  --- baseline ---
+    [d1] OK ttft=151ms total=151ms — baseline request
+    [d1] OK ttft=244ms total=244ms — baseline request
+    [d1] OK ttft=240ms total=240ms — baseline request
+    [d1] OK ttft=235ms total=235ms — baseline request
+    [d1] OK ttft=250ms total=250ms — baseline request
+    [d1] OK ttft=140ms total=140ms — baseline request
+    [d1] OK ttft=239ms total=239ms — baseline request
+    [d1] OK ttft=225ms total=225ms — baseline request
+    [d1] OK ttft=163ms total=163ms — baseline request
+    [d1] OK ttft=246ms total=246ms — baseline request
+    [d1] OK ttft=116ms total=116ms — baseline request
+    [d1] OK ttft=126ms total=126ms — baseline request
+    [d1] OK ttft=245ms total=245ms — baseline request
+    [d1] OK ttft=223ms total=224ms — baseline request
+    [d1] OK ttft=223ms total=223ms — baseline request
+    [d1] OK ttft=223ms total=223ms — baseline request
+    [d1] OK ttft=227ms total=227ms — baseline request
+    [d1] OK ttft=225ms total=225ms — baseline request
+    [d1] OK ttft=177ms total=177ms — baseline request
+    [d1] OK ttft=220ms total=220ms — baseline request
+    [d1] OK ttft=232ms total=232ms — baseline request
+    [d1] OK ttft=222ms total=222ms — baseline request
+    [d1] OK ttft=224ms total=224ms — baseline request
+    [d1] OK ttft=222ms total=222ms — baseline request
+    [d1] OK ttft=220ms total=220ms — baseline request
+    [d1] OK ttft=225ms total=225ms — baseline request
+    [d1] OK ttft=190ms total=190ms — baseline request
+    [d1] OK ttft=228ms total=228ms — baseline request
+    [d1] OK ttft=223ms total=223ms — baseline request
+    [d1] OK ttft=221ms total=221ms — baseline request
+    [d2] OK ttft=223ms total=223ms — baseline request
+    [d2] OK ttft=217ms total=217ms — baseline request
+    [d2] OK ttft=95ms total=95ms — baseline request
+    [d2] OK ttft=219ms total=219ms — baseline request
+    [d2] OK ttft=168ms total=168ms — baseline request
+    [d2] OK ttft=192ms total=192ms — baseline request
+    [d2] OK ttft=243ms total=243ms — baseline request
+    [d2] OK ttft=224ms total=224ms — baseline request
+    [d2] OK ttft=220ms total=220ms — baseline request
+    [d2] OK ttft=170ms total=170ms — baseline request
+    [d2] OK ttft=219ms total=219ms — baseline request
+    [d2] OK ttft=145ms total=145ms — baseline request
+    [d2] OK ttft=241ms total=241ms — baseline request
+    [d2] OK ttft=235ms total=235ms — baseline request
+    [d2] OK ttft=220ms total=220ms — baseline request
+    [d2] OK ttft=220ms total=220ms — baseline request
+    [d2] OK ttft=244ms total=244ms — baseline request
+    [d2] OK ttft=230ms total=230ms — baseline request
+    [d2] OK ttft=238ms total=238ms — baseline request
+    [d2] OK ttft=239ms total=239ms — baseline request
+    [d2] OK ttft=242ms total=242ms — baseline request
+    [d2] OK ttft=242ms total=242ms — baseline request
+    [d2] OK ttft=149ms total=149ms — baseline request
+    [d2] OK ttft=199ms total=199ms — baseline request
+    [d2] OK ttft=222ms total=222ms — baseline request
+    [d2] OK ttft=219ms total=219ms — baseline request
+    [d2] OK ttft=168ms total=168ms — baseline request
+    [d2] OK ttft=221ms total=221ms — baseline request
+    [d2] OK ttft=194ms total=194ms — baseline request
+    [d2] OK ttft=222ms total=222ms — baseline request
+    Summary: 60/60 OK, 0 failed
+
+  --- calibration ---
+    [oc-exec-overhead] FAIL ttft=596ms total=788ms — mean=596ms min=506ms max=788ms
+    [clock-skew] FAIL ttft=281ms total=119ms — skew=281ms ±119ms rtt=607ms
+    [probe-jitter] FAIL ttft=205ms total=263ms — mean=205ms max=263ms stddev=12ms n=25
+    Summary: 0/3 OK, 3 failed
+
+  --- control ---
+    [probe] OK ttft=257ms total=257ms — control probe
+    [probe] OK ttft=92ms total=92ms — control probe
+    [probe] OK ttft=167ms total=167ms — control probe
+    [probe] OK ttft=126ms total=126ms — control probe
+    [probe] OK ttft=163ms total=163ms — control probe
+    [probe] OK ttft=88ms total=88ms — control probe
+    [probe] OK ttft=156ms total=156ms — control probe
+    [probe] OK ttft=163ms total=163ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=158ms total=158ms — control probe
+    [probe] OK ttft=158ms total=158ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=158ms total=158ms — control probe
+    [probe] OK ttft=104ms total=104ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=164ms total=164ms — control probe
+    [probe] OK ttft=85ms total=85ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=163ms total=164ms — control probe
+    [probe] OK ttft=162ms total=162ms — control probe
+    [probe] OK ttft=162ms total=162ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=160ms total=161ms — control probe
+    [probe] OK ttft=162ms total=162ms — control probe
+    [probe] OK ttft=162ms total=162ms — control probe
+    [probe] OK ttft=86ms total=86ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=96ms total=96ms — control probe
+    [probe] OK ttft=162ms total=162ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=163ms total=163ms — control probe
+    [probe] OK ttft=162ms total=162ms — control probe
+    [probe] OK ttft=86ms total=86ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=75ms total=75ms — control probe
+    [probe] OK ttft=85ms total=85ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=85ms total=85ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=162ms total=162ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=158ms total=158ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=139ms total=139ms — control probe
+    [probe] OK ttft=84ms total=84ms — control probe
+    [probe] OK ttft=158ms total=159ms — control probe
+    [probe] OK ttft=158ms total=158ms — control probe
+    [probe] OK ttft=158ms total=158ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=163ms total=163ms — control probe
+    [probe] OK ttft=85ms total=85ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=141ms total=141ms — control probe
+    [probe] OK ttft=102ms total=102ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=162ms total=162ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=130ms total=130ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=161ms total=162ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=160ms total=160ms — control probe
+    [probe] OK ttft=159ms total=159ms — control probe
+    [probe] OK ttft=84ms total=84ms — control probe
+    [probe] OK ttft=161ms total=161ms — control probe
+    Summary: 99/99 OK, 0 failed
+
+  --- Log Analysis ---
+    4a-decode1-post-routing-sidecar.log:
+      NIXL connection: 1 events
+        L5: {"level":"info","ts":"2026-04-03T23:28:15Z","msg":"p/d connector validated","connector":"nixlv2"}
+      Transport errors: 10 events
+        L8: {"level":"error","ts":"2026-04-03T23:28:26Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (8 more)
+        L17: {"level":"error","ts":"2026-04-03T23:29:48Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-03T23:28:15Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4a-decode1-post-vllm.log:
+      NIXL connection: 17 events
+        L7: (APIServer pid=1) INFO 04-03 23:28:29 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (15 more)
+        L141: (EngineCore pid=311) INFO 04-03 23:30:03 [nixl_connector.py:1287] NIXL compatibility check passed (hash: 798457dea7f851e
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-03 23:28:51 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4a-decode1-pre-routing-sidecar.log:
+      NIXL connection: 183 events
+        L5: {"level":"info","ts":"2026-04-01T21:14:12Z","msg":"p/d connector validated","connector":"nixlv2"}
+        ... (181 more)
+        L2228: 2026/04/03 22:31:43 http: TLS handshake error from <pod-ip>:46110: read tcp <pod-ip>:8000-><pod-ip>:46110: i/o
+      Sidecar routing: 5 events
+        L18: {"level":"error","ts":"2026-04-01T21:16:02Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+        ... (3 more)
+        L2220: 2026/04/03 22:25:29 http: TLS handshake error from <pod-ip>:50476: read tcp <pod-ip>:8000-><pod-ip>:50476: i/o
+      Transport errors: 2080 events
+        L8: {"level":"error","ts":"2026-04-01T21:14:23Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (2078 more)
+        L2274: 2026/04/03 23:27:27 traces export: exporter export timeout: rpc error: code = Unavailable desc = connection error: desc 
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-01T21:14:12Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4a-decode1-pre-vllm.log:
+      NIXL connection: 473 events
+        L7: (APIServer pid=1) INFO 04-01 21:14:27 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (471 more)
+        L57088: (APIServer pid=1) INFO 04-03 23:27:20 [metrics.py:103] KV Transfer metrics: Num successful transfers=36, Avg xfer time (
+      Sidecar routing: 345 events
+        L460: (APIServer pid=1) INFO:     <pod-ip>:50478 - "GET /health HTTP/1.1" 200 OK
+        ... (343 more)
+        L57043: (APIServer pid=1) INFO 04-03 23:27:10 [metrics.py:103] KV Transfer metrics: Num successful transfers=48, Avg xfer time (
+      ZMQ discovery: 397 events
+        L16: (EngineCore pid=311) INFO 04-01 21:14:48 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+        ... (395 more)
+        L50043: (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/fastapi/routing.py", line 328, in run_endpoint_functio
+    4b-decode1-post-routing-sidecar.log:
+      NIXL connection: 21 events
+        L5: {"level":"info","ts":"2026-04-04T02:21:00Z","msg":"p/d connector validated","connector":"nixlv2"}
+        ... (19 more)
+        L90: {"level":"error","ts":"2026-04-04T02:44:04Z","logger":"proxy server on port 8000","msg":"http: proxy error","decoderURL"
+      Sidecar routing: 32 events
+        L26: {"level":"error","ts":"2026-04-04T02:30:15Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+        ... (30 more)
+        L89: {"level":"info","ts":"2026-04-04T02:44:04Z","logger":"proxy server on port 8000","msg":"fallback to decode","request_id"
+      Transport errors: 32 events
+        L8: {"level":"error","ts":"2026-04-04T02:21:12Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (30 more)
+        L91: 2026/04/04 02:44:36 traces export: exporter export timeout: rpc error: code = Unavailable desc = connection error: desc 
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-04T02:21:00Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4b-decode1-post-vllm.log:
+      NIXL connection: 45 events
+        L7: (APIServer pid=1) INFO 04-04 02:21:19 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (43 more)
+        L1161: (APIServer pid=1) INFO 04-04 02:46:09 [metrics.py:103] KV Transfer metrics: Num successful transfers=1, Avg xfer time (m
+      Sidecar routing: 15 events
+        L373: (APIServer pid=1) INFO:     <pod-ip>:50376 - "GET /metrics HTTP/1.1" 200 OK
+        ... (13 more)
+        L1118: (APIServer pid=1) INFO:     <pod-ip>:42502 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:21:47 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4b-decode1-pre-routing-sidecar.log:
+      NIXL connection: 19 events
+        L5: {"level":"info","ts":"2026-04-04T02:21:00Z","msg":"p/d connector validated","connector":"nixlv2"}
+        ... (17 more)
+        L82: {"level":"error","ts":"2026-04-04T02:39:02Z","logger":"proxy server on port 8000","msg":"http: proxy error","decoderURL"
+      Sidecar routing: 30 events
+        L26: {"level":"error","ts":"2026-04-04T02:30:15Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+        ... (28 more)
+        L81: {"level":"info","ts":"2026-04-04T02:39:02Z","logger":"proxy server on port 8000","msg":"fallback to decode","request_id"
+      Transport errors: 31 events
+        L8: {"level":"error","ts":"2026-04-04T02:21:12Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (29 more)
+        L86: 2026/04/04 02:43:26 traces export: exporter export timeout: rpc error: code = Unavailable desc = connection error: desc 
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-04T02:21:00Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4b-prefill-post-vllm.log:
+      NIXL connection: 16 events
+        L7: (APIServer pid=1) INFO 04-04 02:44:44 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8100, 'model': 'TinyL
+        ... (14 more)
+        L101: (EngineCore pid=311) INFO 04-04 02:45:58 [nixl_connector.py:578] Hybrid Memory Allocator is enabled with NIXL
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:45:05 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4b-prefill-pre-vllm.log:
+      NIXL connection: 16 events
+        L7: (APIServer pid=1) INFO 04-04 02:39:45 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8100, 'model': 'TinyL
+        ... (14 more)
+        L101: (EngineCore pid=311) INFO 04-04 02:40:59 [nixl_connector.py:578] Hybrid Memory Allocator is enabled with NIXL
+      Sidecar routing: 7 events
+        L168: (APIServer pid=1) INFO:     <pod-ip>:42504 - "GET /health HTTP/1.1" 200 OK
+        ... (5 more)
+        L272: (APIServer pid=1) INFO:     <pod-ip>:53504 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:40:06 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4e-decode1-during-routing-sidecar.log:
+      NIXL connection: 118 events
+        L5: {"level":"info","ts":"2026-04-03T23:28:15Z","msg":"p/d connector validated","connector":"nixlv2"}
+        ... (116 more)
+        L406: {"level":"error","ts":"2026-04-04T00:08:56Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+      Sidecar routing: 232 events
+        L32: {"level":"error","ts":"2026-04-03T23:40:17Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+        ... (230 more)
+        L407: {"level":"info","ts":"2026-04-04T00:08:56Z","logger":"proxy server on port 8000","msg":"fallback to decode","request_id"
+      Transport errors: 51 events
+        L8: {"level":"error","ts":"2026-04-03T23:28:26Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (49 more)
+        L380: 2026/04/04 00:08:55 traces export: exporter export timeout: rpc error: code = Unavailable desc = connection error: desc 
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-03T23:28:15Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4f-decode1-120s-routing-sidecar.log:
+      NIXL connection: 44 events
+        L5: {"level":"info","ts":"2026-04-04T20:39:49Z","msg":"p/d connector validated","connector":"nixlv2"}
+        ... (42 more)
+        L118: {"level":"error","ts":"2026-04-04T20:47:52Z","logger":"proxy server on port 8000","msg":"http: proxy error","decoderURL"
+      Sidecar routing: 46 events
+        L20: {"level":"error","ts":"2026-04-04T20:42:18Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+        ... (44 more)
+        L114: {"level":"info","ts":"2026-04-04T20:47:29Z","logger":"proxy server on port 8000","msg":"fallback to decode","request_id"
+      Transport errors: 21 events
+        L8: {"level":"error","ts":"2026-04-04T20:40:00Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (19 more)
+        L117: 2026/04/04 20:47:49 traces export: exporter export timeout: rpc error: code = Unavailable desc = connection error: desc 
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-04T20:39:49Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4f-decode1-120s-vllm.log:
+      NIXL connection: 18 events
+        L7: (APIServer pid=1) INFO 04-04 20:40:07 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (16 more)
+        L153: (APIServer pid=1) INFO 04-04 20:42:06 [metrics.py:103] KV Transfer metrics: Num successful transfers=2, Avg xfer time (m
+      Sidecar routing: 7 events
+        L206: (APIServer pid=1) INFO:     <pod-ip>:55030 - "GET /metrics HTTP/1.1" 200 OK
+        ... (5 more)
+        L386: (APIServer pid=1) INFO:     <pod-ip>:39502 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 20:40:35 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4f-decode1-30s-routing-sidecar.log:
+      NIXL connection: 4342 events
+        L5: {"level":"info","ts":"2026-04-04T02:21:00Z","msg":"p/d connector validated","connector":"nixlv2"}
+        ... (4340 more)
+        L13751: {"level":"error","ts":"2026-04-04T20:38:55Z","logger":"proxy server on port 8000","msg":"http: proxy error","decoderURL"
+      Sidecar routing: 8630 events
+        L26: {"level":"error","ts":"2026-04-04T02:30:15Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+        ... (8628 more)
+        L13744: {"level":"info","ts":"2026-04-04T20:38:10Z","logger":"proxy server on port 8000","msg":"fallback to decode","request_id"
+      Transport errors: 773 events
+        L8: {"level":"error","ts":"2026-04-04T02:21:12Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (771 more)
+        L13750: 2026/04/04 20:38:49 traces export: exporter export timeout: rpc error: code = Unavailable desc = connection error: desc 
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-04T02:21:00Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4f-decode1-30s-vllm.log:
+      NIXL connection: 122 events
+        L7: (APIServer pid=1) INFO 04-04 02:21:19 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (120 more)
+        L16058: (APIServer pid=1) INFO 04-04 20:37:00 [metrics.py:103] KV Transfer metrics: Num successful transfers=3, Avg xfer time (m
+      Sidecar routing: 73 events
+        L373: (APIServer pid=1) INFO:     <pod-ip>:50376 - "GET /metrics HTTP/1.1" 200 OK
+        ... (71 more)
+        L16030: (APIServer pid=1) INFO 04-04 20:36:30 [metrics.py:103] KV Transfer metrics: Num successful transfers=2, Avg xfer time (m
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:21:47 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4f-decode1-5s-routing-sidecar.log:
+      NIXL connection: 4329 events
+        L5: {"level":"info","ts":"2026-04-04T02:21:00Z","msg":"p/d connector validated","connector":"nixlv2"}
+        ... (4327 more)
+        L13722: {"level":"error","ts":"2026-04-04T20:36:22Z","logger":"proxy server on port 8000","msg":"http: proxy error","decoderURL"
+      Sidecar routing: 8620 events
+        L26: {"level":"error","ts":"2026-04-04T02:30:15Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+        ... (8618 more)
+        L13721: {"level":"info","ts":"2026-04-04T20:36:22Z","logger":"proxy server on port 8000","msg":"fallback to decode","request_id"
+      Transport errors: 767 events
+        L8: {"level":"error","ts":"2026-04-04T02:21:12Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (765 more)
+        L13718: 2026/04/04 20:35:59 traces export: exporter export timeout: rpc error: code = Unavailable desc = connection error: desc 
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-04T02:21:00Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4f-decode1-5s-vllm.log:
+      NIXL connection: 121 events
+        L7: (APIServer pid=1) INFO 04-04 02:21:19 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (119 more)
+        L16039: (APIServer pid=1) INFO 04-04 20:36:40 [metrics.py:103] KV Transfer metrics: Num successful transfers=1, Avg xfer time (m
+      Sidecar routing: 73 events
+        L373: (APIServer pid=1) INFO:     <pod-ip>:50376 - "GET /metrics HTTP/1.1" 200 OK
+        ... (71 more)
+        L16030: (APIServer pid=1) INFO 04-04 20:36:30 [metrics.py:103] KV Transfer metrics: Num successful transfers=2, Avg xfer time (m
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:21:47 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4f-decode1-post-routing-sidecar.log:
+      NIXL connection: 124 events
+        L5: {"level":"info","ts":"2026-04-03T23:28:15Z","msg":"p/d connector validated","connector":"nixlv2"}
+        ... (122 more)
+        L432: {"level":"error","ts":"2026-04-04T00:31:11Z","logger":"proxy server on port 8000","msg":"http: proxy error","decoderURL"
+      Sidecar routing: 236 events
+        L32: {"level":"error","ts":"2026-04-03T23:40:17Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+        ... (234 more)
+        L428: {"level":"info","ts":"2026-04-04T00:30:34Z","logger":"proxy server on port 8000","msg":"fallback to decode","request_id"
+      Transport errors: 66 events
+        L8: {"level":"error","ts":"2026-04-03T23:28:26Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (64 more)
+        L430: 2026/04/04 00:30:36 traces export: exporter export timeout: rpc error: code = Unavailable desc = connection error: desc 
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-03T23:28:15Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4f-decode1-post-vllm.log:
+      NIXL connection: 63 events
+        L7: (APIServer pid=1) INFO 04-03 23:28:29 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (61 more)
+        L2159: (APIServer pid=1) INFO 04-04 00:30:08 [metrics.py:103] KV Transfer metrics: Num successful transfers=1, Avg xfer time (m
+      Sidecar routing: 18 events
+        L149: (APIServer pid=1) INFO 04-03 23:30:08 [metrics.py:103] KV Transfer metrics: Num successful transfers=3, Avg xfer time (m
+        ... (16 more)
+        L2142: (APIServer pid=1) INFO:     <pod-ip>:36502 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-03 23:28:51 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4f-prefill-120s-vllm.log:
+      NIXL connection: 16 events
+        L7: (APIServer pid=1) INFO 04-04 20:34:13 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8100, 'model': 'TinyL
+        ... (14 more)
+        L101: (EngineCore pid=311) INFO 04-04 20:35:29 [nixl_connector.py:578] Hybrid Memory Allocator is enabled with NIXL
+      Sidecar routing: 13 events
+        L173: (APIServer pid=1) INFO:     <pod-ip>:45038 - "GET /metrics HTTP/1.1" 200 OK
+        ... (11 more)
+        L643: (APIServer pid=1) INFO:     <pod-ip>:42502 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 20:34:35 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4f-prefill-30s-vllm.log:
+      NIXL connection: 16 events
+        L7: (APIServer pid=1) INFO 04-04 20:34:13 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8100, 'model': 'TinyL
+        ... (14 more)
+        L101: (EngineCore pid=311) INFO 04-04 20:35:29 [nixl_connector.py:578] Hybrid Memory Allocator is enabled with NIXL
+      Sidecar routing: 2 events
+        L173: (APIServer pid=1) INFO:     <pod-ip>:45038 - "GET /metrics HTTP/1.1" 200 OK
+        L197: (APIServer pid=1) INFO:     <pod-ip>:43504 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 20:34:35 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4f-prefill-5s-vllm.log:
+      NIXL connection: 16 events
+        L7: (APIServer pid=1) INFO 04-04 20:34:13 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8100, 'model': 'TinyL
+        ... (14 more)
+        L101: (EngineCore pid=311) INFO 04-04 20:35:29 [nixl_connector.py:578] Hybrid Memory Allocator is enabled with NIXL
+      Sidecar routing: 2 events
+        L173: (APIServer pid=1) INFO:     <pod-ip>:45038 - "GET /metrics HTTP/1.1" 200 OK
+        L197: (APIServer pid=1) INFO:     <pod-ip>:43504 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 20:34:35 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4f-prefill-post-vllm.log:
+      NIXL connection: 16 events
+        L7: (APIServer pid=1) INFO 04-04 00:09:29 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8100, 'model': 'TinyL
+        ... (14 more)
+        L103: (EngineCore pid=311) INFO 04-04 00:11:05 [nixl_connector.py:578] Hybrid Memory Allocator is enabled with NIXL
+      Sidecar routing: 11 events
+        L151: (APIServer pid=1) INFO:     <pod-ip>:54504 - "GET /metrics HTTP/1.1" 200 OK
+        ... (9 more)
+        L504: (APIServer pid=1) INFO:     <pod-ip>:58504 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 00:09:57 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4h-decode1-post-1-vllm.log:
+      NIXL connection: 20 events
+        L7: (APIServer pid=1) INFO 04-04 20:40:07 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (18 more)
+        L411: (APIServer pid=1) INFO 04-04 20:48:16 [metrics.py:103] KV Transfer metrics: Num successful transfers=5, Avg xfer time (m
+      Sidecar routing: 7 events
+        L206: (APIServer pid=1) INFO:     <pod-ip>:55030 - "GET /metrics HTTP/1.1" 200 OK
+        ... (5 more)
+        L386: (APIServer pid=1) INFO:     <pod-ip>:39502 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 20:40:35 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4h-decode1-post-2-vllm.log:
+      NIXL connection: 33 events
+        L7: (APIServer pid=1) INFO 04-04 20:40:07 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (31 more)
+        L1226: (EngineCore pid=311) ERROR 04-04 20:51:03 [nixl_connector.py:2639] nixl_cu12._bindings.nixlRemoteDisconnectError: NIXL_E
+      Sidecar routing: 15 events
+        L206: (APIServer pid=1) INFO:     <pod-ip>:55030 - "GET /metrics HTTP/1.1" 200 OK
+        ... (13 more)
+        L1107: (APIServer pid=1) INFO:     <pod-ip>:50404 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 20:40:35 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4h-decode1-post-3-vllm.log:
+      NIXL connection: 20 events
+        L7: (APIServer pid=1) INFO 04-04 20:52:48 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (18 more)
+        L187: (APIServer pid=1) INFO 04-04 20:55:07 [metrics.py:103] KV Transfer metrics: Num successful transfers=15, Avg xfer time (
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 20:53:16 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4h-decode1-pre-1-vllm.log:
+      NIXL connection: 20 events
+        L7: (APIServer pid=1) INFO 04-04 20:40:07 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (18 more)
+        L411: (APIServer pid=1) INFO 04-04 20:48:16 [metrics.py:103] KV Transfer metrics: Num successful transfers=5, Avg xfer time (m
+      Sidecar routing: 7 events
+        L206: (APIServer pid=1) INFO:     <pod-ip>:55030 - "GET /metrics HTTP/1.1" 200 OK
+        ... (5 more)
+        L386: (APIServer pid=1) INFO:     <pod-ip>:39502 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 20:40:35 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4h-decode1-pre-2-vllm.log:
+      NIXL connection: 24 events
+        L7: (APIServer pid=1) INFO 04-04 20:40:07 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (22 more)
+        L1198: (APIServer pid=1) INFO 04-04 20:50:56 [metrics.py:103] KV Transfer metrics: Num successful transfers=3, Avg xfer time (m
+      Sidecar routing: 15 events
+        L206: (APIServer pid=1) INFO:     <pod-ip>:55030 - "GET /metrics HTTP/1.1" 200 OK
+        ... (13 more)
+        L1107: (APIServer pid=1) INFO:     <pod-ip>:50404 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 20:40:35 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4h-decode1-pre-3-vllm.log:
+      NIXL connection: 19 events
+        L7: (APIServer pid=1) INFO 04-04 20:52:48 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (17 more)
+        L163: (APIServer pid=1) INFO 04-04 20:54:57 [metrics.py:103] KV Transfer metrics: Num successful transfers=1, Avg xfer time (m
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 20:53:16 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4i-decode1-1000ms-vllm.log:
+      NIXL connection: 115 events
+        L7: (APIServer pid=1) INFO 04-04 02:21:19 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (113 more)
+        L15868: (APIServer pid=1) INFO 04-04 20:33:30 [metrics.py:103] KV Transfer metrics: Num successful transfers=1, Avg xfer time (m
+      Sidecar routing: 72 events
+        L373: (APIServer pid=1) INFO:     <pod-ip>:50376 - "GET /metrics HTTP/1.1" 200 OK
+        ... (70 more)
+        L15797: (APIServer pid=1) INFO:     <pod-ip>:58504 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:21:47 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4i-decode1-100ms-vllm.log:
+      NIXL connection: 29 events
+        L7: (APIServer pid=1) INFO 04-04 02:21:19 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (27 more)
+        L617: (APIServer pid=1) INFO 04-04 02:34:09 [metrics.py:103] KV Transfer metrics: Num successful transfers=3, Avg xfer time (m
+      Sidecar routing: 7 events
+        L373: (APIServer pid=1) INFO:     <pod-ip>:50376 - "GET /metrics HTTP/1.1" 200 OK
+        ... (5 more)
+        L549: (APIServer pid=1) INFO:     <pod-ip>:35036 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:21:47 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4i-decode1-200ms-vllm.log:
+      NIXL connection: 31 events
+        L7: (APIServer pid=1) INFO 04-04 02:21:19 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (29 more)
+        L712: (APIServer pid=1) INFO 04-04 02:36:29 [metrics.py:103] KV Transfer metrics: Num successful transfers=1, Avg xfer time (m
+      Sidecar routing: 8 events
+        L373: (APIServer pid=1) INFO:     <pod-ip>:50376 - "GET /metrics HTTP/1.1" 200 OK
+        ... (6 more)
+        L624: (APIServer pid=1) INFO:     <pod-ip>:43502 - "GET /health HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:21:47 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4i-decode1-500ms-vllm.log:
+      NIXL connection: 33 events
+        L7: (APIServer pid=1) INFO 04-04 02:21:19 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (31 more)
+        L812: (APIServer pid=1) INFO 04-04 02:38:59 [metrics.py:103] KV Transfer metrics: Num successful transfers=1, Avg xfer time (m
+      Sidecar routing: 8 events
+        L373: (APIServer pid=1) INFO:     <pod-ip>:50376 - "GET /metrics HTTP/1.1" 200 OK
+        ... (6 more)
+        L624: (APIServer pid=1) INFO:     <pod-ip>:43502 - "GET /health HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:21:47 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4i-decode1-700ms-vllm.log:
+      NIXL connection: 109 events
+        L7: (APIServer pid=1) INFO 04-04 02:21:19 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (107 more)
+        L15491: (APIServer pid=1) INFO 04-04 20:26:10 [metrics.py:103] KV Transfer metrics: Num successful transfers=7, Avg xfer time (m
+      Sidecar routing: 71 events
+        L373: (APIServer pid=1) INFO:     <pod-ip>:50376 - "GET /metrics HTTP/1.1" 200 OK
+        ... (69 more)
+        L15176: (APIServer pid=1) INFO:     <pod-ip>:50206 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:21:47 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4i-decode1-800ms-vllm.log:
+      NIXL connection: 111 events
+        L7: (APIServer pid=1) INFO 04-04 02:21:19 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (109 more)
+        L15625: (APIServer pid=1) INFO 04-04 20:28:50 [metrics.py:103] KV Transfer metrics: Num successful transfers=1, Avg xfer time (m
+      Sidecar routing: 71 events
+        L373: (APIServer pid=1) INFO:     <pod-ip>:50376 - "GET /metrics HTTP/1.1" 200 OK
+        ... (69 more)
+        L15176: (APIServer pid=1) INFO:     <pod-ip>:50206 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:21:47 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4i-decode1-900ms-vllm.log:
+      NIXL connection: 113 events
+        L7: (APIServer pid=1) INFO 04-04 02:21:19 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (111 more)
+        L15743: (APIServer pid=1) INFO 04-04 20:31:10 [metrics.py:103] KV Transfer metrics: Num successful transfers=1, Avg xfer time (m
+      Sidecar routing: 72 events
+        L373: (APIServer pid=1) INFO:     <pod-ip>:50376 - "GET /metrics HTTP/1.1" 200 OK
+        ... (70 more)
+        L15797: (APIServer pid=1) INFO:     <pod-ip>:58504 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 02:21:47 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4j-decode1-container-post-routing-sidecar.log:
+      NIXL connection: 2487 events
+        L5: {"level":"info","ts":"2026-04-03T23:28:15Z","msg":"p/d connector validated","connector":"nixlv2"}
+        ... (2485 more)
+        L7560: {"level":"error","ts":"2026-04-04T00:40:14Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+      Sidecar routing: 4958 events
+        L32: {"level":"error","ts":"2026-04-03T23:40:17Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+        ... (4956 more)
+        L7561: {"level":"info","ts":"2026-04-04T00:40:14Z","logger":"proxy server on port 8000","msg":"fallback to decode","request_id"
+      Transport errors: 140 events
+        L8: {"level":"error","ts":"2026-04-03T23:28:26Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (138 more)
+        L7591: 2026/04/04 00:58:51 traces export: exporter export timeout: rpc error: code = Unavailable desc = connection error: desc 
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-03T23:28:15Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4j-decode1-container-post-vllm.log:
+      NIXL connection: 17 events
+        L7: (APIServer pid=1) INFO 04-04 00:50:36 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (15 more)
+        L416: (EngineCore pid=311) INFO 04-04 00:59:30 [nixl_connector.py:1287] NIXL compatibility check passed (hash: 798457dea7f851e
+      Sidecar routing: 12 events
+        L7: (APIServer pid=1) INFO 04-04 00:50:36 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (10 more)
+        L409: (APIServer pid=1) INFO:     <pod-ip>:35502 - "GET /metrics HTTP/1.1" 200 OK
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 00:50:58 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4j-decode1-pod-post-routing-sidecar.log:
+      NIXL connection: 1 events
+        L5: {"level":"info","ts":"2026-04-04T01:00:20Z","msg":"p/d connector validated","connector":"nixlv2"}
+      Transport errors: 9 events
+        L8: {"level":"error","ts":"2026-04-04T01:00:31Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (7 more)
+        L16: {"level":"error","ts":"2026-04-04T01:01:42Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-04T01:00:20Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4j-decode1-pod-post-vllm.log:
+      NIXL connection: 17 events
+        L7: (APIServer pid=1) INFO 04-04 01:00:31 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (15 more)
+        L137: (EngineCore pid=311) INFO 04-04 01:01:56 [nixl_connector.py:1287] NIXL compatibility check passed (hash: 798457dea7f851e
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 01:00:53 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+    4k-decode1-post-routing-sidecar.log:
+      NIXL connection: 4212 events
+        L5: {"level":"info","ts":"2026-04-04T02:21:00Z","msg":"p/d connector validated","connector":"nixlv2"}
+        ... (4210 more)
+        L12744: {"level":"error","ts":"2026-04-04T03:18:40Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+      Sidecar routing: 8396 events
+        L26: {"level":"error","ts":"2026-04-04T02:30:15Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+        ... (8394 more)
+        L12745: {"level":"info","ts":"2026-04-04T03:18:40Z","logger":"proxy server on port 8000","msg":"fallback to decode","request_id"
+      Transport errors: 135 events
+        L8: {"level":"error","ts":"2026-04-04T02:21:12Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (133 more)
+        L12749: 2026/04/04 03:19:26 traces export: exporter export timeout: rpc error: code = Unavailable desc = connection error: desc 
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-04T02:21:00Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4l-decode1-post-routing-sidecar.log:
+      NIXL connection: 225 events
+        L5: {"level":"info","ts":"2026-04-04T01:00:20Z","msg":"p/d connector validated","connector":"nixlv2"}
+        ... (223 more)
+        L660: {"level":"error","ts":"2026-04-04T01:03:05Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+      Sidecar routing: 418 events
+        L18: {"level":"error","ts":"2026-04-04T01:02:19Z","logger":"proxy server on port 8000","msg":"request failed","code":502,"bod
+        ... (416 more)
+        L661: {"level":"info","ts":"2026-04-04T01:03:05Z","logger":"proxy server on port 8000","msg":"fallback to decode","request_id"
+      Transport errors: 24 events
+        L8: {"level":"error","ts":"2026-04-04T01:00:31Z","logger":"proxy server on port 8000","msg":"failed to connect to vLLM decod
+        ... (22 more)
+        L673: 2026/04/04 01:06:35 traces export: exporter export timeout: rpc error: code = Unavailable desc = connection error: desc 
+      ZMQ discovery: 1 events
+        L1: {"level":"info","ts":"2026-04-04T01:00:20Z","msg":"Initializing OpenTelemetry tracing","endpoint":"localhost:4317","serv
+    4l-decode1-post-vllm.log:
+      NIXL connection: 32 events
+        L7: (APIServer pid=1) INFO 04-04 01:00:31 [utils.py:233] non-default args: {'host': '0.0.0.0', 'port': 8001, 'model': 'TinyL
+        ... (30 more)
+        L1001: (APIServer pid=1) INFO 04-04 01:06:39 [metrics.py:103] KV Transfer metrics: Num successful transfers=48, Avg xfer time (
+      Sidecar routing: 1 events
+        L145: (APIServer pid=1) INFO 04-04 01:01:59 [metrics.py:103] KV Transfer metrics: Num successful transfers=4, Avg xfer time (m
+      ZMQ discovery: 1 events
+        L16: (EngineCore pid=311) INFO 04-04 01:00:53 [core.py:103] Initializing a V1 LLM engine (v0.18.1) with config: model='TinyLl
+
+
+============================================================
+  Experiment 5: Sequence Length Sweep
+============================================================
+
+  Data quality:
+      240/960 non-200 responses (25.0%)
+      28/960 truncated responses (<10 completion tokens, 2.9%)
+  Completeness warnings:
+      High error rate: 25% of requests returned non-200
+
+  Note: build_prompt produces ~1.3x target token count (consistent across all lengths)
+
+    Length |  T_sidecar | T_transfer | T_overhead | A(prefill) |  B(decode) | C(sidecar) |  D(disagg)
+  ---------+------------+------------+------------+------------+------------+------------+-----------
+        10 |      31.4ms |      30.2ms |      59.9ms |     205.7ms |     204.0ms |     235.4ms |     265.6ms
+        50 |      30.3ms |      29.9ms |      60.8ms |     208.2ms |     208.8ms |     239.1ms |     269.0ms
+       100 |      30.5ms |      28.6ms |      59.2ms |     209.9ms |     210.0ms |     240.5ms |     269.1ms
+       250 |      31.8ms |      30.1ms |      60.8ms |     211.9ms |     210.8ms |     242.6ms |     272.7ms
+       500 |      30.0ms |      32.0ms |      62.6ms |     210.6ms |     211.2ms |     241.2ms |     273.2ms
+      1000 |      31.0ms |      33.7ms |      64.1ms |     211.2ms |     210.6ms |     241.6ms |     275.3ms
+      2000 | (all requests failed — HTTP 400: prompt likely exceeds model context window)
+      4096 | (all requests failed — HTTP 400: prompt likely exceeds model context window)
+
+  Paired-difference T_transfer = mean(D_i - C_i) at each length:
+        10 tokens: 25.3ms (95%CI [20.0, 30.5], n=24)
+        50 tokens: 32.2ms (95%CI [27.6, 36.8], n=29)
+       100 tokens: 27.5ms (95%CI [22.5, 32.4], n=30)
+       250 tokens: 27.6ms (95%CI [22.0, 33.3], n=28)
+       500 tokens: 27.1ms (95%CI [16.9, 37.3], n=29)
+      1000 tokens: 33.4ms (95%CI [32.6, 34.2], n=28)
+      2000 tokens: insufficient paired runs (0)
+      4096 tokens: insufficient paired runs (0)
+
+  Crossover analysis (T_transfer vs T_prefill):
+    T_transfer < T_prefill at ALL measured lengths (compute-dominated)
+    Crossover may occur beyond 1000 tokens
+
+  Linearity: Pearson r(seq_len, T_transfer) = 0.920 — non-linear
+    Transfer cost is not purely bandwidth-limited; investigate protocol overhead or memory allocation
+
+  Validation: A ≈ B (same model, different GPU)
+        10: A=205.7ms, B=204.0ms, diff=0.8%
+        50: A=208.2ms, B=208.8ms, diff=0.3%
+       100: A=209.9ms, B=210.0ms, diff=0.0%
+       250: A=211.9ms, B=210.8ms, diff=0.5%
+       500: A=210.6ms, B=211.2ms, diff=0.3%
+      1000: A=211.2ms, B=210.6ms, diff=0.3%
+
+
+============================================================
+  Experiment 6: Saturation Profiling
+============================================================
+
+  Data quality:
+      71/7950 requests with error field set
+
+      Config |   QPS |    n |      p50 |      p90 |      p99 |  err% |  delay_p50 |  delay_p99
+  -----------+-------+------+----------+----------+----------+-------+------------+-----------
+    BASELINE |     1 |  30*|   207.0ms |   210.2ms |   220.7ms |    0% |       0.1ms |       0.4ms  
+    BASELINE |     2 |  60*|   207.8ms |   209.5ms |   230.0ms |    0% |       0.1ms |       0.2ms  
+    BASELINE |     4 | 120 |   208.1ms |   210.1ms |   220.3ms |    0% |       0.1ms |       0.3ms  
+    BASELINE |     8 | 240 |   232.8ms |   237.5ms |   245.9ms |    0% |       0.1ms |       0.1ms  
+    BASELINE |    12 | 360 |   234.9ms |   239.5ms |   243.5ms |    0% |       0.1ms |       0.1ms  
+    BASELINE |    16 | 480 |   235.9ms |   240.6ms |   243.5ms |    0% |       0.1ms |       0.1ms  
+    BASELINE |    24 | 720 |   253.4ms |   258.1ms |   263.9ms |    0% |       0.1ms |       0.2ms  
+    BASELINE |    32 | 960 |   258.4ms |   263.1ms |   270.8ms |    0% |       0.1ms |       0.1ms  
+   DISAGG-1D |     1 |  30*|   265.0ms |   266.7ms |   268.7ms |    0% |       0.1ms |       0.2ms  
+   DISAGG-1D |     2 |  60*|   266.9ms |   272.7ms |   290.7ms |    0% |       0.1ms |       0.2ms  
+   DISAGG-1D |     4 | 120 |   280.9ms |   285.4ms |   288.2ms |    0% |       0.1ms |       0.1ms  
+   DISAGG-1D |     8 | 240 |   317.3ms |   323.0ms |   327.6ms |    0% |       0.1ms |       0.1ms  
+   DISAGG-1D |    12 | 360 |   321.8ms |   329.0ms |   341.0ms |    0% |       0.1ms |       0.4ms  
+   DISAGG-1D |    16 | 480 |   325.2ms |   347.4ms |   348.6ms |    0% |       0.1ms |       0.4ms  
+   DISAGG-1D |    24 | 703 | 168602.6ms | 230084.6ms | 245290.1ms |    2% |  526786.0ms | 1149005.0ms !
+   DISAGG-1D |    32 | 931 | 211508.9ms | 290325.0ms | 298351.9ms |    3% |  765969.9ms | 1406229.2ms !
+   DISAGG-2D |     1 |  30*|   299.7ms |   304.8ms |   307.9ms |    0% |       0.1ms |       0.3ms  
+   DISAGG-2D |     2 |  60*|   265.8ms |   277.1ms |   305.7ms |    0% |       0.1ms |       0.2ms  
+   DISAGG-2D |     4 | 120 |   267.1ms |   277.9ms |   310.5ms |    0% |       0.1ms |       0.3ms  
+   DISAGG-2D |     8 | 240 |   267.0ms |   282.0ms |   291.3ms |    0% |       0.1ms |       0.1ms  
+   DISAGG-2D |    12 | 360 |   318.5ms |   329.7ms |   342.2ms |    0% |       0.1ms |       1.4ms  
+   DISAGG-2D |    16 | 480 |   317.0ms |   323.6ms |   338.3ms |    0% |       0.1ms |       1.2ms  
+   DISAGG-2D |    24 | 695 | 170904.6ms | 200024.5ms | 203469.6ms |    3% |  564955.2ms | 1098524.9ms !
+   DISAGG-2D |    32 |    0 |  no data |          |          |    0% |
+
+  * = n<100 (p99 estimate is approximate)  ! = depart delay >50ms (harness saturated)
+
+  Saturation Analysis (SLO: p99 > 2.0x baseline p50):
+    BASELINE: no saturation observed up to QPS=32.0
+    DISAGG-1D: saturates at QPS=24.0 (p99=245290.1ms > threshold=530.0ms)
+    DISAGG-2D: saturates at QPS=24.0 (p99=203469.6ms > threshold=599.4ms)
+
+  Scaling dividend: BASELINE did not saturate, cannot compute ratio
+
+  WARNING: Test harness saturation detected (depart delay > 50ms):
+    DISAGG-1D at QPS=24.0: median depart delay = 526786.0ms
+    DISAGG-1D at QPS=32.0: median depart delay = 765969.9ms
+    DISAGG-2D at QPS=24.0: median depart delay = 564955.2ms
+    Results at these QPS levels reflect closed-loop behavior.
+
+
+============================================================
+  Experiment 7: Mixed Workload
+============================================================
+
+  Data quality:
+  Completeness warnings:
+      config=BASELINE/workload_class=long: 45 rows (expected 184)
+      config=DISAGG-2D/workload_class=long: 45 rows (expected 184)
+
+  BASELINE / long: 45/45 OK (20% of mix)
+  BASELINE / short: 184/184 OK (80% of mix)
+  DISAGG-2D / long: 45/45 OK (20% of mix)
+  DISAGG-2D / short: 184/184 OK (80% of mix)
+
+      Config |  Class |    n |  TTFT p50 |  TTFT p99 |  ITL mean |   ITL p99
+  -----------+--------+------+-----------+-----------+-----------+----------
+    BASELINE |   long |   45 |     33.1ms |     41.7ms |    10.3ms |    11.6ms
+    BASELINE |  short |  184 |     30.8ms |     39.6ms |    10.5ms |    11.3ms
+   DISAGG-2D |   long |   45 |     85.2ms |    147.0ms |    10.0ms |    12.7ms
+   DISAGG-2D |  short |  184 |     78.0ms |    163.8ms |     9.7ms |    11.0ms
+
+  ═══════════════════════════════════════════════════
+  THE VERDICT
+  ═══════════════════════════════════════════════════
+
+  1. TTFT OVERHEAD (short requests):
+     Baseline:     30.8ms (p50)
+     Disaggregated: 78.0ms (p50)
+     Overhead:     +47.2ms (+153%)
+     → Significant overhead — investigate sidecar/transfer cost
+
+  2. ITL STABILITY (short requests — decode quality under mixed load):
+     Baseline     ITL: mean=10.5ms, p99=11.3ms
+     Disaggregated ITL: mean=9.7ms, p99=11.0ms
+     ITL p99 ratio: 0.97x
+     → Disagg improves decode quality
+
+  3. GOODPUT (successful req/s at offered load):
+     Baseline:      3.9 req/s
+     Disaggregated: 3.9 req/s
+     Ratio: 1.00x
+     → Similar goodput (neither wins at this QPS)
+
+  ─────────────────────────────────────────────────
+  VERDICT: Disaggregation is NOT justified at this operating point. Overhead exceeds benefit.
+  ─────────────────────────────────────────────────
+
+

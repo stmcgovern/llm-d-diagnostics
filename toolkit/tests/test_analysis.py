@@ -11,7 +11,7 @@ import unittest
 
 # Import from parent directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from analyze import pearson_r, stats, analyze_exp5, analyze_exp6
+from analyze import analyze_exp5, analyze_exp6, pearson_r
 
 
 class TestPearsonR(unittest.TestCase):
