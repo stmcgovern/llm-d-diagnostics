@@ -7,6 +7,8 @@ metadata:
     app.kubernetes.io/part-of: vllm-disagg
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: vllm-prefill
@@ -25,17 +27,17 @@ spec:
         - vllm.entrypoints.openai.api_server
         args:
         - --model
-        - TinyLlama/TinyLlama-1.1B-Chat-v1.0
+        - $(MODEL_NAME)
         - --host
         - "0.0.0.0"
         - --port
         - "8100"
         - --dtype
-        - float16
+        - $(DTYPE)
         - --gpu-memory-utilization
-        - "0.8"
+        - $(GPU_MEMORY_UTILIZATION)
         - --max-model-len
-        - "2048"
+        - $(MAX_MODEL_LEN)
         - --trust-remote-code
         - --kv-transfer-config
         - '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'
@@ -46,6 +48,9 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
+        envFrom:
+        - configMapRef:
+            name: vllm-model-config
         ports:
         - containerPort: 8100
           name: http
@@ -62,20 +67,29 @@ spec:
             cpu: "4"
             memory: 16Gi
             nvidia.com/gpu: "1"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8100
+          failureThreshold: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
         readinessProbe:
           httpGet:
             path: /health
             port: 8100
-          initialDelaySeconds: 30
           periodSeconds: 10
           timeoutSeconds: 5
         livenessProbe:
           httpGet:
             path: /health
             port: 8100
-          initialDelaySeconds: 60
           periodSeconds: 30
           timeoutSeconds: 5
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5"]
         volumeMounts:
         - name: model-cache
           mountPath: /model-cache
@@ -88,6 +102,7 @@ spec:
       - name: dshm
         emptyDir:
           medium: Memory
+          sizeLimit: 4Gi
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

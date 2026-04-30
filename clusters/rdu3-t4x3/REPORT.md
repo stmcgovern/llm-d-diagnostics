@@ -42,7 +42,7 @@ adds +47ms TTFT overhead with no measurable ITL or throughput benefit.
 | KV transfer | NixlConnector, UCX over TCP |
 | Routing sidecar | llm-d-routing-sidecar v0.6.1 (nixlv2 connector) |
 | KV config | max_model_len=2048, gpu_memory_utilization=0.8 |
-| Diagnostics toolkit | This repository (`scripts/toolkit/`) |
+| Diagnostics toolkit | This repository (`toolkit/`) |
 
 ### 1.1 Topology
 

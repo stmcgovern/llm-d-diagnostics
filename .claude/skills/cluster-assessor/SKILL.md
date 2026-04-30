@@ -1,5 +1,5 @@
 ---
-name: assess-cluster
+name: cluster-assessor
 description: Run the llm-d diagnostics toolkit against a cluster and produce an assessment
 allowed-tools: Read, Bash, Grep, Glob, Write, Edit, Agent
 argument-hint: [cluster-name] [namespace]
@@ -62,7 +62,7 @@ oc get network.operator cluster -o jsonpath='{.spec.defaultNetwork.type}'
 
 ```bash
 # Copy toolkit to test-client pod
-oc cp scripts/toolkit test-client:/scripts/toolkit -n <namespace>
+oc cp toolkit test-client:/scripts/toolkit -n <namespace>
 
 # Experiments 1-3 run inside the pod
 oc exec test-client -n <namespace> -- python3 /scripts/toolkit/exp1_latency.py
@@ -71,7 +71,7 @@ oc exec test-client -n <namespace> -- python3 /scripts/toolkit/exp2_throughput.p
 oc exec test-client -n <namespace> -- python3 /scripts/toolkit/exp3_isolation.py
 
 # Experiment 4 runs locally (it kills pods via oc)
-NS=<namespace> python3 scripts/toolkit/exp4_fault.py
+NS=<namespace> python3 toolkit/exp4_fault.py
 ```
 
 Run experiments sequentially. After each one completes, report what happened
@@ -92,7 +92,7 @@ cp data/exp4-results.csv clusters/<cluster-name>/data/ 2>/dev/null
 ### 4. Analyze
 
 ```bash
-python3 scripts/toolkit/analyze.py clusters/<cluster-name>/data/
+python3 toolkit/analyze.py clusters/<cluster-name>/data/
 ```
 
 Read the full output. Note:

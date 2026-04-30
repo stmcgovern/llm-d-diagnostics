@@ -5,6 +5,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: vllm-disagg
 spec:
+  # storageClassName: set via STORAGE_CLASS in env.sh (deploy.sh generates PVC)
   accessModes:
   - ReadWriteMany
   resources:

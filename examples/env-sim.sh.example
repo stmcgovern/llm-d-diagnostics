@@ -1,0 +1,19 @@
+#!/bin/bash
+# Simulation mode — no GPUs required
+#
+# Uses llm-d-inference-sim to emulate prefill/decode with configurable
+# latency. Good for validating the toolkit, manifests, and experiment
+# workflow before requesting GPU access.
+#
+# Usage:
+#   cp examples/env-sim.sh.example clusters/my-sim/env.sh
+#   ./scripts/deploy.sh clusters/my-sim sim
+#   SIM=1 ./toolkit/run.sh clusters/my-sim latency
+
+export NS=my-namespace
+export MODEL="sim-model"
+export SIM=1
+export DATA_DIR="clusters/my-sim/data"
+
+# In-cluster prefill service URL
+export PREFILL_HOST="vllm-prefill-svc.${NS}.svc.cluster.local:8100"

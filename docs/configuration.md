@@ -34,8 +34,69 @@ to a specific cluster.
 | `LONG_PCT` | `20` | exp7 | Percentage of long prompts in mix |
 | `SHORT_TOKENS` | `10` | exp7 | Short prompt token count |
 | `LONG_TOKENS` | `500` | exp7 | Long prompt token count |
+| `TEST_CLIENT` | `test-client` | exp4 | Pod name for test client |
+| `PREFILL_DEPLOY` | `vllm-prefill` | exp4 | Prefill deployment name |
+| `DECODE1_DEPLOY` | `vllm-decode` | exp4 | Decode-1 deployment name |
+| `DECODE2_DEPLOY` | `vllm-decode-2` | exp4 | Decode-2 deployment name |
+| `LOAD_REQUESTS` | `8` | exp4e | Concurrent requests for failure-under-load |
+| `NETEM_DELAY_MS` | `100` | exp4g | Added latency for slow-network test |
+| `NETEM_LOSS_PCT` | `10` | exp4g | Packet loss percentage |
+| `KEEPALIVE_RUNS` | `3` | exp4h | UCX keepalive measurement runs |
+| `KILL_DELAYS_MS` | `100,200,500` | exp4i | Kill delays for mid-transfer test |
+| `LOAD_QPS` | `4` | exp4k, exp4l | Target QPS for sustained load tests |
+| `LOAD_DURATION` | `60` | exp4k | Duration of load test in seconds |
+| `KILL_AT_S` | `10` | exp4k | Seconds before prefill kill |
+| `ROLLOUT_DURATION` | `90` | exp4l | Duration of rolling update test |
+| `CACHE_LENGTHS` | `100,500,1000` | exp8 | Prompt lengths for prefix cache test |
+| `CONV_RUNS` | `5` | exp8 | Multi-turn conversation runs |
+| `CACHE_DECAY_S` | `30` | exp8 | Delay between cache hit checks |
+| `LOAD_RUNS` | `3` | exp9 | Number of cold-start measurements |
+| `DECODE_SELECTOR` | `app=vllm-decode` | exp9 | Pod selector for decode pod to kill |
+| `STARTUP_TIMEOUT` | `600` | exp9 | Max wait for pod restart (seconds) |
+| `EVICTION_DELAYS` | `10,30,60` | exp10 | Delay sweep for cache eviction |
+| `EVICTION_RUNS` | `5` | exp10 | Runs per delay interval |
+| `CACHE_PROMPT_TOKENS` | `500` | exp10 | Prompt length for eviction test |
+| `BG_LOAD` | `0` | exp10 | Background QPS during eviction test |
+| `PRESSURE_PROMPTS_N` | `20` | exp10 | Eviction pressure prompts |
 
-Full list in [`scripts/toolkit/client.py`](../scripts/toolkit/client.py) and each experiment script.
+Full list in [`toolkit/client.py`](../toolkit/client.py) and each experiment script.
+
+## Model configuration (Kubernetes manifests)
+
+The model name, context length, GPU memory utilization, and dtype are
+defined once in a ConfigMap (`manifests/00-model-config.yaml`). All
+deployments reference it. To switch models, edit the ConfigMap and
+re-apply:
+
+```yaml
+# manifests/00-model-config.yaml
+data:
+  MODEL_NAME: "meta-llama/Llama-3.1-8B-Instruct"
+  MAX_MODEL_LEN: "4096"
+  GPU_MEMORY_UTILIZATION: "0.9"
+  DTYPE: "float16"
+```
+
+When deploying with `deploy.sh`, the ConfigMap is generated from `env.sh`
+values — you don't need to edit the yaml. If deploying manually with
+`oc apply -f manifests/`, edit `00-model-config.yaml` directly and ensure
+`MODEL` in `env.sh` matches `MODEL_NAME` in the ConfigMap.
+
+## Deployment configuration
+
+| Variable | Default | What it does |
+|----------|---------|-------------|
+| `VLLM_IMAGE` | `vllm/vllm-openai:v0.18.1` | vLLM container image |
+| `SIDECAR_IMAGE` | `ghcr.io/llm-d/llm-d-routing-sidecar:v0.6.1` | Routing sidecar image |
+| `MODEL_CACHE_SIZE` | `50Gi` | PVC size for model weights cache |
+| `STORAGE_CLASS` | (cluster default) | Kubernetes StorageClass for model-cache PVC |
+| `MAX_MODEL_LEN` | `2048` | Maximum sequence length |
+| `GPU_MEMORY_UTILIZATION` | `0.8` | vLLM GPU memory fraction |
+| `DTYPE` | `float16` | Model weight precision |
+
+`STORAGE_CLASS` must support `ReadWriteMany` if pods are spread across
+nodes (anti-affinity). On OpenShift OCS, use `ocs-storagecluster-cephfs`.
+If unset, the cluster's default StorageClass is used.
 
 ## Cluster config file
 
@@ -46,8 +107,24 @@ Each cluster has an `env.sh` that sets the variables for that deployment:
 export NS=my-namespace
 export MODEL="my-org/my-model"
 export DATA_DIR="clusters/my-cluster/data"
+export STORAGE_CLASS="my-rwx-storage-class"  # must support ReadWriteMany
 export PREFILL_HOST="vllm-prefill-svc.${NS}.svc.cluster.local:8100"
 ```
 
 Source it before running experiments directly, or let `run.sh` source it
 automatically.
+
+## Security notes
+
+This toolkit is designed for **internal cluster diagnostics with trusted
+operators**. A few things to be aware of:
+
+- **TLS verification is disabled** in client.py (`ssl.CERT_NONE`). The
+  llm-d routing sidecar generates self-signed certificates at startup —
+  there is no CA to verify against. This is inherent to the sidecar design.
+- **Containers run as root** because vLLM requires it for CUDA and NIXL
+  memory registration. OpenShift SCCs enforce additional restrictions at
+  the cluster level.
+- **Model cache PVC is read-write** because vLLM downloads model weights
+  on first startup. A production deployment should pre-populate the cache
+  and mount read-only.

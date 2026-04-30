@@ -13,8 +13,8 @@ import unittest
 from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from exp7_mixed_workload import poisson_intervals, pick_workload, compute_itl
 from analyze import analyze_exp7
+from exp7_mixed_workload import compute_itl, pick_workload, poisson_intervals
 
 
 class TestPoissonIntervals(unittest.TestCase):
@@ -95,7 +95,7 @@ class TestComputeITL(unittest.TestCase):
         self.assertEqual(p99, 0.0)
 
     def test_empty(self):
-        mean, p99 = compute_itl([])
+        mean, _p99 = compute_itl([])
         self.assertEqual(mean, 0.0)
 
     def test_variable_gaps(self):
@@ -139,7 +139,12 @@ class TestExp7Analysis(unittest.TestCase):
         return rows
 
     def test_verdict_beneficial(self):
-        """Disagg wins on ITL and throughput → BENEFICIAL."""
+        """Disagg wins on overhead + ITL but same goodput → IMPROVES latency.
+
+        With equal goodput across 3 GPUs (disagg) vs 1 GPU (baseline), the
+        cost-aware verdict correctly flags poor GPU efficiency rather than
+        blindly claiming "beneficial".
+        """
         rows = []
         # BASELINE: high ITL, moderate TTFT
         rows += self._make_rows("BASELINE", "short", 50, ttft=50, itl_mean=30, itl_p99=80)
@@ -156,7 +161,12 @@ class TestExp7Analysis(unittest.TestCase):
             with redirect_stdout(output):
                 analyze_exp7(tmpdir)
             text = output.getvalue()
-            self.assertIn("BENEFICIAL", text)
+            # Cost-aware verdict: latency improves but GPU efficiency is poor
+            self.assertIn("IMPROVES latency", text)
+            self.assertIn("GPU efficiency", text)
+            # Scorecard should show overhead and ITL passing
+            self.assertIn("Overhead < 20%:     PASS", text)
+            self.assertIn("ITL p99 improved:   PASS", text)
 
     def test_verdict_not_justified(self):
         """Disagg has high overhead and same ITL → NOT justified."""

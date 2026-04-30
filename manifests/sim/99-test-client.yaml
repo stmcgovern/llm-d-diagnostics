@@ -4,16 +4,25 @@ metadata:
   name: test-client
   labels:
     app: test-client
+    app.kubernetes.io/part-of: vllm-disagg
 spec:
   containers:
   - name: python
     image: python:3.12-alpine
     command: ["sleep", "infinity"]
+    envFrom:
+    - configMapRef:
+        name: vllm-model-config
+    env:
+    - name: NS
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.namespace
     resources:
       requests:
-        cpu: "100m"
-        memory: 128Mi
-      limits:
         cpu: "500m"
-        memory: 256Mi
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 1Gi
   restartPolicy: Never

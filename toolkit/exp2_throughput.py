@@ -18,17 +18,28 @@ Additional env vars:
 """
 
 import os
+import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(__file__))
 from client import (
-    BASELINE_URL, DISAGG_D1_URL, DISAGG_D2_URL, MODEL,
-    WARMUP, DATA_DIR, PREFILL_HOST,
-    build_prompt, send_request, CSVWriter,
-    progress, dot, print_config, env, write_run_info,
+    BASELINE_URL,
+    DATA_DIR,
+    DISAGG_D1_URL,
+    DISAGG_D2_URL,
+    PREFILL_HOST,
+    WARMUP,
+    build_prompt,
+    dot,
+    env,
+    print_config,
+    progress,
+    send_request,
+    write_run_info,
 )
+from schemas import ConfigThroughput, Exp2Row, TypedCSVWriter
 
 TOTAL_REQUESTS = int(env("TOTAL_REQUESTS", "20"))
 MAX_TOKENS = int(env("MAX_TOKENS", "30"))
@@ -39,10 +50,6 @@ PROMPT = build_prompt(PROMPT_TOKENS)
 
 DISAGG_HEADERS = {"x-prefiller-host-port": PREFILL_HOST}
 
-FIELDS = [
-    "experiment", "config", "run", "concurrency",
-    "ttft_ms", "total_ms", "status_code", "target", "error",
-]
 
 
 def send_one(url, headers, tag):
@@ -56,7 +63,7 @@ def main():
     write_run_info("exp2", {"concurrency_levels": CONCURRENCY_LEVELS,
                             "total_requests": TOTAL_REQUESTS,
                             "prompt_tokens": PROMPT_TOKENS})
-    writer = CSVWriter(outfile, FIELDS)
+    writer = TypedCSVWriter(outfile, Exp2Row)
 
     progress("=== Experiment 2: Throughput Under Load ===")
     print_config()
@@ -68,14 +75,16 @@ def main():
     for concurrency in CONCURRENCY_LEVELS:
         progress(f"--- Concurrency: {concurrency} ---")
 
-        for config_name in ["BASELINE", "DISAGG-1D", "DISAGG-2D"]:
+        config_order = [ConfigThroughput.BASELINE, ConfigThroughput.DISAGG_1D, ConfigThroughput.DISAGG_2D]
+        random.shuffle(config_order)
+        for config_name in config_order:
             progress(f"  {config_name}: ", end="")
 
             # Warm-up (sequential, exercise all endpoints)
             for i in range(WARMUP):
-                if config_name == "BASELINE":
+                if config_name == ConfigThroughput.BASELINE:
                     send_request(BASELINE_URL, PROMPT, MAX_TOKENS)
-                elif config_name == "DISAGG-2D" and i % 2 == 1:
+                elif config_name == ConfigThroughput.DISAGG_2D and i % 2 == 1:
                     send_request(DISAGG_D2_URL, PROMPT, MAX_TOKENS,
                                  extra_headers=DISAGG_HEADERS)
                 else:
@@ -91,12 +100,12 @@ def main():
                 futures = []
 
                 with ThreadPoolExecutor(max_workers=batch_size) as pool:
-                    for i in range(batch_size):
+                    for _i in range(batch_size):
                         run += 1
                         run_num = run  # capture current value for this future
-                        if config_name == "BASELINE":
+                        if config_name == ConfigThroughput.BASELINE:
                             f = pool.submit(send_one, BASELINE_URL, None, "d1")
-                        elif config_name == "DISAGG-1D":
+                        elif config_name == ConfigThroughput.DISAGG_1D:
                             f = pool.submit(send_one, DISAGG_D1_URL,
                                             DISAGG_HEADERS, "d1")
                         else:  # DISAGG-2D: round-robin
@@ -115,6 +124,7 @@ def main():
                             "config": config_name,
                             "run": run_num,
                             "concurrency": concurrency,
+                            "pod": "service-lb",
                             "ttft_ms": r.ttft_ms,
                             "total_ms": r.total_ms,
                             "status_code": r.status,

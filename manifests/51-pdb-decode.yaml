@@ -1,0 +1,15 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vllm-decode-pdb
+  labels:
+    app.kubernetes.io/part-of: vllm-disagg
+spec:
+  maxUnavailable: 1
+  selector:
+    matchExpressions:
+    - key: app
+      operator: In
+      values:
+      - vllm-decode
+      - vllm-decode-2

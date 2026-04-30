@@ -26,11 +26,22 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(__file__))
 from client import (
-    BASELINE_URL, DISAGG_D1_URL, DISAGG_D2_URL, MODEL,
-    WARMUP, DATA_DIR, PREFILL_HOST,
-    build_prompt, send_request, send_streaming, CSVWriter,
-    progress, dot, print_config, env, write_run_info,
+    BASELINE_URL,
+    DATA_DIR,
+    DISAGG_D1_URL,
+    DISAGG_D2_URL,
+    PREFILL_HOST,
+    WARMUP,
+    build_prompt,
+    dot,
+    env,
+    print_config,
+    progress,
+    send_request,
+    send_streaming,
+    write_run_info,
 )
+from schemas import ConfigIsolation, Exp3Row, TypedCSVWriter, Weight
 
 TRIALS = int(env("TRIALS", "10"))
 HEAVY_MAX = int(env("HEAVY_MAX", "50"))
@@ -43,11 +54,6 @@ LIGHT_PROMPT = build_prompt(LIGHT_PROMPT_TOKENS)
 
 DISAGG_HEADERS = {"x-prefiller-host-port": PREFILL_HOST}
 
-FIELDS = [
-    "experiment", "config", "trial", "weight", "idx",
-    "ttft_ms", "total_ms", "status_code",
-    "completion_tokens", "itl_ms", "error",
-]
 
 
 def send_one(url, headers, prompt, max_tokens):
@@ -62,7 +68,7 @@ def main():
                             "light_prompt_tokens": LIGHT_PROMPT_TOKENS,
                             "heavy_max_tokens": HEAVY_MAX,
                             "light_max_tokens": LIGHT_MAX})
-    writer = CSVWriter(outfile, FIELDS)
+    writer = TypedCSVWriter(outfile, Exp3Row)
 
     progress("=== Experiment 3: Prefill Isolation ===")
     print_config()
@@ -72,21 +78,21 @@ def main():
     progress("")
 
     configs = {
-        "BASELINE": [
-            (BASELINE_URL, None, HEAVY_PROMPT, HEAVY_MAX, "heavy", 0),
-            (BASELINE_URL, None, LIGHT_PROMPT, LIGHT_MAX, "light", 1),
-            (BASELINE_URL, None, LIGHT_PROMPT, LIGHT_MAX, "light", 2),
-            (BASELINE_URL, None, LIGHT_PROMPT, LIGHT_MAX, "light", 3),
-            (BASELINE_URL, None, LIGHT_PROMPT, LIGHT_MAX, "light", 4),
-            (BASELINE_URL, None, LIGHT_PROMPT, LIGHT_MAX, "light", 5),
+        ConfigIsolation.BASELINE: [
+            (BASELINE_URL, None, HEAVY_PROMPT, HEAVY_MAX, Weight.HEAVY, 0),
+            (BASELINE_URL, None, LIGHT_PROMPT, LIGHT_MAX, Weight.LIGHT, 1),
+            (BASELINE_URL, None, LIGHT_PROMPT, LIGHT_MAX, Weight.LIGHT, 2),
+            (BASELINE_URL, None, LIGHT_PROMPT, LIGHT_MAX, Weight.LIGHT, 3),
+            (BASELINE_URL, None, LIGHT_PROMPT, LIGHT_MAX, Weight.LIGHT, 4),
+            (BASELINE_URL, None, LIGHT_PROMPT, LIGHT_MAX, Weight.LIGHT, 5),
         ],
-        "DISAGG-2D": [
-            (DISAGG_D1_URL, DISAGG_HEADERS, HEAVY_PROMPT, HEAVY_MAX, "heavy", 0),
-            (DISAGG_D1_URL, DISAGG_HEADERS, LIGHT_PROMPT, LIGHT_MAX, "light", 1),
-            (DISAGG_D2_URL, DISAGG_HEADERS, LIGHT_PROMPT, LIGHT_MAX, "light", 2),
-            (DISAGG_D1_URL, DISAGG_HEADERS, LIGHT_PROMPT, LIGHT_MAX, "light", 3),
-            (DISAGG_D2_URL, DISAGG_HEADERS, LIGHT_PROMPT, LIGHT_MAX, "light", 4),
-            (DISAGG_D1_URL, DISAGG_HEADERS, LIGHT_PROMPT, LIGHT_MAX, "light", 5),
+        ConfigIsolation.DISAGG_2D: [
+            (DISAGG_D1_URL, DISAGG_HEADERS, HEAVY_PROMPT, HEAVY_MAX, Weight.HEAVY, 0),
+            (DISAGG_D1_URL, DISAGG_HEADERS, LIGHT_PROMPT, LIGHT_MAX, Weight.LIGHT, 1),
+            (DISAGG_D2_URL, DISAGG_HEADERS, LIGHT_PROMPT, LIGHT_MAX, Weight.LIGHT, 2),
+            (DISAGG_D1_URL, DISAGG_HEADERS, LIGHT_PROMPT, LIGHT_MAX, Weight.LIGHT, 3),
+            (DISAGG_D2_URL, DISAGG_HEADERS, LIGHT_PROMPT, LIGHT_MAX, Weight.LIGHT, 4),
+            (DISAGG_D1_URL, DISAGG_HEADERS, LIGHT_PROMPT, LIGHT_MAX, Weight.LIGHT, 5),
         ],
     }
 
@@ -94,7 +100,7 @@ def main():
         progress(f"  Config: {config_name}")
 
         # Warm-up (use a light request spec)
-        light_spec = next(s for s in request_specs if s[4] == "light")
+        light_spec = next(s for s in request_specs if s[4] == Weight.LIGHT)
         for _ in range(WARMUP):
             send_request(light_spec[0], LIGHT_PROMPT, LIGHT_MAX,
                          extra_headers=light_spec[1])
@@ -124,6 +130,7 @@ def main():
                         "trial": trial,
                         "weight": weight,
                         "idx": idx,
+                        "pod": "service-lb",
                         "ttft_ms": r.ttft_ms,
                         "total_ms": r.total_ms,
                         "status_code": r.status,

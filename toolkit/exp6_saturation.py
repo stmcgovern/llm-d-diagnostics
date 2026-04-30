@@ -16,8 +16,8 @@ The gap between monolithic and disaggregated saturation points is the
 scaling dividend — the quantified benefit of disaggregation.
 
 Usage:
-    python3 scripts/toolkit/exp6_saturation.py
-    QPS_LEVELS=1,2,4,8,16 DURATION_S=60 python3 scripts/toolkit/exp6_saturation.py
+    python3 toolkit/exp6_saturation.py
+    QPS_LEVELS=1,2,4,8,16 DURATION_S=60 python3 toolkit/exp6_saturation.py
 
 Additional env vars:
     QPS_LEVELS    Comma-separated target QPS values (default: 1,2,4,8,12,16,24,32)
@@ -28,17 +28,28 @@ Additional env vars:
 
 import os
 import sys
-import time
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(__file__))
 from client import (
-    BASELINE_URL, DISAGG_D1_URL, DISAGG_D2_URL, MODEL,
-    MAX_TOKENS, WARMUP, DATA_DIR, PREFILL_HOST,
-    build_prompt, send_request, CSVWriter,
-    progress, dot, print_config, env, write_run_info,
+    BASELINE_URL,
+    DATA_DIR,
+    DISAGG_D1_URL,
+    DISAGG_D2_URL,
+    MAX_TOKENS,
+    PREFILL_HOST,
+    WARMUP,
+    build_prompt,
+    dot,
+    env,
+    print_config,
+    progress,
+    send_request,
+    write_run_info,
 )
+from schemas import ConfigThroughput, Exp6Row, TypedCSVWriter
 
 QPS_LEVELS = [float(x) for x in env("QPS_LEVELS", "1,2,4,8,12,16,24,32").split(",")]
 DURATION_S = int(env("DURATION_S", "30"))
@@ -49,23 +60,17 @@ PROMPT = build_prompt(PROMPT_TOKENS)
 DISAGG_HEADERS = {"x-prefiller-host-port": PREFILL_HOST}
 
 CONFIGS = [
-    ("BASELINE",  "direct to monolithic vLLM"),
-    ("DISAGG-1D", "sidecar -> prefill -> NIXL -> 1 decode"),
-    ("DISAGG-2D", "sidecar -> prefill -> NIXL -> 2 decodes (round-robin)"),
-]
-
-FIELDS = [
-    "experiment", "config", "qps_target", "seq",
-    "depart_delay_ms", "ttft_ms", "total_ms",
-    "status_code", "completion_tokens", "error",
+    (ConfigThroughput.BASELINE,  "direct to monolithic vLLM"),
+    (ConfigThroughput.DISAGG_1D, "sidecar -> prefill -> NIXL -> 1 decode"),
+    (ConfigThroughput.DISAGG_2D, "sidecar -> prefill -> NIXL -> 2 decodes (round-robin)"),
 ]
 
 
 def pick_url(config_name, seq):
     """Select the URL for a given config and sequence number."""
-    if config_name == "BASELINE":
+    if config_name == ConfigThroughput.BASELINE:
         return BASELINE_URL
-    elif config_name == "DISAGG-1D":
+    elif config_name == ConfigThroughput.DISAGG_1D:
         return DISAGG_D1_URL
     else:  # DISAGG-2D: round-robin
         return DISAGG_D1_URL if seq % 2 == 1 else DISAGG_D2_URL
@@ -73,7 +78,7 @@ def pick_url(config_name, seq):
 
 def pick_headers(config_name):
     """Select headers for a given config."""
-    if config_name == "BASELINE":
+    if config_name == ConfigThroughput.BASELINE:
         return None
     return DISAGG_HEADERS
 
@@ -119,6 +124,7 @@ def rate_controlled_run(config_name, qps, duration_s, writer):
             "status_code": r.status,
             "completion_tokens": r.completion_tokens,
             "error": r.error,
+            "pod": "service-lb",
         })
         dot()
 
@@ -152,7 +158,7 @@ def main():
     outfile = os.path.join(DATA_DIR, "exp6-results.csv")
     write_run_info("exp6", {"qps_levels": QPS_LEVELS, "duration_s": DURATION_S,
                             "prompt_tokens": PROMPT_TOKENS, "slo_mult": SLO_MULT})
-    writer = CSVWriter(outfile, FIELDS)
+    writer = TypedCSVWriter(outfile, Exp6Row)
 
     progress("=== Experiment 6: Saturation Profiling ===")
     print_config()
@@ -162,32 +168,43 @@ def main():
     progress(f"  Output: {outfile}")
     progress("")
 
-    for config_name, desc in CONFIGS:
-        progress(f"  Config: {config_name} ({desc})")
-
-        # Warm-up: a few sequential requests to prime the system
+    saturated = set()
+    # Warm up all configs first
+    for config_name, _desc in CONFIGS:
         for i in range(WARMUP):
             url = pick_url(config_name, i + 1)
             send_request(url, PROMPT, MAX_TOKENS, extra_headers=pick_headers(config_name))
 
-        for i, qps in enumerate(QPS_LEVELS):
-            # Cooldown between levels: drain + pause
-            if i > 0:
-                url = pick_url(config_name, 1)
-                send_request(url, PROMPT, MAX_TOKENS,
-                             extra_headers=pick_headers(config_name))
-                time.sleep(5)
+    for i, qps in enumerate(QPS_LEVELS):
+        progress(f"--- QPS: {qps} ---")
 
-            total = int(qps * DURATION_S)
-            progress(f"    QPS={qps} ({total} requests over {DURATION_S}s): ", end="")
+        # Cooldown between QPS levels (not between configs at same QPS)
+        if i > 0:
+            time.sleep(5)
 
-            results, actual_qps = rate_controlled_run(
-                config_name, qps, DURATION_S, writer)
+        for config_name, _desc in CONFIGS:
+            if config_name in saturated:
+                progress(f"  {config_name}: SKIPPED (saturated)")
+                continue
+
+            progress(f"  {config_name}: ", end="")
+
+            results, actual_qps = rate_controlled_run(config_name, qps, DURATION_S, writer)
 
             ok = sum(1 for r in results if r.status == 200)
+            fail_rate = 1.0 - (ok / len(results)) if results else 0
+            throughput_ratio = actual_qps / qps if qps > 0 else 1.0
             progress(f" {ok}/{len(results)} OK (actual {actual_qps:.1f} req/s)")
 
-        progress("")
+            if fail_rate > 0.10 or throughput_ratio < 0.50:
+                progress(f"    SATURATED (fail={fail_rate:.0%}, throughput={throughput_ratio:.0%})")
+                saturated.add(config_name)
+
+        if len(saturated) == len(CONFIGS):
+            progress("  All configs saturated, stopping")
+            break
+
+    progress("")
 
     writer.close()
     progress("")
