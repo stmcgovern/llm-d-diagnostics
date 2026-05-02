@@ -21,6 +21,12 @@
 #     fault         Fault tolerance (kills pods — destructive)
 #     model-load    Cold start time (kills pods — destructive)
 #
+#   Advisory (advisor/):
+#     diagnose      Root-cause diagnosis with fix commands
+#     health        Continuous health monitoring + trend detection
+#     plan          GPU capacity planning + cost model
+#     rebalance     P/D ratio recommendation + watch mode
+#
 #   Utilities:
 #     analyze       Statistical analysis of collected data (local)
 #     metrics       Standalone Prometheus metrics collection
@@ -298,6 +304,27 @@ case "$COMMAND" in
         exec "$0" "$CLUSTER_DIR" characterize
         ;;
 
+    # ── Advisory layer commands ────────────────────────────────────────────
+    diagnose)
+        shift 2  # remove cluster-dir and command
+        python3 "$REPO_ROOT/advisor/diagnose.py" --namespace "$NS" "$@"
+        ;;
+
+    health)
+        shift 2
+        python3 "$REPO_ROOT/advisor/health.py" --namespace "$NS" --model "$MODEL" "$@"
+        ;;
+
+    plan)
+        shift 2
+        python3 "$REPO_ROOT/advisor/plan.py" "$@"
+        ;;
+
+    rebalance)
+        shift 2
+        python3 "$REPO_ROOT/advisor/rebalance.py" --namespace "$NS" "$@"
+        ;;
+
     *)
         echo "Unknown command: $COMMAND"
         echo ""
@@ -316,6 +343,11 @@ case "$COMMAND" in
         echo "  kv-eviction     KV cache persistence under pressure"
         echo "  fault           Fault tolerance (destructive)"
         echo "  model-load      Cold start time (destructive)"
+        echo ""
+        echo "  diagnose        Root-cause diagnosis with fix commands"
+        echo "  health          Continuous health monitoring"
+        echo "  plan            GPU capacity planning"
+        echo "  rebalance       P/D ratio recommendation"
         echo ""
         echo "  analyze         Run analysis on collected data"
         echo "  preflight       Verify cluster is ready"
