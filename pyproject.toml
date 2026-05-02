@@ -22,4 +22,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["client", "schemas"]
+known-first-party = ["client", "schemas", "_cluster", "pricing", "probe", "plan"]
+
+[tool.pytest.ini_options]
+testpaths = ["toolkit/tests", "advisor/tests"]

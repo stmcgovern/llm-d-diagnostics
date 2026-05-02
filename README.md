@@ -46,7 +46,24 @@ confidence intervals, and flags data quality issues.
 | `kv-eviction` | KV cache persistence under delay and pressure |
 
 Run `characterize` for all non-destructive experiments. Run `fault-test`
-for destructive experiments (kills pods — confirms before running).
+for destructive experiments (kills pods -- confirms before running).
+
+## Advisory Tools
+
+The `advisor/` directory adds decision-making on top of the measurement data.
+
+```bash
+# Should I disaggregate? (no cluster needed)
+python3 advisor/plan.py --model meta-llama/Llama-3.1-8B-Instruct --gpu-type h100
+
+# What's wrong with my cluster?
+./toolkit/run.sh clusters/my-cluster diagnose
+
+# Is my P/D ratio right?
+./toolkit/run.sh clusters/my-cluster rebalance
+```
+
+Capacity planning, root-cause diagnosis, P/D ratio optimization, and health monitoring. See [advisor/README.md](advisor/README.md) for details.
 
 ## What You Get
 
@@ -128,6 +145,7 @@ the assessment.
 
 ```
 toolkit/            Diagnostics toolkit (Python 3, stdlib only)
+advisor/            Advisory tools: plan, diagnose, rebalance, health
 profiling/          PyTorch profiling wrappers
 manifests/          K8s manifests for real GPU P/D deployment
 manifests/sim/      K8s manifests for inference-sim (no GPU)
