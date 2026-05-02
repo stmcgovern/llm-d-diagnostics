@@ -722,6 +722,33 @@ class PinnedConnection:
         return f"PinnedConnection({self.pod_name}, {self._host}:{self._port}, {tls})"
 
 
+# ── oc/kubectl subprocess wrapper ────────────────────────────────────────────
+
+def oc(*args, timeout=60):
+    """Run an ``oc`` CLI command, raising RuntimeError on non-zero exit.
+
+    Used by advisor/_cluster.py and anywhere else that needs direct ``oc``
+    access.  Consolidates the subprocess pattern that was previously
+    duplicated across advisor modules and _discover_via_oc above.
+    """
+    import subprocess
+    r = subprocess.run(
+        ["oc"] + list(args), capture_output=True, text=True, timeout=timeout,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"oc {' '.join(args)}: {r.stderr.strip()[:200]}")
+    return r.stdout.strip()
+
+
+def oc_safe(*args, timeout=60):
+    """Run an ``oc`` CLI command, returning (stdout, stderr) without raising."""
+    import subprocess
+    r = subprocess.run(
+        ["oc"] + list(args), capture_output=True, text=True, timeout=timeout,
+    )
+    return r.stdout.strip(), r.stderr.strip()
+
+
 # ── Progress output ──────────────────────────────────────────────────────────
 
 def write_run_info(experiment, extra=None):

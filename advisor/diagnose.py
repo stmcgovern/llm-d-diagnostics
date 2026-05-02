@@ -5,25 +5,19 @@ Each check maps to a REAL production bug from llm-d, NVIDIA Dynamo,
 or SGLang. Every issue includes evidence from YOUR cluster, a cause
 explanation with a reference link, and a copy-pasteable fix command.
 
-Part of the llm-d-diagnostics advisory layer.  Depends on
-``advisor/_cluster.py`` for oc subprocess access and on
-``toolkit/client.py`` for streaming request probes.
+Part of the llm-d-diagnostics advisory layer.
 """
 
 import argparse
-import http.client
-import os
 import sys
 from dataclasses import dataclass
 
 try:
-    from ._cluster import oc, oc_safe, get_pods_full as get_pods
+    from ._cluster import oc_safe, get_pods_full as get_pods, scrape_pod_metrics
+    from .probe import _send_probe
 except ImportError:
-    from _cluster import oc, oc_safe, get_pods_full as get_pods
-
-# Import send_streaming from toolkit (one-way dependency: advisor -> toolkit)
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "toolkit"))
-from client import send_streaming  # noqa: E402
+    from _cluster import oc_safe, get_pods_full as get_pods, scrape_pod_metrics
+    from probe import _send_probe
 
 
 @dataclass
@@ -57,7 +51,7 @@ def diagnose(namespace: str, model: str = "") -> list[Issue]:
     issues.extend(_check_image_mismatch(pods, namespace))
     issues.extend(_check_prefill_spof(prefill, namespace))
     issues.extend(_check_kv_roles(pods, namespace))
-    issues.extend(_check_nixl_failures(pods))
+    issues.extend(_check_nixl_failures(pods, namespace))
     issues.extend(_check_kv_cache_pressure(pods, namespace))
     issues.extend(_check_stale_kv_timeout(pods, namespace))
     issues.extend(_check_nixl_config(prefill, namespace))
@@ -113,7 +107,7 @@ def _check_image_mismatch(pods, ns) -> list[Issue]:
 
     if len(all_images) > 1:
         img_list = ", ".join(f"{role}: {list(imgs)[0]}" for role, imgs in images.items())
-        target_image = list(all_images)[0]
+        target_image = sorted(all_images)[0]
         return [Issue(
             "critical",
             "vLLM image version mismatch across pods",
@@ -165,20 +159,15 @@ def _check_kv_roles(pods, ns) -> list[Issue]:
     return []
 
 
-def _check_nixl_failures(pods) -> list[Issue]:
+def _check_nixl_failures(pods, ns="default") -> list[Issue]:
     """Check for active NIXL transfer failures via metrics."""
     for p in pods:
-        ip = p.get("ip", "")
-        if not ip:
+        body = scrape_pod_metrics(p, ns)
+        if not body:
             continue
-        port = 8100 if "prefill" in p.get("name", "") else 8001
-        try:
-            conn = http.client.HTTPConnection(ip, port, timeout=3)
-            conn.request("GET", "/metrics")
-            body = conn.getresponse().read().decode(errors="replace")
-            conn.close()
-            for line in body.split("\n"):
-                if line.startswith("vllm:nixl_num_failed_transfers"):
+        for line in body.split("\n"):
+            if line.startswith("vllm:nixl_num_failed_transfers"):
+                try:
                     val = float(line.split()[-1])
                     if val > 0:
                         return [Issue(
@@ -187,30 +176,24 @@ def _check_nixl_failures(pods) -> list[Issue]:
                             f"{int(val)} failed NIXL KV transfers",
                             "NIXL transfer failures indicate network issues between "
                             "prefill and decode pods, version incompatibility, or "
-                            "NIXL handshake corruption. Concurrent requests + bonding "
-                            "NIC without proper config caused similar failures (llm-d#759).",
+                            "NIXL handshake corruption (llm-d#759).",
                             "https://github.com/llm-d/llm-d/issues/759",
-                            f"oc logs {p['name']} -c vllm | grep -i 'nixl\\|transfer\\|error' | tail -20",
+                            f"oc logs {p['name']} -n {ns} -c vllm | grep -i 'nixl\\|transfer\\|error' | tail -20",
                         )]
-        except Exception:
-            pass
+                except (ValueError, IndexError):
+                    pass
     return []
 
 
 def _check_kv_cache_pressure(pods, ns="default") -> list[Issue]:
     """Check for KV cache nearing capacity -- possible leak (ai-dynamo#6071)."""
     for p in pods:
-        ip = p.get("ip", "")
-        if not ip:
+        body = scrape_pod_metrics(p, ns)
+        if not body:
             continue
-        port = 8100 if "prefill" in p.get("name", "") else 8001
-        try:
-            conn = http.client.HTTPConnection(ip, port, timeout=3)
-            conn.request("GET", "/metrics")
-            body = conn.getresponse().read().decode(errors="replace")
-            conn.close()
-            for line in body.split("\n"):
-                if line.startswith("vllm:kv_cache_usage_perc"):
+        for line in body.split("\n"):
+            if line.startswith("vllm:kv_cache_usage_perc"):
+                try:
                     val = float(line.split()[-1])
                     if val > 0.9:
                         return [Issue(
@@ -224,8 +207,8 @@ def _check_kv_cache_pressure(pods, ns="default") -> list[Issue]:
                             f"oc rollout restart deployment/vllm-prefill -n {ns}",
                             auto_fixable=True,
                         )]
-        except Exception:
-            pass
+                except (ValueError, IndexError):
+                    pass
     return []
 
 
@@ -283,23 +266,9 @@ def _check_kv_expiration(pods, ns) -> list[Issue]:
     """Check for KV block expiration -- vital deployment health indicator (vLLM PR #32340)."""
     issues = []
     for p in pods:
-        ip = p.get("ip", "")
-        if not ip:
-            continue
-        port = 8100 if "prefill" in p.get("name", "") else 8001
-        try:
-            conn = http.client.HTTPConnection(ip, port, timeout=3)
-            conn.request("GET", "/metrics")
-            body = conn.getresponse().read().decode(errors="replace")
-            conn.close()
-        except Exception:
-            body = ""
+        body = scrape_pod_metrics(p, ns)
         if not body:
-            out, _ = oc_safe("exec", p["name"], "-n", ns, "--",
-                             "python3", "-c",
-                             f"import urllib.request;print(urllib.request.urlopen('http://localhost:{port}/metrics',timeout=5).read().decode())",
-                             timeout=10)
-            body = out
+            continue
         for line in body.split("\n"):
             if "nixl_num_kv_expired_reqs" in line and not line.startswith("#"):
                 try:
@@ -324,16 +293,8 @@ def _check_transfer_duration(pods, ns="default") -> list[Issue]:
     """Check NIXL transfer duration for anomalies."""
     issues = []
     for p in pods:
-        ip = p.get("ip", "")
-        if not ip:
-            continue
-        port = 8100 if "prefill" in p.get("name", "") else 8001
-        try:
-            conn = http.client.HTTPConnection(ip, port, timeout=3)
-            conn.request("GET", "/metrics")
-            body = conn.getresponse().read().decode(errors="replace")
-            conn.close()
-        except Exception:
+        body = scrape_pod_metrics(p, ns)
+        if not body:
             continue
         transfer_sum = 0
         transfer_count = 0
@@ -364,33 +325,17 @@ def _check_transfer_duration(pods, ns="default") -> list[Issue]:
 
 
 def _check_probe_health(ns, model) -> list[Issue]:
-    """Send a test disagg request to verify end-to-end pipeline.
-
-    Uses toolkit's send_streaming() for true TTFT measurement.
-    Requires MODEL env var to be set (or defaults to env.sh value).
-    """
-    os.environ.setdefault("MODEL", model)
-    os.environ.setdefault("NS", ns)
+    """Send a test disagg request to verify end-to-end pipeline."""
     url = "https://vllm-decode-svc:8000/v1/completions"
     headers = {"x-prefiller-host-port": f"vllm-prefill-svc.{ns}.svc.cluster.local:8100"}
-    try:
-        r = send_streaming(url, "Hello", max_tokens=5, extra_headers=headers)
-        if r.status != 200:
-            return [Issue(
-                "critical",
-                "Disaggregated inference pipeline is broken",
-                f"Test request returned status={r.status}, error={r.error[:100]}",
-                "The full pipeline (client -> sidecar -> prefill -> NIXL -> decode) is not working. "
-                "Check pod health, NIXL handshake, and sidecar routing.",
-                "",
-                f"oc logs -l app=vllm-decode -c routing-sidecar -n {ns} --tail=20",
-            )]
-    except Exception as e:
+    r = _send_probe(url, model, extra_headers=headers)
+    if r["status"] != 200:
         return [Issue(
             "critical",
             "Disaggregated inference pipeline is broken",
-            f"Test request failed: {str(e)[:100]}",
-            "Could not reach the decode service. Check pod health and network.",
+            f"Test request returned status={r['status']}, error={r['error'][:100]}",
+            "The full pipeline (client -> sidecar -> prefill -> NIXL -> decode) is not working. "
+            "Check pod health, NIXL handshake, and sidecar routing.",
             "",
             f"oc logs -l app=vllm-decode -c routing-sidecar -n {ns} --tail=20",
         )]

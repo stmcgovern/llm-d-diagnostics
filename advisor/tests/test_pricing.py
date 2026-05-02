@@ -1,12 +1,8 @@
 """Tests for advisor/pricing.py — pricing API with live fetch + static fallback."""
 
 import json
-import os
-import sys
 import unittest
 from unittest.mock import patch, MagicMock
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pricing import (
     GPU_TFLOPS_FP16,

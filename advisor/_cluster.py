@@ -1,31 +1,32 @@
-"""Thin oc/kubectl adapter for advisor commands.
+"""Single bridge between advisor/ and toolkit/.
 
-Provides subprocess wrappers for ``oc`` and full-metadata pod discovery.
-This is intentionally minimal — operational helpers only, no model profiles
-or HuggingFace fetching (those live in plan.py and toolkit/scaling_model.py).
+Every advisor module imports cluster operations and toolkit functions
+through this file.  It is the ONLY place that manipulates sys.path to
+reach the toolkit package, keeping the rest of the advisor code clean.
+
+Provides:
+    oc, oc_safe        — re-exported from toolkit/client.py
+    send_streaming     — re-exported from toolkit/client.py
+    SCALING_GPUS       — re-exported from toolkit/scaling_model.py
+    get_pods_full      — advisor-specific full-metadata pod discovery
+    scrape_pod_metrics — shared Prometheus scraping (HTTP + oc exec fallback)
 """
 
+import http.client
 import json
-import subprocess
+import os
+import sys
+
+# ── Toolkit imports (single sys.path entry point) ────────────────────────
+_toolkit_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "toolkit")
+if _toolkit_dir not in sys.path:
+    sys.path.insert(0, _toolkit_dir)
+
+from client import oc, oc_safe, send_streaming  # noqa: E402
+from scaling_model import GPUS as SCALING_GPUS  # noqa: E402
 
 
-def oc(*args, timeout=60):
-    """Run an oc command, raising RuntimeError on non-zero exit."""
-    r = subprocess.run(
-        ["oc"] + list(args), capture_output=True, text=True, timeout=timeout,
-    )
-    if r.returncode != 0:
-        raise RuntimeError(f"oc {' '.join(args)}: {r.stderr.strip()[:200]}")
-    return r.stdout.strip()
-
-
-def oc_safe(*args, timeout=60):
-    """Run an oc command, returning (stdout, stderr) without raising."""
-    r = subprocess.run(
-        ["oc"] + list(args), capture_output=True, text=True, timeout=timeout,
-    )
-    return r.stdout.strip(), r.stderr.strip()
-
+# ── Pod discovery ────────────────────────────────────────────────────────
 
 def get_pods_full(namespace, label=None):
     """Get full pod metadata: name, ip, ready status, labels, image, args.
@@ -55,3 +56,37 @@ def get_pods_full(namespace, label=None):
             "args": str(containers[0].get("args", [])),
         })
     return result
+
+
+# ── Shared metrics scraping ──────────────────────────────────────────────
+
+def scrape_pod_metrics(pod, namespace):
+    """Scrape Prometheus /metrics from a pod.
+
+    Tries direct HTTP to pod IP first (fast, works when pod network is
+    reachable).  Falls back to ``oc exec`` with a Python one-liner when
+    the pod IP is unreachable (e.g. running from a laptop).
+
+    Returns the raw metrics text, or empty string on failure.
+    """
+    ip = pod.get("ip", "")
+    port = 8100 if "prefill" in pod.get("name", "") else 8001
+
+    if ip:
+        try:
+            conn = http.client.HTTPConnection(ip, port, timeout=3)
+            conn.request("GET", "/metrics")
+            body = conn.getresponse().read().decode(errors="replace")
+            conn.close()
+            return body
+        except Exception:
+            pass
+
+    out, _ = oc_safe(
+        "exec", pod["name"], "-n", namespace, "--",
+        "python3", "-c",
+        f"import urllib.request;print(urllib.request.urlopen("
+        f"'http://localhost:{port}/metrics',timeout=5).read().decode())",
+        timeout=10,
+    )
+    return out

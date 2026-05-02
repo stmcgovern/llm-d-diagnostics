@@ -1,14 +1,9 @@
 """Tests for advisor/plan.py — capacity planning, no cluster needed."""
 
 import json
-import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "toolkit"))
 
 from plan import (
     MEASURED_BASELINES,

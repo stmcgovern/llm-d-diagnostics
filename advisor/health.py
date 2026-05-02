@@ -12,16 +12,15 @@ synthetic requests.
 """
 
 import argparse
-import http.client
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 try:
-    from ._cluster import oc_safe, get_pods_full as get_pods
+    from ._cluster import oc_safe, get_pods_full as get_pods, scrape_pod_metrics
     from .probe import DisaggProber, ProbeResult
 except ImportError:
-    from _cluster import oc_safe, get_pods_full as get_pods
+    from _cluster import oc_safe, get_pods_full as get_pods, scrape_pod_metrics
     from probe import DisaggProber, ProbeResult
 
 
@@ -140,29 +139,9 @@ class HealthMonitor:
             return HealthCheck("kv_roles", False, "No KV producer found", "critical")
         return HealthCheck("kv_roles", True, f"{len(producers)} producer(s), {len(consumers)} consumer(s)")
 
-    def _scrape_metrics(self, pod) -> str:
-        """Scrape Prometheus metrics from a pod. Tries pod IP first, falls back to oc exec."""
-        ip = pod.get("ip", "")
-        port = 8100 if "prefill" in pod.get("name", "") else 8001
-        if ip:
-            try:
-                conn = http.client.HTTPConnection(ip, port, timeout=3)
-                conn.request("GET", "/metrics")
-                resp = conn.getresponse()
-                body = resp.read().decode(errors="replace")
-                conn.close()
-                return body
-            except Exception:
-                pass
-        out, _ = oc_safe("exec", pod["name"], "-n", self.namespace, "--",
-                         "python3", "-c",
-                         f"import urllib.request;print(urllib.request.urlopen('http://localhost:{port}/metrics',timeout=5).read().decode())",
-                         timeout=10)
-        return out
-
     def _check_nixl_failures(self, pods) -> HealthCheck:
         for p in pods:
-            body = self._scrape_metrics(p)
+            body = scrape_pod_metrics(p, self.namespace)
             if not body:
                 continue
             for line in body.split("\n"):
@@ -177,7 +156,7 @@ class HealthMonitor:
 
     def _check_kv_pressure(self, pods) -> HealthCheck:
         for p in pods:
-            body = self._scrape_metrics(p)
+            body = scrape_pod_metrics(p, self.namespace)
             if not body:
                 continue
             for line in body.split("\n"):
@@ -195,7 +174,7 @@ class HealthMonitor:
 
         queue_depths = {}
         for p in decode:
-            body = self._scrape_metrics(p)
+            body = scrape_pod_metrics(p, self.namespace)
             if not body:
                 continue
             for line in body.split("\n"):
@@ -221,7 +200,7 @@ class HealthMonitor:
     def _check_kv_expiration(self, pods) -> HealthCheck:
         """Check for KV block expiration (stranded transfers). vLLM PR #32340."""
         for p in pods:
-            body = self._scrape_metrics(p)
+            body = scrape_pod_metrics(p, self.namespace)
             if not body:
                 continue
             for line in body.split("\n"):
@@ -242,7 +221,7 @@ class HealthMonitor:
     def _check_transfer_duration(self, pods) -> HealthCheck:
         """Track NIXL transfer duration for network degradation detection."""
         for p in pods:
-            body = self._scrape_metrics(p)
+            body = scrape_pod_metrics(p, self.namespace)
             if not body:
                 continue
             for line in body.split("\n"):

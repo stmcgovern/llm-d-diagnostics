@@ -140,3 +140,7 @@ python3 -m pytest advisor/tests/ -v   # 87 tests, ~4 seconds
 ```
 
 Covers every decision path: capacity planning (measured + extrapolated), all diagnostic checks, all rebalance thresholds, probe baseline tracking, pricing (static + live fetch), and the cluster adapter.
+
+## Attribution
+
+Advisory tools originated in [disagg-advisor](https://github.com/llm-d/llm-d-diagnostics) by Arkadip Maitra.

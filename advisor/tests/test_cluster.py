@@ -1,19 +1,17 @@
-"""Tests for advisor/_cluster.py — oc wrapper, mocked subprocess."""
+"""Tests for advisor/_cluster.py — oc wrapper (from toolkit) + pod discovery + metrics scraping."""
 
 import json
-import os
-import sys
+import subprocess
 import unittest
 from unittest.mock import patch, MagicMock
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from _cluster import oc, oc_safe, get_pods_full
+from _cluster import oc, oc_safe, get_pods_full, scrape_pod_metrics
 
 
 class TestOc(unittest.TestCase):
+    """oc() and oc_safe() are defined in toolkit/client.py; _cluster re-exports them."""
 
-    @patch("_cluster.subprocess.run")
+    @patch("subprocess.run")
     def test_success(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout="output-text\n", stderr="")
         result = oc("get", "pods")
@@ -22,14 +20,14 @@ class TestOc(unittest.TestCase):
         args = mock_run.call_args[0][0]
         self.assertEqual(args, ["oc", "get", "pods"])
 
-    @patch("_cluster.subprocess.run")
+    @patch("subprocess.run")
     def test_failure_raises(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error msg")
         with self.assertRaises(RuntimeError) as ctx:
             oc("get", "pods")
         self.assertIn("error msg", str(ctx.exception))
 
-    @patch("_cluster.subprocess.run")
+    @patch("subprocess.run")
     def test_timeout_passed(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
         oc("get", "pods", timeout=120)
@@ -39,14 +37,14 @@ class TestOc(unittest.TestCase):
 
 class TestOcSafe(unittest.TestCase):
 
-    @patch("_cluster.subprocess.run")
+    @patch("subprocess.run")
     def test_returns_tuple(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1, stdout="out", stderr="err")
         stdout, stderr = oc_safe("get", "pods")
         self.assertEqual(stdout, "out")
         self.assertEqual(stderr, "err")
 
-    @patch("_cluster.subprocess.run")
+    @patch("subprocess.run")
     def test_does_not_raise_on_failure(self, mock_run):
         mock_run.return_value = MagicMock(returncode=127, stdout="", stderr="not found")
         stdout, stderr = oc_safe("nonexistent")
@@ -124,6 +122,28 @@ class TestGetPodsFull(unittest.TestCase):
         get_pods_full("ns")
         args = mock_oc.call_args[0]
         self.assertNotIn("-l", args)
+
+
+class TestScrapePodMetrics(unittest.TestCase):
+
+    @patch("_cluster.http.client.HTTPConnection")
+    def test_http_success(self, mock_http):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"vllm:kv_cache_usage_perc 0.5\n"
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = mock_resp
+        mock_http.return_value = mock_conn
+
+        pod = {"name": "vllm-decode-0", "ip": "10.0.0.1"}
+        body = scrape_pod_metrics(pod, "ns")
+        self.assertIn("kv_cache_usage_perc", body)
+
+    @patch("_cluster.oc_safe")
+    def test_fallback_to_oc_exec(self, mock_oc_safe):
+        mock_oc_safe.return_value = ("vllm:kv_cache_usage_perc 0.3\n", "")
+        pod = {"name": "vllm-decode-0", "ip": ""}
+        body = scrape_pod_metrics(pod, "ns")
+        self.assertIn("kv_cache_usage_perc", body)
 
 
 if __name__ == "__main__":

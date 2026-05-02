@@ -5,13 +5,8 @@ decision logic without a real cluster.  HTTP metrics scraping is mocked
 at the http.client level.
 """
 
-import os
-import sys
 import unittest
 from unittest.mock import patch, MagicMock
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "toolkit"))
 
 from diagnose import (
     Issue,
@@ -138,38 +133,26 @@ class TestCheckKvRoles(unittest.TestCase):
 
 # ── NIXL failures (metrics scraping) ─────────────────────────────────────
 
-def _mock_metrics_response(body_text):
-    """Create a mock http.client response that returns body_text."""
-    mock_resp = MagicMock()
-    mock_resp.read.return_value = body_text.encode()
-    mock_conn = MagicMock()
-    mock_conn.getresponse.return_value = mock_resp
-    return mock_conn
-
-
 class TestCheckNixlFailures(unittest.TestCase):
 
-    @patch("diagnose.http.client.HTTPConnection")
-    def test_no_failures(self, mock_http):
-        mock_http.return_value = _mock_metrics_response(
-            "vllm:nixl_num_failed_transfers 0\n"
-        )
-        issues = _check_nixl_failures([PREFILL, DECODE_1])
+    @patch("diagnose.scrape_pod_metrics")
+    def test_no_failures(self, mock_scrape):
+        mock_scrape.return_value = "vllm:nixl_num_failed_transfers 0\n"
+        issues = _check_nixl_failures([PREFILL, DECODE_1], "ns")
         self.assertEqual(len(issues), 0)
 
-    @patch("diagnose.http.client.HTTPConnection")
-    def test_failures_detected(self, mock_http):
-        mock_http.return_value = _mock_metrics_response(
-            "vllm:nixl_num_failed_transfers 5\n"
-        )
-        issues = _check_nixl_failures([DECODE_1])
+    @patch("diagnose.scrape_pod_metrics")
+    def test_failures_detected(self, mock_scrape):
+        mock_scrape.return_value = "vllm:nixl_num_failed_transfers 5\n"
+        issues = _check_nixl_failures([DECODE_1], "ns")
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0].severity, "critical")
         self.assertIn("5", issues[0].evidence)
 
-    def test_no_ip_skipped(self):
-        no_ip = _pod("p", "vllm-prefill", ip="")
-        issues = _check_nixl_failures([no_ip])
+    @patch("diagnose.scrape_pod_metrics")
+    def test_empty_metrics(self, mock_scrape):
+        mock_scrape.return_value = ""
+        issues = _check_nixl_failures([DECODE_1], "ns")
         self.assertEqual(len(issues), 0)
 
 
@@ -177,30 +160,24 @@ class TestCheckNixlFailures(unittest.TestCase):
 
 class TestCheckKvCachePressure(unittest.TestCase):
 
-    @patch("diagnose.http.client.HTTPConnection")
-    def test_normal_usage(self, mock_http):
-        mock_http.return_value = _mock_metrics_response(
-            "vllm:kv_cache_usage_perc 0.45\n"
-        )
+    @patch("diagnose.scrape_pod_metrics")
+    def test_normal_usage(self, mock_scrape):
+        mock_scrape.return_value = "vllm:kv_cache_usage_perc 0.45\n"
         issues = _check_kv_cache_pressure([DECODE_1], "test-ns")
         self.assertEqual(len(issues), 0)
 
-    @patch("diagnose.http.client.HTTPConnection")
-    def test_high_pressure(self, mock_http):
-        mock_http.return_value = _mock_metrics_response(
-            "vllm:kv_cache_usage_perc 0.95\n"
-        )
+    @patch("diagnose.scrape_pod_metrics")
+    def test_high_pressure(self, mock_scrape):
+        mock_scrape.return_value = "vllm:kv_cache_usage_perc 0.95\n"
         issues = _check_kv_cache_pressure([DECODE_1], "test-ns")
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0].severity, "warning")
         self.assertIn("95%", issues[0].evidence)
 
-    @patch("diagnose.http.client.HTTPConnection")
-    def test_fix_uses_correct_namespace(self, mock_http):
+    @patch("diagnose.scrape_pod_metrics")
+    def test_fix_uses_correct_namespace(self, mock_scrape):
         """Regression: fix command must use the ns parameter, not $(oc project -q)."""
-        mock_http.return_value = _mock_metrics_response(
-            "vllm:kv_cache_usage_perc 0.95\n"
-        )
+        mock_scrape.return_value = "vllm:kv_cache_usage_perc 0.95\n"
         pod = _pod("vllm-prefill-0", "vllm-prefill", ip="10.0.0.1")
         issues = _check_kv_cache_pressure([pod], "my-namespace")
         self.assertEqual(len(issues), 1)
@@ -212,18 +189,18 @@ class TestCheckKvCachePressure(unittest.TestCase):
 
 class TestCheckTransferDuration(unittest.TestCase):
 
-    @patch("diagnose.http.client.HTTPConnection")
-    def test_normal_duration(self, mock_http):
-        mock_http.return_value = _mock_metrics_response(
+    @patch("diagnose.scrape_pod_metrics")
+    def test_normal_duration(self, mock_scrape):
+        mock_scrape.return_value = (
             "nixl_transfer_duration_seconds_sum 0.1\n"
             "nixl_transfer_duration_seconds_count 100\n"
         )
         issues = _check_transfer_duration([DECODE_1], "test-ns")
         self.assertEqual(len(issues), 0)
 
-    @patch("diagnose.http.client.HTTPConnection")
-    def test_high_duration(self, mock_http):
-        mock_http.return_value = _mock_metrics_response(
+    @patch("diagnose.scrape_pod_metrics")
+    def test_high_duration(self, mock_scrape):
+        mock_scrape.return_value = (
             "nixl_transfer_duration_seconds_sum 100\n"
             "nixl_transfer_duration_seconds_count 100\n"
         )
@@ -231,9 +208,9 @@ class TestCheckTransferDuration(unittest.TestCase):
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0].severity, "warning")
 
-    @patch("diagnose.http.client.HTTPConnection")
-    def test_fix_includes_namespace(self, mock_http):
-        mock_http.return_value = _mock_metrics_response(
+    @patch("diagnose.scrape_pod_metrics")
+    def test_fix_includes_namespace(self, mock_scrape):
+        mock_scrape.return_value = (
             "nixl_transfer_duration_seconds_sum 100\n"
             "nixl_transfer_duration_seconds_count 100\n"
         )

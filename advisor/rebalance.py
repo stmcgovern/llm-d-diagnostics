@@ -12,14 +12,13 @@ Part of the llm-d-diagnostics advisory layer.
 """
 
 import argparse
-import http.client
 import time
 from dataclasses import dataclass, field
 
 try:
-    from ._cluster import oc, oc_safe, get_pods_full as get_pods
+    from ._cluster import get_pods_full as get_pods, scrape_pod_metrics
 except ImportError:
-    from _cluster import oc, oc_safe, get_pods_full as get_pods
+    from _cluster import get_pods_full as get_pods, scrape_pod_metrics
 
 
 @dataclass
@@ -49,30 +48,14 @@ PREFILL_QUEUE_HIGH = 5
 PREFILL_QUEUE_CRITICAL = 10
 
 
-def _scrape_pod_metrics(pod, namespace) -> PodMetrics:
-    """Scrape Prometheus metrics from a single pod."""
+def _parse_pod_metrics(pod, namespace) -> PodMetrics:
+    """Scrape and parse Prometheus metrics from a single pod into PodMetrics."""
     pm = PodMetrics(
         name=pod["name"],
         role="prefill" if "prefill" in pod["name"] else "decode",
     )
-    port = 8100 if pm.role == "prefill" else 8001
 
-    ip = pod.get("ip", "")
-    body = ""
-    if ip:
-        try:
-            conn = http.client.HTTPConnection(ip, port, timeout=3)
-            conn.request("GET", "/metrics")
-            body = conn.getresponse().read().decode(errors="replace")
-            conn.close()
-        except Exception:
-            pass
-    if not body:
-        out, _ = oc_safe("exec", pod["name"], "-n", namespace, "--",
-                         "python3", "-c",
-                         f"import urllib.request;print(urllib.request.urlopen('http://localhost:{port}/metrics',timeout=5).read().decode())",
-                         timeout=10)
-        body = out
+    body = scrape_pod_metrics(pod, namespace)
 
     for line in body.split("\n"):
         if line.startswith("#"):
@@ -114,7 +97,7 @@ def rebalance(namespace: str) -> RebalanceResult:
 
     all_metrics = []
     for p in prefill_pods + decode_pods:
-        pm = _scrape_pod_metrics(p, namespace)
+        pm = _parse_pod_metrics(p, namespace)
         all_metrics.append(pm)
         result.metrics.append(pm)
 
@@ -189,7 +172,7 @@ def rebalance_watch(namespace: str, interval_s: float = 15, duration_s: float = 
             kv_vals = []
             q_vals = []
             for p in decode_pods:
-                pm = _scrape_pod_metrics(p, namespace)
+                pm = _parse_pod_metrics(p, namespace)
                 kv_vals.append(pm.kv_cache_pct)
                 q_vals.append(pm.requests_waiting)
 

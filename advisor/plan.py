@@ -13,20 +13,16 @@ talks to HuggingFace (no cluster dependency).
 import argparse
 import json
 import math
-import os
-import sys
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
     from .pricing import GPU_TFLOPS_FP16, GPU_VRAM_GB, get_price, get_cheapest
+    from ._cluster import SCALING_GPUS
 except ImportError:
     from pricing import GPU_TFLOPS_FP16, GPU_VRAM_GB, get_price, get_cheapest
-
-# Import hardware database from toolkit (one-way dependency: advisor -> toolkit)
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "toolkit"))
-from scaling_model import GPUS as SCALING_GPUS  # noqa: E402
+    from _cluster import SCALING_GPUS
 
 
 DTYPE_BYTES = {"float32": 4, "float16": 2, "bfloat16": 2}

@@ -4,20 +4,21 @@ Synthetic disaggregated request prober.
 Sends a real disagg request through the full P/D pipeline (client -> sidecar
 -> prefill -> NIXL KV transfer -> decode -> response) and tracks TTFT
 against a rolling baseline for anomaly detection.
-
-Uses ``toolkit/client.py``'s ``send_streaming`` for true TTFT measurement
-instead of the legacy ``oc exec``-based approach.
 """
 
-import os
+import http.client
+import json
+import ssl
 import statistics
-import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "toolkit"))
-from client import send_streaming  # noqa: E402
+try:
+    from ._cluster import oc_safe
+except ImportError:
+    from _cluster import oc_safe
 
 
 @dataclass
@@ -29,6 +30,65 @@ class ProbeResult:
     baseline_ms: float
     ratio: float  # ttft / baseline
     error: str = ""
+
+
+def _send_probe(url, model, prompt="Hello", max_tokens=5, extra_headers=None):
+    """Send a single streaming probe request with explicit model parameter.
+
+    Avoids relying on toolkit's module-global MODEL variable.
+    Returns dict with ttft_ms, status, error.
+    """
+    parsed = urlparse(url)
+    host, port = parsed.hostname, parsed.port
+    path = parsed.path or "/"
+    use_tls = parsed.scheme == "https"
+
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "stream": True,
+    })
+    headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    start = time.monotonic()
+    try:
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=20)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=20)
+
+        conn.request("POST", path, body=payload, headers=headers)
+        resp = conn.getresponse()
+        token_times = []
+
+        while True:
+            line = resp.readline()
+            if not line:
+                break
+            line = line.decode("utf-8", errors="replace").strip()
+            if line == "data: [DONE]":
+                break
+            if line.startswith("data: "):
+                try:
+                    chunk = json.loads(line[6:])
+                    if chunk.get("choices", [{}])[0].get("text", ""):
+                        token_times.append(time.monotonic() - start)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        total = time.monotonic() - start
+        conn.close()
+        ttft = token_times[0] * 1000 if token_times else total * 1000
+        return {"ttft_ms": round(ttft, 1), "status": resp.status, "error": ""}
+
+    except Exception as e:
+        return {"ttft_ms": 0, "status": 0, "error": str(e)[:200]}
 
 
 class DisaggProber:
@@ -43,24 +103,16 @@ class DisaggProber:
         self.disagg_url = "https://vllm-decode-svc:8000/v1/completions"
         self.prefill_host = f"vllm-prefill-svc.{namespace}.svc.cluster.local:8100"
 
-        os.environ.setdefault("MODEL", model)
-        os.environ.setdefault("NS", namespace)
-
     def probe(self) -> ProbeResult:
         """Send one synthetic disagg request and evaluate health."""
         t = time.time()
-        try:
-            r = send_streaming(
-                self.disagg_url, "Hello", max_tokens=5,
-                extra_headers={"x-prefiller-host-port": self.prefill_host},
-            )
-            ttft = r.ttft_ms
-            status = r.status
-            error = r.error
-        except Exception as e:
-            ttft = 0
-            status = 0
-            error = str(e)[:200]
+        r = _send_probe(
+            self.disagg_url, self.model,
+            extra_headers={"x-prefiller-host-port": self.prefill_host},
+        )
+        ttft = r["ttft_ms"]
+        status = r["status"]
+        error = r["error"]
 
         if status == 200 and ttft > 0:
             self._baseline_window.append(ttft)
