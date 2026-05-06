@@ -18,10 +18,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from .pricing import GPU_TFLOPS_FP16, GPU_VRAM_GB, get_price, get_cheapest
+    from .pricing import GPU_MEM_BW_GBS, GPU_VRAM_GB, get_price, get_cheapest
     from ._cluster import SCALING_GPUS
 except ImportError:
-    from pricing import GPU_TFLOPS_FP16, GPU_VRAM_GB, get_price, get_cheapest
+    from pricing import GPU_MEM_BW_GBS, GPU_VRAM_GB, get_price, get_cheapest
     from _cluster import SCALING_GPUS
 
 
@@ -127,10 +127,23 @@ MEASURED_BASELINES = {
     },
 }
 
+# KV cache bytes per token = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
+KV_BYTES_PER_TOKEN = {
+    "Qwen/Qwen2.5-0.5B-Instruct": 2 * 24 * 2 * 64 * 2,
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": 2 * 22 * 4 * 64 * 2,
+    "Qwen/Qwen2.5-1.5B-Instruct": 2 * 28 * 2 * 64 * 2,
+    "stabilityai/stablelm-2-1_6b-chat": 2 * 24 * 32 * 64 * 2,
+    "HuggingFaceTB/SmolLM2-1.7B-Instruct": 2 * 24 * 32 * 64 * 2,
+    "Qwen/Qwen2.5-3B-Instruct": 2 * 36 * 2 * 128 * 2,
+    "microsoft/Phi-3.5-mini-instruct": 2 * 32 * 32 * 96 * 2,
+    "allenai/OLMoE-1B-7B-0924-Instruct": 2 * 16 * 16 * 64 * 2,
+}
+
 # Scaling model from exp5 regression (Pearson r=0.987 on NIXL transfer vs seq length)
-SCALING_NIXL_BASE_MS = 20
 SCALING_SIDECAR_MS = 12
 MOE_NIXL_CORRECTION = 2.73
+NIXL_REF_KV_BYTES = 393_216  # Phi-3 KV bytes per token (reference)
+NIXL_REF_MS = 25  # measured NIXL transfer for reference model
 
 
 @dataclass
@@ -178,7 +191,6 @@ def plan_capacity(
     _gpu_key = gpu_type.upper().replace("_", "-")
     _hw = SCALING_GPUS.get(_gpu_key, {})
     gpu_vram = _hw.get("memory_gb", GPU_VRAM_GB.get(gpu_type, 16))
-    gpu_tflops = _hw.get("fp16_tflops", GPU_TFLOPS_FP16.get(gpu_type, 65))
 
     plan = CapacityPlan(
         model=model_id, gpu_type=gpu_type,
@@ -207,7 +219,7 @@ def plan_capacity(
         plan.confidence = "measured"
         _plan_from_measured(plan, measured, target_throughput, price, tp)
     else:
-        _plan_from_extrapolation(plan, profile, gpu_type, gpu_tflops, target_throughput, price, tp)
+        _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp)
 
     _generate_recommendation(plan)
 
@@ -244,18 +256,42 @@ def _find_nearest_baselines(params_b, gpu_type, is_moe=False):
             continue
         if is_moe != data.get("is_moe", False):
             continue
-        candidates.append((abs(data["params_b"] - params_b), data))
+        candidates.append((abs(data["params_b"] - params_b), data, model_id))
     candidates.sort(key=lambda x: x[0])
-    return [c[1] for c in candidates[:2]]
+    return [(c[1], c[2]) for c in candidates[:2]]
 
 
-def _plan_from_extrapolation(plan, profile, gpu_type, gpu_tflops, target_throughput, price, tp):
-    """Plan by interpolating from the 8-model dataset + scaling model."""
+def _estimate_kv_bytes(profile) -> int:
+    """Estimate KV cache bytes per token from model profile."""
+    known = KV_BYTES_PER_TOKEN.get(profile.model_id)
+    if known:
+        return known
+    if profile.num_kv_heads and profile.head_dim and profile.num_layers:
+        dtype_bytes = DTYPE_BYTES.get(profile.torch_dtype, 2)
+        return 2 * profile.num_layers * profile.num_kv_heads * profile.head_dim * dtype_bytes
+    return NIXL_REF_KV_BYTES
+
+
+def _estimate_nixl_ms(kv_bytes: int, is_moe: bool) -> float:
+    """Estimate NIXL transfer time from KV cache size, scaled from reference measurement."""
+    ratio = kv_bytes / NIXL_REF_KV_BYTES if NIXL_REF_KV_BYTES > 0 else 1
+    ms = NIXL_REF_MS * ratio
+    if is_moe:
+        ms *= MOE_NIXL_CORRECTION
+    return max(ms, 5)
+
+
+def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp):
+    """Plan by extrapolating from the 8-model dataset + scaling model."""
 
     params_b = profile.num_params / 1e9 if profile.num_params else 1
     is_moe = profile.is_moe
-    t4_tflops = GPU_TFLOPS_FP16["t4"]
-    gpu_speedup = gpu_tflops / t4_tflops
+
+    _gpu_key = gpu_type.upper().replace("_", "-")
+    _hw = SCALING_GPUS.get(_gpu_key, {})
+    t4_bw = SCALING_GPUS.get("T4", {}).get("hbm_bw_gbs", GPU_MEM_BW_GBS.get("t4", 320))
+    target_bw = _hw.get("hbm_bw_gbs", GPU_MEM_BW_GBS.get(gpu_type, t4_bw))
+    bw_speedup = target_bw / t4_bw
 
     nearest = _find_nearest_baselines(params_b, gpu_type, is_moe)
     if not nearest:
@@ -263,42 +299,59 @@ def _plan_from_extrapolation(plan, profile, gpu_type, gpu_tflops, target_through
 
     if nearest:
         if len(nearest) >= 2:
-            lo, hi = nearest[0], nearest[1]
+            (lo, _), (hi, _) = nearest[0], nearest[1]
             lo_b, hi_b = lo["params_b"], hi["params_b"]
-            if hi_b != lo_b:
-                t = (params_b - lo_b) / (hi_b - lo_b)
-                t = max(0, min(2, t))
+            range_b = hi_b - lo_b if hi_b != lo_b else 1
+
+            if lo_b <= params_b <= hi_b:
+                t = (params_b - lo_b) / range_b
+                mono_ttft = lo["mono_ttft_ms"] + t * (hi["mono_ttft_ms"] - lo["mono_ttft_ms"])
+                mono_rps = lo["mono_throughput"] + t * (hi["mono_throughput"] - lo["mono_throughput"])
+                plan.reasoning.append(
+                    f"Interpolated between {lo_b:.1f}B and {hi_b:.1f}B baselines")
             else:
-                t = 0
-            mono_ttft = lo["mono_ttft_ms"] + t * (hi["mono_ttft_ms"] - lo["mono_ttft_ms"])
-            disagg_ttft = lo["disagg_ttft_ms"] + t * (hi["disagg_ttft_ms"] - lo["disagg_ttft_ms"])
-            mono_rps = lo["mono_throughput"] + t * (hi["mono_throughput"] - lo["mono_throughput"])
+                ref = lo if abs(lo_b - params_b) < abs(hi_b - params_b) else hi
+                scale = params_b / ref["params_b"] if ref["params_b"] > 0 else 1
+                mono_ttft = ref["mono_ttft_ms"] * scale
+                mono_rps = ref["mono_throughput"] / max(scale, 0.5)
+                plan.reasoning.append(
+                    f"Proportional scaling from {ref['params_b']:.1f}B baseline "
+                    f"(target {params_b:.1f}B is outside measured range)")
         else:
-            ref = nearest[0]
+            (ref, _) = nearest[0]
             scale = params_b / ref["params_b"] if ref["params_b"] > 0 else 1
             mono_ttft = ref["mono_ttft_ms"] * scale
-            disagg_ttft = ref["disagg_ttft_ms"] * scale
             mono_rps = ref["mono_throughput"] / max(scale, 0.5)
+            plan.reasoning.append(f"Scaled from single baseline ({ref['params_b']:.1f}B)")
 
         if gpu_type != "t4":
-            mono_ttft = mono_ttft / gpu_speedup
-            disagg_ttft = disagg_ttft / gpu_speedup
+            mono_ttft = mono_ttft / bw_speedup
+            plan.reasoning.append(
+                f"GPU scaling: {bw_speedup:.1f}x memory BW ({t4_bw} -> {target_bw} GB/s)")
+
+        kv_bytes = _estimate_kv_bytes(profile)
+        nixl_ms = _estimate_nixl_ms(kv_bytes, is_moe)
+        if gpu_type != "t4":
+            nixl_ms = nixl_ms / bw_speedup
+        disagg_ttft = mono_ttft + SCALING_SIDECAR_MS + nixl_ms
 
         plan.mono_est_ttft_ms = round(max(mono_ttft, 10))
-        plan.mono_est_throughput = round(max(mono_rps * gpu_speedup, 0.01), 2)
+        plan.mono_est_throughput = round(max(mono_rps * bw_speedup, 0.01), 2)
         plan.disagg_est_ttft_ms = round(max(disagg_ttft, 10))
 
+        kv_kb = kv_bytes / 1024
         plan.reasoning.append(
-            f"Interpolated from 8-model dataset (nearest: {nearest[0]['params_b']:.1f}B"
-            + (f", {nearest[1]['params_b']:.1f}B" if len(nearest) >= 2 else "")
-            + f") on {gpu_type}")
+            f"KV cache: {kv_kb:.0f} KB/token ({profile.num_kv_heads} KV heads), "
+            f"est. NIXL: {nixl_ms:.0f}ms + sidecar: {SCALING_SIDECAR_MS}ms")
     else:
-        plan.mono_est_ttft_ms = round(200 * params_b / gpu_speedup)
+        mono_ttft = 200 * params_b / bw_speedup
+        plan.mono_est_ttft_ms = round(max(mono_ttft, 10))
         plan.mono_est_throughput = round(1000 / max(plan.mono_est_ttft_ms, 1) * 0.7, 2)
-        nixl_ms = SCALING_NIXL_BASE_MS * (MOE_NIXL_CORRECTION if is_moe else 1)
+        kv_bytes = _estimate_kv_bytes(profile)
+        nixl_ms = _estimate_nixl_ms(kv_bytes, is_moe)
         overhead_ms = SCALING_SIDECAR_MS + nixl_ms
         plan.disagg_est_ttft_ms = round(plan.mono_est_ttft_ms + overhead_ms)
-        plan.reasoning.append("Pure heuristic (no matching baseline found); run experiments to validate")
+        plan.reasoning.append("Pure heuristic (no matching baseline); run experiments to validate")
 
     plan.mono_instances = max(1, math.ceil(target_throughput / plan.mono_est_throughput)) if plan.mono_est_throughput > 0 else 1
     plan.mono_total_gpus = plan.mono_instances * tp

@@ -72,11 +72,11 @@ class HealthMonitor:
         t_start = time.time()
         try:
             while True:
-                if duration_s and (time.time() - t_start) > duration_s:
-                    break
                 snap = self._check_all()
                 self.snapshots.append(snap)
                 self._print_snapshot(snap)
+                if duration_s and (time.time() - t_start) > duration_s:
+                    break
                 time.sleep(self.interval_s)
         except KeyboardInterrupt:
             print("\n  Interrupted.")
@@ -87,8 +87,8 @@ class HealthMonitor:
         snap = HealthSnapshot(timestamp=time.time())
 
         pods = get_pods(self.namespace, "app.kubernetes.io/part-of=vllm-disagg")
-        prefill_pods = [p for p in pods if p["labels"].get("app") == "vllm-prefill"]
-        decode_pods = [p for p in pods if "decode" in p["labels"].get("app", "")]
+        prefill_pods = [p for p in pods if "prefill" in p.get("role", "")]
+        decode_pods = [p for p in pods if "decode" in p.get("role", "")]
 
         snap.checks.append(self._check_pod_health(prefill_pods, decode_pods))
         snap.checks.append(self._check_version_compat(pods))
@@ -204,7 +204,7 @@ class HealthMonitor:
             if not body:
                 continue
             for line in body.split("\n"):
-                if "nixl_num_kv_expired_reqs" in line and not line.startswith("#"):
+                if "nixl_num_kv_expired_reqs_total" in line and not line.startswith("#"):
                     try:
                         val = float(line.split()[-1])
                         prev = self._prev_kv_expired.get(p["name"], 0)

@@ -40,19 +40,30 @@ def get_pods_full(namespace, label=None):
     items = json.loads(out).get("items", [])
     result = []
     for p in items:
+        phase = p.get("status", {}).get("phase", "")
+        if phase not in ("Running", "Succeeded"):
+            continue
         name = p["metadata"]["name"]
+        labels = p["metadata"].get("labels", {})
         ip = p.get("status", {}).get("podIP", "")
         ready = any(
             c.get("type") == "Ready" and c.get("status") == "True"
             for c in p.get("status", {}).get("conditions", [])
         )
         containers = p["spec"].get("containers", [{}])
+        init_containers = p["spec"].get("initContainers", [])
+        images = [c.get("image", "") for c in containers]
+        init_images = [c.get("image", "") for c in init_containers]
+        role = labels.get("llm-d.ai/role", labels.get("app", ""))
         result.append({
             "name": name,
             "ip": ip,
             "ready": ready,
-            "labels": p["metadata"].get("labels", {}),
-            "image": containers[0].get("image", ""),
+            "labels": labels,
+            "role": role,
+            "image": images[0] if images else "",
+            "images": images,
+            "init_images": init_images,
             "args": str(containers[0].get("args", [])),
         })
     return result

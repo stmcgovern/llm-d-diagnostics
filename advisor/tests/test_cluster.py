@@ -65,6 +65,7 @@ SAMPLE_PODS_JSON = json.dumps({
                 }],
             },
             "status": {
+                "phase": "Running",
                 "podIP": "10.0.0.1",
                 "conditions": [{"type": "Ready", "status": "True"}],
             },
@@ -81,6 +82,7 @@ SAMPLE_PODS_JSON = json.dumps({
                 }],
             },
             "status": {
+                "phase": "Running",
                 "podIP": "10.0.0.2",
                 "conditions": [{"type": "Ready", "status": "False"}],
             },
