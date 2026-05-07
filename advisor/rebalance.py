@@ -82,8 +82,8 @@ def _parse_pod_metrics(pod, namespace) -> PodMetrics:
 def rebalance(namespace: str) -> RebalanceResult:
     """Analyze the running cluster and recommend P/D ratio changes."""
     pods = get_pods(namespace, "app.kubernetes.io/part-of=vllm-disagg")
-    prefill_pods = [p for p in pods if p["labels"].get("app") == "vllm-prefill"]
-    decode_pods = [p for p in pods if "decode" in p["labels"].get("app", "")]
+    prefill_pods = [p for p in pods if "prefill" in p.get("role", "")]
+    decode_pods = [p for p in pods if "decode" in p.get("role", "")]
 
     result = RebalanceResult(
         prefill_count=len(prefill_pods),
@@ -167,7 +167,7 @@ def rebalance_watch(namespace: str, interval_s: float = 15, duration_s: float = 
     try:
         while time.time() - t_start < duration_s:
             pods = get_pods(namespace, "app.kubernetes.io/part-of=vllm-disagg")
-            decode_pods = [p for p in pods if "decode" in p["labels"].get("app", "")]
+            decode_pods = [p for p in pods if "decode" in p.get("role", "")]
 
             kv_vals = []
             q_vals = []

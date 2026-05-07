@@ -81,7 +81,7 @@ def scrape_pod_metrics(pod, namespace):
     Returns the raw metrics text, or empty string on failure.
     """
     ip = pod.get("ip", "")
-    port = 8100 if "prefill" in pod.get("name", "") else 8001
+    port = 8100 if "prefill" in pod.get("role", pod.get("name", "")) else 8001
 
     if ip:
         try:

@@ -218,7 +218,7 @@ def _check_kv_cache_pressure(pods, ns="default") -> list[Issue]:
 def _check_stale_kv_timeout(pods, ns) -> list[Issue]:
     """Check if NIXL abort timeout is too long (llm-d ops doc)."""
     for p in pods:
-        if "prefill" not in p.get("name", ""):
+        if "prefill" not in p.get("role", ""):
             continue
         out, _ = oc_safe("exec", p["name"], "-n", ns, "-c", "vllm",
                           "--", "printenv", "VLLM_NIXL_ABORT_REQUEST_TIMEOUT", timeout=10)
