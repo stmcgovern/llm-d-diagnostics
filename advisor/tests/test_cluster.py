@@ -105,10 +105,43 @@ class TestGetPodsFull(unittest.TestCase):
         self.assertTrue(prefill["ready"])
         self.assertEqual(prefill["labels"]["app"], "vllm-prefill")
         self.assertIn("vllm-openai", prefill["image"])
+        self.assertEqual(prefill["role"], "vllm-prefill")
+        self.assertIsInstance(prefill["images"], list)
+        self.assertIsInstance(prefill["init_images"], list)
 
         decode = pods[1]
         self.assertEqual(decode["name"], "vllm-decode-xyz")
         self.assertFalse(decode["ready"])
+
+    @patch("_cluster.oc")
+    def test_terminating_pod_filtered(self, mock_oc):
+        """Bug 8: pods not in Running/Succeeded phase should be skipped."""
+        data = json.loads(SAMPLE_PODS_JSON)
+        data["items"][1]["status"]["phase"] = "Terminating"
+        mock_oc.return_value = json.dumps(data)
+        pods = get_pods_full("test-ns")
+        self.assertEqual(len(pods), 1)
+        self.assertEqual(pods[0]["name"], "vllm-prefill-abc")
+
+    @patch("_cluster.oc")
+    def test_role_label_precedence(self, mock_oc):
+        """Bug 10: llm-d.ai/role label takes precedence over app label."""
+        data = json.loads(SAMPLE_PODS_JSON)
+        data["items"][0]["metadata"]["labels"]["llm-d.ai/role"] = "prefill"
+        mock_oc.return_value = json.dumps(data)
+        pods = get_pods_full("test-ns")
+        self.assertEqual(pods[0]["role"], "prefill")
+
+    @patch("_cluster.oc")
+    def test_init_containers_captured(self, mock_oc):
+        """Bug 10: initContainers images captured for native sidecar visibility."""
+        data = json.loads(SAMPLE_PODS_JSON)
+        data["items"][0]["spec"]["initContainers"] = [
+            {"image": "routing-sidecar:v1.0", "restartPolicy": "Always"},
+        ]
+        mock_oc.return_value = json.dumps(data)
+        pods = get_pods_full("test-ns")
+        self.assertEqual(pods[0]["init_images"], ["routing-sidecar:v1.0"])
 
     @patch("_cluster.oc")
     def test_label_passed_to_oc(self, mock_oc):

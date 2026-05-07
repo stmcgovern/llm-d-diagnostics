@@ -12,11 +12,15 @@ from diagnose import (
     Issue,
     _check_image_mismatch,
     _check_kv_cache_pressure,
+    _check_kv_expiration,
     _check_kv_roles,
+    _check_nixl_config,
     _check_nixl_failures,
     _check_pod_health,
     _check_prefill_spof,
+    _check_stale_kv_timeout,
     _check_transfer_duration,
+    diagnose,
     print_diagnosis,
 )
 
@@ -24,10 +28,12 @@ from diagnose import (
 # ── Test fixtures ────────────────────────────────────────────────────────
 
 def _pod(name, app_label, ready=True, image="vllm/vllm-openai:v0.18.1",
-         ip="10.0.0.1", args=""):
+         ip="10.0.0.1", args="", role=None):
+    labels = {"app": app_label}
     return {
         "name": name, "ip": ip, "ready": ready,
-        "labels": {"app": app_label},
+        "labels": labels,
+        "role": role if role is not None else app_label,
         "image": image,
         "args": str(args),
     }
@@ -216,6 +222,117 @@ class TestCheckTransferDuration(unittest.TestCase):
         )
         issues = _check_transfer_duration([DECODE_1], "prod-ns")
         self.assertIn("prod-ns", issues[0].fix)
+
+
+# ── KV expiration (_total suffix fix, Bug 1) ────────────────────────────
+
+class TestCheckKvExpiration(unittest.TestCase):
+
+    @patch("diagnose.scrape_pod_metrics")
+    def test_no_expirations(self, mock_scrape):
+        mock_scrape.return_value = "vllm:nixl_num_kv_expired_reqs_total 0\n"
+        issues = _check_kv_expiration([DECODE_1], "ns")
+        self.assertEqual(len(issues), 0)
+
+    @patch("diagnose.scrape_pod_metrics")
+    def test_expirations_detected(self, mock_scrape):
+        mock_scrape.return_value = "vllm:nixl_num_kv_expired_reqs_total 5\n"
+        issues = _check_kv_expiration([DECODE_1], "ns")
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, "critical")
+        self.assertIn("5", issues[0].evidence)
+
+    @patch("diagnose.scrape_pod_metrics")
+    def test_total_suffix_required(self, mock_scrape):
+        """Bug 1: metric without _total suffix must not match."""
+        mock_scrape.return_value = "vllm:nixl_num_kv_expired_reqs 10\n"
+        issues = _check_kv_expiration([DECODE_1], "ns")
+        self.assertEqual(len(issues), 0)
+
+    @patch("diagnose.scrape_pod_metrics")
+    def test_created_epoch_ignored(self, mock_scrape):
+        """_created is an epoch timestamp (~1.78e9), must not trigger."""
+        mock_scrape.return_value = (
+            "vllm:nixl_num_kv_expired_reqs_total 0\n"
+            "vllm:nixl_num_kv_expired_reqs_created 1.78e+09\n"
+        )
+        issues = _check_kv_expiration([DECODE_1], "ns")
+        self.assertEqual(len(issues), 0)
+
+
+# ── Stale KV timeout ────────────────────────────────────────────────────
+
+class TestCheckStaleKvTimeout(unittest.TestCase):
+
+    @patch("diagnose.oc_safe")
+    def test_missing_env_no_issue(self, mock_oc):
+        mock_oc.return_value = ("", "")
+        issues = _check_stale_kv_timeout([PREFILL], "ns")
+        self.assertEqual(len(issues), 0)
+
+    @patch("diagnose.oc_safe")
+    def test_high_timeout_warns(self, mock_oc):
+        mock_oc.return_value = ("480\n", "")
+        issues = _check_stale_kv_timeout([PREFILL], "ns")
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, "info")
+        self.assertIn("480", issues[0].evidence)
+
+    @patch("diagnose.oc_safe")
+    def test_reasonable_timeout_ok(self, mock_oc):
+        mock_oc.return_value = ("120\n", "")
+        issues = _check_stale_kv_timeout([PREFILL], "ns")
+        self.assertEqual(len(issues), 0)
+
+
+# ── NIXL config ──────────────────────────────────────────────────────────
+
+class TestCheckNixlConfig(unittest.TestCase):
+
+    @patch("diagnose.oc_safe")
+    def test_configured(self, mock_oc):
+        mock_oc.return_value = ('VLLM_NIXL_SIDE_CHANNEL_HOST=10.0.0.1', "")
+        issues = _check_nixl_config([PREFILL], "ns")
+        self.assertEqual(len(issues), 0)
+
+    @patch("diagnose.oc_safe")
+    def test_missing(self, mock_oc):
+        mock_oc.return_value = ("SOME_OTHER_ENV=yes", "")
+        issues = _check_nixl_config([PREFILL], "ns")
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, "warning")
+
+    def test_no_prefill_no_issue(self):
+        issues = _check_nixl_config([], "ns")
+        self.assertEqual(len(issues), 0)
+
+
+# ── Orchestration ────────────────────────────────────────────────────────
+
+class TestDiagnoseOrchestration(unittest.TestCase):
+
+    @patch("diagnose.oc_safe")
+    @patch("diagnose.scrape_pod_metrics")
+    @patch("diagnose.get_pods")
+    def test_all_checks_run(self, mock_get_pods, mock_scrape, mock_oc):
+        mock_get_pods.return_value = [PREFILL, DECODE_1]
+        mock_scrape.return_value = (
+            "vllm:nixl_num_failed_transfers 0\n"
+            "vllm:kv_cache_usage_perc 0.4\n"
+            "vllm:nixl_num_kv_expired_reqs_total 0\n"
+        )
+        mock_oc.return_value = ('VLLM_NIXL_SIDE_CHANNEL_HOST=10.0.0.1', "")
+        issues = diagnose("test-ns")
+        critical = [i for i in issues if i.severity == "critical"]
+        self.assertEqual(len(critical), 0, f"Unexpected criticals: {[i.title for i in critical]}")
+
+    @patch("diagnose.get_pods")
+    def test_no_pods_returns_critical(self, mock_get_pods):
+        mock_get_pods.return_value = []
+        issues = diagnose("empty-ns")
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, "critical")
+        self.assertIn("No P/D", issues[0].title)
 
 
 # ── Print diagnosis ──────────────────────────────────────────────────────
