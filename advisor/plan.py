@@ -136,14 +136,19 @@ KV_BYTES_PER_TOKEN = {
     "HuggingFaceTB/SmolLM2-1.7B-Instruct": 2 * 24 * 32 * 64 * 2,
     "Qwen/Qwen2.5-3B-Instruct": 2 * 36 * 2 * 128 * 2,
     "microsoft/Phi-3.5-mini-instruct": 2 * 32 * 32 * 96 * 2,
-    "allenai/OLMoE-1B-7B-0924-Instruct": 2 * 16 * 16 * 64 * 2,
+    "allenai/OLMoE-1B-7B-0924-Instruct": 2 * 16 * 16 * 128 * 2,
 }
 
-# Scaling model from exp5 regression (Pearson r=0.987 on NIXL transfer vs seq length)
+# Scaling constants from exp5 regression (Pearson r=0.987)
 SCALING_SIDECAR_MS = 12
-MOE_NIXL_CORRECTION = 2.73
-NIXL_REF_KV_BYTES = 393_216  # Phi-3 KV bytes per token (reference)
-NIXL_REF_MS = 25  # measured NIXL transfer for reference model
+
+# NIXL transfer model: T_transfer = protocol_ms + (kv_bytes * seq_len) / eff_bw
+# Measured via exp5b direct NIXL prometheus scraping on T4 cluster (R²=0.999).
+# protocol_ms is fixed overhead (NIXL handshake, buffer setup) — model-independent.
+# eff_bw is effective NIC throughput in GB/s — hardware-dependent.
+NIXL_PROTOCOL_MS = 4.3         # regression intercept (exp5b, 180 points, Phi-3 on T4)
+NIXL_EFF_BW_GBS = 0.299        # regression slope -> effective bandwidth (10 Gbps OVN/TCP)
+MOE_NIXL_CORRECTION = 1.0      # MoE uses dense attention → KV transfer is identical to dense
 
 
 @dataclass
@@ -168,7 +173,7 @@ class CapacityPlan:
     disagg_cost_per_hr: float = 0
 
     recommendation: str = ""
-    confidence: str = "low"
+    confidence: str = ""
     reasoning: list = field(default_factory=list)
 
 
@@ -178,6 +183,7 @@ def plan_capacity(
     target_ttft_ms: float = 500,
     gpu_type: str = "t4",
     provider: str = "aws",
+    seq_len: int = 128,
 ) -> CapacityPlan:
     """Generate a capacity plan for the given model and requirements."""
 
@@ -198,6 +204,8 @@ def plan_capacity(
         target_ttft_ms=target_ttft_ms,
     )
 
+    plan.reasoning.extend(_validate_profile(profile))
+
     weight_gb = profile.weight_gb or (profile.num_params * 2 / (1024**3))
 
     max_tp_per_node = 8
@@ -208,38 +216,45 @@ def plan_capacity(
         tp = max_tp_per_node
     plan.mono_gpus_per_instance = tp * pp
 
+    kv_bytes = _estimate_kv_bytes(profile)
+    if weight_gb > 0:
+        _check_vram_feasibility(weight_gb, kv_bytes, seq_len, plan.mono_gpus_per_instance, gpu_vram, plan)
+
     if pp > 1:
         plan.reasoning.append(
             f"Model requires pipeline parallelism (PP={pp}, TP={tp}). "
-            f"Each instance uses {tp * pp} GPUs. PP adds ~30% TTFT overhead per stage."
+            f"Each instance uses {tp * pp} GPUs."
         )
 
     measured = MEASURED_BASELINES.get((model_id, gpu_type))
     if measured:
         plan.confidence = "measured"
-        _plan_from_measured(plan, measured, target_throughput, price, tp)
+        _plan_from_measured(plan, measured, target_throughput, price)
     else:
-        _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp)
+        _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp, seq_len)
 
     _generate_recommendation(plan)
 
     return plan
 
 
-def _plan_from_measured(plan, measured, target_throughput, price, tp):
+def _plan_from_measured(plan, measured, target_throughput, price):
     """Plan using actual measured data from our experiments."""
     mono_rps = measured["mono_throughput"]
     disagg_rps = measured["disagg_throughput"]
+    gpus_per = plan.mono_gpus_per_instance
 
     plan.mono_instances = max(1, math.ceil(target_throughput / mono_rps)) if mono_rps > 0 else 1
-    plan.mono_total_gpus = plan.mono_instances * tp
+    plan.mono_total_gpus = plan.mono_instances * gpus_per
     plan.mono_est_ttft_ms = measured["mono_ttft_ms"]
     plan.mono_est_throughput = mono_rps * plan.mono_instances
     plan.mono_cost_per_hr = plan.mono_total_gpus * price
 
     disagg_instances = max(1, math.ceil(target_throughput / disagg_rps)) if disagg_rps > 0 else 1
-    plan.disagg_prefill_gpus = max(1, disagg_instances // 3 + 1) * tp
-    plan.disagg_decode_gpus = disagg_instances * tp
+    prefill_capacity = 1000 / measured["mono_ttft_ms"]
+    min_prefill = max(1, math.ceil(target_throughput / prefill_capacity))
+    plan.disagg_prefill_gpus = min_prefill * gpus_per
+    plan.disagg_decode_gpus = disagg_instances * gpus_per
     plan.disagg_total_gpus = plan.disagg_prefill_gpus + plan.disagg_decode_gpus
     plan.disagg_est_ttft_ms = measured["disagg_ttft_ms"]
     plan.disagg_est_throughput = disagg_rps * disagg_instances
@@ -277,19 +292,65 @@ def _estimate_kv_bytes(profile) -> int:
     if profile.num_kv_heads and profile.head_dim and profile.num_layers:
         dtype_bytes = DTYPE_BYTES.get(profile.torch_dtype, 2)
         return 2 * profile.num_layers * profile.num_kv_heads * profile.head_dim * dtype_bytes
-    return NIXL_REF_KV_BYTES
+    return KV_BYTES_PER_TOKEN["microsoft/Phi-3.5-mini-instruct"]
 
 
-def _estimate_nixl_ms(kv_bytes: int, is_moe: bool) -> float:
-    """Estimate NIXL transfer time from KV cache size, scaled from reference measurement."""
-    ratio = kv_bytes / NIXL_REF_KV_BYTES if NIXL_REF_KV_BYTES > 0 else 1
-    ms = NIXL_REF_MS * ratio
+def _estimate_nixl_ms(kv_bytes_per_token: int, seq_len: int = 128,
+                      gpu_type: str = "t4", is_moe: bool = False) -> float:
+    """Estimate NIXL transfer time from KV cache size and NIC bandwidth.
+
+    T = protocol_ms + (kv_bytes_per_token * ceil(seq_len/16)*16) / eff_bw
+    NIXL transfers KV in 16-token blocks; block alignment eliminates
+    quantization error at short sequences (exp5b: 180/180 exact multiples).
+    """
+    t4_nic = GPU_NIC_BW_GBPS.get("t4", 25)
+    target_nic = GPU_NIC_BW_GBPS.get(gpu_type, t4_nic)
+    scaled_bw = NIXL_EFF_BW_GBS * (target_nic / t4_nic)
+    block_aligned = math.ceil(seq_len / 16) * 16
+    data_ms = (kv_bytes_per_token * block_aligned) / (scaled_bw * 1e9) * 1000
     if is_moe:
-        ms *= MOE_NIXL_CORRECTION
-    return max(ms, 5)
+        data_ms *= MOE_NIXL_CORRECTION
+    return NIXL_PROTOCOL_MS + data_ms
 
 
-def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp):
+def _validate_profile(profile):
+    """Flag plans built on missing or implausible profile data."""
+    issues = []
+    if not profile.num_params:
+        issues.append("WARNING: could not fetch model params from HuggingFace. "
+                       "GPU count and TTFT estimates may be wrong.")
+    if not profile.num_kv_heads:
+        issues.append("WARNING: could not determine KV head count. "
+                       "NIXL transfer estimate uses Phi-3 fallback (may be 30x wrong).")
+    return issues
+
+
+def _check_vram_feasibility(weight_gb, kv_bytes_per_token, seq_len, gpus_per_instance, gpu_vram, plan):
+    """Check if model + KV cache fits in VRAM."""
+    weight_per_gpu = weight_gb / max(gpus_per_instance, 1)
+    kv_per_gpu = (kv_bytes_per_token * seq_len) / (max(gpus_per_instance, 1) * 1024**3)
+    total_per_gpu = weight_per_gpu + kv_per_gpu
+    usable_vram = gpu_vram * 0.85
+    if total_per_gpu > usable_vram:
+        plan.reasoning.append(
+            f"VRAM WARNING: {total_per_gpu:.1f} GB/GPU needed "
+            f"(weights {weight_per_gpu:.1f} + KV {kv_per_gpu:.1f}) "
+            f"exceeds {usable_vram:.0f} GB usable on {plan.gpu_type.upper()}. "
+            f"Increase TP or use a larger GPU.")
+
+
+def _proportional_scale(ref, params_b, plan):
+    """Scale TTFT and throughput proportionally from a reference baseline."""
+    scale = params_b / ref["params_b"] if ref["params_b"] > 0 else 1
+    if scale > 5:
+        plan.reasoning.append(
+            f"LOW CONFIDENCE: extrapolating {scale:.0f}x beyond nearest baseline "
+            f"({ref['params_b']:.1f}B -> {params_b:.1f}B). TTFT estimate is unreliable.")
+        plan.confidence = "low"
+    return ref["mono_ttft_ms"] * scale, ref["mono_throughput"] / max(scale, 0.5)
+
+
+def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp, seq_len=128):
     """Plan by extrapolating from the 8-model dataset + scaling model."""
 
     params_b = profile.num_params / 1e9 if profile.num_params else 1
@@ -306,8 +367,11 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
     nic_speedup = target_nic / t4_nic
 
     nearest = _find_nearest_baselines(params_b, gpu_type, is_moe)
+    used_cross_gpu = not nearest
     if not nearest:
         nearest = _find_nearest_baselines(params_b, "t4", is_moe)
+
+    interpolated = False
 
     if nearest:
         if len(nearest) >= 2:
@@ -321,21 +385,18 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
                 t = (params_b - lo_b) / range_b
                 mono_ttft = lo["mono_ttft_ms"] + t * (hi["mono_ttft_ms"] - lo["mono_ttft_ms"])
                 mono_rps = lo["mono_throughput"] + t * (hi["mono_throughput"] - lo["mono_throughput"])
+                interpolated = True
                 plan.reasoning.append(
                     f"Interpolated between {lo_b:.1f}B and {hi_b:.1f}B baselines")
             else:
                 ref = lo if abs(lo_b - params_b) < abs(hi_b - params_b) else hi
-                scale = params_b / ref["params_b"] if ref["params_b"] > 0 else 1
-                mono_ttft = ref["mono_ttft_ms"] * scale
-                mono_rps = ref["mono_throughput"] / max(scale, 0.5)
+                mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan)
                 plan.reasoning.append(
                     f"Proportional scaling from {ref['params_b']:.1f}B baseline "
                     f"(target {params_b:.1f}B is outside measured range)")
         else:
             (ref, _) = nearest[0]
-            scale = params_b / ref["params_b"] if ref["params_b"] > 0 else 1
-            mono_ttft = ref["mono_ttft_ms"] * scale
-            mono_rps = ref["mono_throughput"] / max(scale, 0.5)
+            mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan)
             plan.reasoning.append(f"Scaled from single baseline ({ref['params_b']:.1f}B)")
 
         if gpu_type != "t4":
@@ -343,74 +404,91 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
             plan.reasoning.append(
                 f"GPU scaling: {bw_speedup:.1f}x memory BW ({t4_bw} -> {target_bw} GB/s)")
 
+        tp_eff = max(0.6, 0.85 - 0.05 * (tp - 2)) if tp > 1 else 1.0
         if tp > 1:
-            tp_eff = max(0.6, 0.85 - 0.05 * (tp - 2))
             mono_ttft = mono_ttft / (tp * tp_eff)
             plan.reasoning.append(f"TP={tp} parallelism: TTFT / {tp * tp_eff:.1f}")
 
+        pp = plan.mono_gpus_per_instance // max(tp, 1)
+        if pp > 1:
+            pp_factor = 1 + 0.3 * (pp - 1)
+            mono_ttft = mono_ttft * pp_factor
+            plan.reasoning.append(f"PP={pp} pipeline overhead: TTFT * {pp_factor:.1f}")
+
         kv_bytes = _estimate_kv_bytes(profile)
-        nixl_ms = _estimate_nixl_ms(kv_bytes, is_moe)
-        if gpu_type != "t4":
-            nixl_ms = nixl_ms / nic_speedup
-            plan.reasoning.append(
-                f"NIXL scaling: {nic_speedup:.0f}x NIC BW ({t4_nic} -> {target_nic} Gbps)")
+        nixl_ms = _estimate_nixl_ms(kv_bytes, seq_len, gpu_type, is_moe)
         disagg_ttft = mono_ttft + SCALING_SIDECAR_MS + nixl_ms
 
         plan.mono_est_ttft_ms = round(max(mono_ttft, 10))
-        plan.mono_est_throughput = round(max(mono_rps * bw_speedup, 0.01), 2)
+        plan.mono_est_throughput = round(max(mono_rps * bw_speedup * tp * tp_eff, 0.01), 2)
         plan.disagg_est_ttft_ms = round(max(disagg_ttft, 10))
 
         kv_kb = kv_bytes / 1024
+        data_ms = nixl_ms - NIXL_PROTOCOL_MS
         plan.reasoning.append(
-            f"KV cache: {kv_kb:.0f} KB/token ({profile.num_kv_heads} KV heads), "
-            f"est. NIXL: {nixl_ms:.0f}ms + sidecar: {SCALING_SIDECAR_MS}ms")
-    else:
-        mono_ttft = 200 * params_b / bw_speedup
-        if tp > 1:
-            tp_eff = max(0.6, 0.85 - 0.05 * (tp - 2))
-            mono_ttft = mono_ttft / (tp * tp_eff)
-        plan.mono_est_ttft_ms = round(max(mono_ttft, 10))
-        plan.mono_est_throughput = round(1000 / max(plan.mono_est_ttft_ms, 1) * 0.7, 2)
-        kv_bytes = _estimate_kv_bytes(profile)
-        nixl_ms = _estimate_nixl_ms(kv_bytes, is_moe)
+            f"KV cache: {kv_kb:.0f} KB/token ({profile.num_kv_heads} KV heads) x {seq_len} tokens, "
+            f"NIXL: {NIXL_PROTOCOL_MS:.0f}ms protocol + {data_ms:.0f}ms data + "
+            f"sidecar: {SCALING_SIDECAR_MS}ms")
         if gpu_type != "t4":
-            nixl_ms = nixl_ms / nic_speedup
-        overhead_ms = SCALING_SIDECAR_MS + nixl_ms
-        plan.disagg_est_ttft_ms = round(plan.mono_est_ttft_ms + overhead_ms)
-        plan.reasoning.append("Pure heuristic (no matching baseline); run experiments to validate")
+            plan.reasoning.append(
+                f"NIC scaling: {nic_speedup:.0f}x ({t4_nic} -> {target_nic} Gbps)")
+    else:
+        raise RuntimeError(f"No baselines found for {params_b:.1f}B — this should be unreachable")
 
     plan.mono_instances = max(1, math.ceil(target_throughput / plan.mono_est_throughput)) if plan.mono_est_throughput > 0 else 1
-    plan.mono_total_gpus = plan.mono_instances * tp
+    plan.mono_est_throughput = round(plan.mono_est_throughput * plan.mono_instances, 2)
+    gpus_per = plan.mono_gpus_per_instance
+    plan.mono_total_gpus = plan.mono_instances * gpus_per
     plan.mono_cost_per_hr = plan.mono_total_gpus * price
 
-    plan.disagg_prefill_gpus = max(1, plan.mono_instances // 2) * tp
-    plan.disagg_decode_gpus = plan.mono_instances * tp
+    prefill_capacity = 1000 / max(plan.mono_est_ttft_ms, 1)
+    min_prefill = max(1, math.ceil(target_throughput / prefill_capacity))
+    plan.disagg_prefill_gpus = min_prefill * gpus_per
+    plan.disagg_decode_gpus = plan.mono_instances * gpus_per
     plan.disagg_total_gpus = plan.disagg_prefill_gpus + plan.disagg_decode_gpus
-    plan.disagg_est_throughput = round(plan.mono_est_throughput * plan.mono_instances, 2)
+    plan.disagg_est_throughput = plan.mono_est_throughput
     plan.disagg_cost_per_hr = plan.disagg_total_gpus * price
 
-    if plan.confidence != "measured":
-        plan.confidence = "interpolated" if nearest else "low"
-        plan.reasoning.append("Run experiments for empirical validation on your actual hardware")
+    if plan.disagg_total_gpus > plan.mono_total_gpus:
+        plan.reasoning.append(
+            "Without measured disagg throughput, disagg always uses more GPUs. "
+            "Run experiments to measure actual disagg throughput before deciding.")
+
+    if plan.confidence != "low":
+        plan.confidence = "interpolated" if (interpolated and not used_cross_gpu) else "extrapolated"
+    plan.reasoning.append("Run experiments for empirical validation on your actual hardware")
 
 
 def _generate_recommendation(plan):
-    """Generate YES/NO recommendation from the plan."""
-    mono_cost_eff = plan.mono_est_throughput / max(plan.mono_total_gpus, 1)
-    disagg_cost_eff = plan.disagg_est_throughput / max(plan.disagg_total_gpus, 1)
+    """Compare mono vs disagg on SLO compliance and GPU cost."""
+    mono_meets_slo = plan.mono_est_ttft_ms <= plan.target_ttft_ms
+    disagg_meets_slo = plan.disagg_est_ttft_ms <= plan.target_ttft_ms
 
-    if plan.disagg_total_gpus <= plan.mono_total_gpus and plan.disagg_est_ttft_ms < plan.mono_est_ttft_ms:
-        plan.recommendation = "DISAGGREGATE"
-        plan.reasoning.append("Same or fewer GPUs with lower latency")
-    elif plan.disagg_est_ttft_ms < plan.target_ttft_ms * 0.7 and plan.mono_est_ttft_ms > plan.target_ttft_ms * 0.9:
-        plan.recommendation = "DISAGGREGATE"
-        plan.reasoning.append("Disagg has more SLO headroom")
-    elif plan.mono_total_gpus < plan.disagg_total_gpus and mono_cost_eff > disagg_cost_eff * 1.2:
+    if mono_meets_slo and disagg_meets_slo:
+        gpu_ratio = plan.disagg_total_gpus / max(plan.mono_total_gpus, 1)
+        if gpu_ratio < 0.8:
+            plan.recommendation = "DISAGGREGATE"
+            plan.reasoning.append(
+                f"Both meet SLO; disagg uses fewer GPUs "
+                f"({plan.disagg_total_gpus} vs {plan.mono_total_gpus})")
+        elif gpu_ratio > 1.2:
+            plan.recommendation = "MONOLITHIC"
+            plan.reasoning.append(
+                f"Both meet SLO; mono uses fewer GPUs "
+                f"({plan.mono_total_gpus} vs {plan.disagg_total_gpus})")
+        else:
+            plan.recommendation = "RUN EXPERIMENTS TO DECIDE"
+            plan.reasoning.append("Close call -- empirical benchmark needed")
+            plan.reasoning.append(f"Run: ./toolkit/run.sh <cluster> characterize")
+    elif mono_meets_slo:
         plan.recommendation = "MONOLITHIC"
-        plan.reasoning.append("Mono uses fewer GPUs with better per-GPU efficiency")
+        plan.reasoning.append("Only monolithic meets TTFT SLO")
+    elif disagg_meets_slo:
+        plan.recommendation = "DISAGGREGATE"
+        plan.reasoning.append("Only disaggregated meets TTFT SLO")
     else:
         plan.recommendation = "RUN EXPERIMENTS TO DECIDE"
-        plan.reasoning.append("Close call -- empirical benchmark needed")
+        plan.reasoning.append("Neither topology meets TTFT SLO at current scale")
         plan.reasoning.append(f"Run: ./toolkit/run.sh <cluster> characterize")
 
 
@@ -418,20 +496,20 @@ def print_plan(plan: CapacityPlan):
     print(f"\n{'='*60}")
     print(f"  CAPACITY PLAN: {plan.model}")
     print(f"{'='*60}")
-    print(f"  Target: {plan.target_throughput} req/s, TTFT < {plan.target_ttft_ms}ms")
+    print(f"  Target: {plan.target_throughput} req/s, TTFT <= {plan.target_ttft_ms}ms")
     print(f"  GPU: {plan.gpu_type.upper()}    Confidence: {plan.confidence}")
     print()
     print(f"  Option A: MONOLITHIC")
-    print(f"    TP={plan.mono_gpus_per_instance}, Instances={plan.mono_instances}")
+    print(f"    GPUs/instance={plan.mono_gpus_per_instance}, Instances={plan.mono_instances}")
     print(f"    GPUs: {plan.mono_total_gpus}    Cost: ${plan.mono_cost_per_hr:.2f}/hr")
     print(f"    Est. TTFT: {plan.mono_est_ttft_ms}ms    Throughput: {plan.mono_est_throughput:.2f} req/s")
-    slo_status = "MEETS SLO" if plan.mono_est_ttft_ms < plan.target_ttft_ms else "EXCEEDS SLO"
+    slo_status = "MEETS SLO" if plan.mono_est_ttft_ms <= plan.target_ttft_ms else "EXCEEDS SLO"
     print(f"    SLO: {slo_status}")
     print()
     print(f"  Option B: DISAGGREGATED ({plan.disagg_prefill_gpus}P + {plan.disagg_decode_gpus}D)")
     print(f"    GPUs: {plan.disagg_total_gpus}    Cost: ${plan.disagg_cost_per_hr:.2f}/hr")
     print(f"    Est. TTFT: {plan.disagg_est_ttft_ms}ms    Throughput: {plan.disagg_est_throughput:.2f} req/s")
-    slo_status = "MEETS SLO" if plan.disagg_est_ttft_ms < plan.target_ttft_ms else "EXCEEDS SLO"
+    slo_status = "MEETS SLO" if plan.disagg_est_ttft_ms <= plan.target_ttft_ms else "EXCEEDS SLO"
     print(f"    SLO: {slo_status}")
     print()
     print(f"  RECOMMENDATION: {plan.recommendation}")
@@ -462,6 +540,8 @@ if __name__ == "__main__":
     parser.add_argument("--throughput", type=float, default=1.0, help="Target throughput in req/s (default: 1.0)")
     parser.add_argument("--ttft-slo", type=float, default=500, help="Target TTFT in ms (default: 500)")
     parser.add_argument("--provider", default="aws", help="Cloud provider for pricing (default: aws)")
+    parser.add_argument("--seq-len", type=int, default=128,
+                        help="Prompt sequence length in tokens (default: 128)")
     parser.add_argument("--save", default="", help="Path to save plan JSON")
     args = parser.parse_args()
 
@@ -471,6 +551,7 @@ if __name__ == "__main__":
         target_ttft_ms=args.ttft_slo,
         gpu_type=args.gpu_type,
         provider=args.provider,
+        seq_len=args.seq_len,
     )
     print_plan(plan)
 

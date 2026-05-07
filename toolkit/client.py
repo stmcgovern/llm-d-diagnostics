@@ -250,12 +250,30 @@ MAX_TOKENS = int(env("MAX_TOKENS", "20"))
 
 BASE_SENTENCE = "The quick brown fox jumps over the lazy dog again"
 
+_WORD_POOL = (
+    "alpha bravo charlie delta echo foxtrot golf hotel india juliet "
+    "kilo lima mike november oscar papa quebec romeo sierra tango "
+    "uniform victor whiskey xray yankee zulu red green blue yellow "
+    "orange purple black white silver golden bright dark fast slow "
+    "large small heavy light warm cool deep wide long short"
+).split()
 
-def build_prompt(target_tokens):
+
+def build_prompt(target_tokens, cache_bust=None):
     """Build a prompt targeting approximately `target_tokens` tokens.
-    Each repetition of BASE_SENTENCE is ~10 tokens."""
+
+    Each repetition of BASE_SENTENCE is ~10 tokens.  When *cache_bust* is
+    set (any hashable value — typically a run counter), the entire prompt
+    body is generated from a seeded RNG so every token block is unique,
+    defeating vLLM's hash-based prefix cache.
+    """
     reps = max(1, target_tokens // 10)
-    return " ".join([BASE_SENTENCE] * reps)
+    if cache_bust is None:
+        return " ".join([BASE_SENTENCE] * reps)
+    import random
+    rng = random.Random(hash(cache_bust))
+    words = [rng.choice(_WORD_POOL) for _ in range(target_tokens)]
+    return " ".join(words)
 
 
 # ── HTTP client with precise timing ──────────────────────────────────────────

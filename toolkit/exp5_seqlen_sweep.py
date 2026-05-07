@@ -134,7 +134,7 @@ def main():
 
     try:
         for ptokens in SWEEP_LENGTHS:
-            prompt = build_prompt(ptokens)
+            warmup_prompt = build_prompt(ptokens)
             progress(f"--- Prompt target: {ptokens} tokens ---")
 
             active_configs = [(n, c, d) for n, c, d in CONFIGS
@@ -145,7 +145,7 @@ def main():
 
             # Warm-up all active configs at this prompt length
             for _config_name, conn, _desc in active_configs:
-                conn.warmup(prompt, MAX_TOKENS)
+                conn.warmup(warmup_prompt, MAX_TOKENS)
 
             # Interleaved runs: cycle through all active configs per run.
             # This ensures paired differences (C-B, D-C) cancel time-varying
@@ -155,6 +155,7 @@ def main():
             statuses_by_config = {n: [] for n, _, _ in active_configs}
 
             for run in range(1, SWEEP_RUNS + 1):
+                prompt = build_prompt(ptokens, cache_bust=(ptokens, run))
                 for config_name, conn, _desc in active_configs:
                     r = conn.send(prompt, MAX_TOKENS)
 
