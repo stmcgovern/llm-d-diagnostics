@@ -75,6 +75,12 @@ GPU_TFLOPS_FP16 = {
     "h100": 989, "h200": 989,
 }
 
+GPU_MEM_BW_GBS = {
+    "t4": 320, "a10g": 600, "l40s": 864,
+    "a100_40": 1555, "a100_80": 2039,
+    "h100": 3350, "h200": 4800,
+}
+
 # Active pricing table -- starts as a deep copy of static, refreshed by
 # ``refresh_pricing()`` when live data is available.
 PRICING: dict[str, dict[str, float]] = {

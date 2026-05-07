@@ -87,7 +87,7 @@ class TestFindNearestBaselines(unittest.TestCase):
     def test_moe_filter(self):
         nearest = _find_nearest_baselines(7.0, "t4", is_moe=True)
         self.assertEqual(len(nearest), 1)
-        self.assertTrue(nearest[0]["is_moe"])
+        self.assertTrue(nearest[0][0]["is_moe"])
 
     def test_no_match_wrong_gpu(self):
         nearest = _find_nearest_baselines(1.0, "nonexistent_gpu", is_moe=False)

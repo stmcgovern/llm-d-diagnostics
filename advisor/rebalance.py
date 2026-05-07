@@ -52,7 +52,7 @@ def _parse_pod_metrics(pod, namespace) -> PodMetrics:
     """Scrape and parse Prometheus metrics from a single pod into PodMetrics."""
     pm = PodMetrics(
         name=pod["name"],
-        role="prefill" if "prefill" in pod["name"] else "decode",
+        role="prefill" if "prefill" in pod.get("role", pod["name"]) else "decode",
     )
 
     body = scrape_pod_metrics(pod, namespace)

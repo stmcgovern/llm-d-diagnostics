@@ -35,8 +35,8 @@ def diagnose(namespace: str, model: str = "") -> list[Issue]:
     """Run all diagnostic checks and return found issues."""
     issues = []
     pods = get_pods(namespace, "app.kubernetes.io/part-of=vllm-disagg")
-    prefill = [p for p in pods if p["labels"].get("app") == "vllm-prefill"]
-    decode = [p for p in pods if "decode" in p["labels"].get("app", "")]
+    prefill = [p for p in pods if "prefill" in p.get("role", "")]
+    decode = [p for p in pods if "decode" in p.get("role", "")]
 
     if not pods:
         issues.append(Issue(
@@ -96,9 +96,12 @@ def _check_pod_health(prefill, decode, ns) -> list[Issue]:
 
 def _check_image_mismatch(pods, ns) -> list[Issue]:
     """Based on ai-dynamo#6671: NIXL version conflicts from different images."""
+    vllm_pods = [p for p in pods if "prefill" in p.get("role", "") or "decode" in p.get("role", "")]
+    if not vllm_pods:
+        vllm_pods = pods
     images = {}
-    for p in pods:
-        role = p["labels"].get("app", "unknown")
+    for p in vllm_pods:
+        role = p.get("role", p["labels"].get("app", "unknown"))
         images.setdefault(role, set()).add(p["image"])
 
     all_images = set()
@@ -270,7 +273,7 @@ def _check_kv_expiration(pods, ns) -> list[Issue]:
         if not body:
             continue
         for line in body.split("\n"):
-            if "nixl_num_kv_expired_reqs" in line and not line.startswith("#"):
+            if "nixl_num_kv_expired_reqs_total" in line and not line.startswith("#"):
                 try:
                     val = float(line.split()[-1])
                     if val > 0:
