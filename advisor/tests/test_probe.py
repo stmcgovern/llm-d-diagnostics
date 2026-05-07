@@ -121,5 +121,22 @@ class TestDisaggProberWarmup(unittest.TestCase):
         self.assertEqual(mock_send.call_count, 7)
 
 
+class TestDisaggProberConfig(unittest.TestCase):
+
+    def test_default_urls(self):
+        prober = DisaggProber("my-ns", "my-model")
+        self.assertEqual(prober.disagg_url, "https://vllm-decode-svc:8000/v1/completions")
+        self.assertIn("my-ns", prober.prefill_host)
+
+    def test_custom_urls(self):
+        prober = DisaggProber(
+            "ns", "model",
+            decode_url="http://custom:9000/v1/completions",
+            prefill_host="custom-prefill:8100",
+        )
+        self.assertEqual(prober.disagg_url, "http://custom:9000/v1/completions")
+        self.assertEqual(prober.prefill_host, "custom-prefill:8100")
+
+
 if __name__ == "__main__":
     unittest.main()

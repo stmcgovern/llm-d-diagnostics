@@ -196,6 +196,11 @@ class TestCheckKvPressure(unittest.TestCase):
         c = self.mon._check_kv_pressure([DECODE_1], m)
         self.assertTrue(c.passed)
 
+    def test_malformed_metric_skipped(self):
+        m = {"vllm-decode-0": "vllm:kv_cache_usage_perc not_a_number\n"}
+        c = self.mon._check_kv_pressure([DECODE_1], m)
+        self.assertTrue(c.passed)
+
 
 # ── Queue balance ────────────────────────────────────────────────────────
 

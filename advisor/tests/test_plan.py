@@ -90,6 +90,19 @@ class TestFindNearestBaselines(unittest.TestCase):
         self.assertGreaterEqual(len(nearest), 1)
         self.assertLessEqual(len(nearest), 2)
 
+    def test_brackets_target_in_range(self):
+        """Target between measured points should return bracket pair."""
+        nearest = _find_nearest_baselines(2.0, "t4", is_moe=False)
+        self.assertEqual(len(nearest), 2)
+        lo_b = nearest[0][0]["params_b"]
+        hi_b = nearest[1][0]["params_b"]
+        self.assertLessEqual(lo_b, 2.0)
+        self.assertGreaterEqual(hi_b, 2.0)
+
+    def test_below_range_returns_two_nearest(self):
+        nearest = _find_nearest_baselines(0.1, "t4", is_moe=False)
+        self.assertEqual(len(nearest), 2)
+
     def test_moe_filter(self):
         nearest = _find_nearest_baselines(7.0, "t4", is_moe=True)
         self.assertEqual(len(nearest), 1)
@@ -259,6 +272,16 @@ class TestBwScaling(unittest.TestCase):
         )
         self.assertLess(plan_h100.mono_est_ttft_ms, plan_t4.mono_est_ttft_ms)
 
+    def test_nixl_uses_nic_not_hbm(self):
+        """NIXL transfers go over NIC, not HBM. Verify different scaling ratios."""
+        plan = plan_capacity(
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            target_throughput=1.0, target_ttft_ms=500, gpu_type="h100",
+        )
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("NIC BW", reasoning)
+        self.assertIn("memory BW", reasoning)
+
     def test_extrapolation_outside_range(self):
         """Model outside measured range falls back to proportional scaling."""
         plan = plan_capacity(
@@ -267,6 +290,20 @@ class TestBwScaling(unittest.TestCase):
         )
         self.assertGreater(plan.mono_est_ttft_ms, 0)
         self.assertIn(plan.confidence, ["interpolated", "low"])
+
+
+# ── TP correction ──────────────────────────────────────────────────────
+
+class TestTpCorrection(unittest.TestCase):
+
+    def test_interpolation_uses_2b_bracket(self):
+        """Target 2.0B should interpolate between 1.7B and 3.0B baselines."""
+        plan = plan_capacity(
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            target_throughput=1.0, target_ttft_ms=500, gpu_type="t4",
+        )
+        reasoning = " ".join(plan.reasoning)
+        self.assertNotIn("TP=", reasoning)
 
 
 if __name__ == "__main__":
