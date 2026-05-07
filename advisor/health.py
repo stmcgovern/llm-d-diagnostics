@@ -167,7 +167,10 @@ class HealthMonitor:
                 continue
             for line in body.split("\n"):
                 if line.startswith("vllm:kv_cache_usage_perc"):
-                    val = float(line.split()[-1])
+                    try:
+                        val = float(line.split()[-1])
+                    except (ValueError, IndexError):
+                        continue
                     if val > 0.9:
                         return HealthCheck("kv_pressure", False,
                                            f"{p['name']}: KV cache at {val*100:.0f}%", "warning")

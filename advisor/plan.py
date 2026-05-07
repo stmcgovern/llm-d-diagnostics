@@ -18,10 +18,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from .pricing import GPU_MEM_BW_GBS, GPU_VRAM_GB, get_price, get_cheapest
+    from .pricing import GPU_MEM_BW_GBS, GPU_NIC_BW_GBPS, GPU_VRAM_GB, get_price, get_cheapest
     from ._cluster import SCALING_GPUS
 except ImportError:
-    from pricing import GPU_MEM_BW_GBS, GPU_VRAM_GB, get_price, get_cheapest
+    from pricing import GPU_MEM_BW_GBS, GPU_NIC_BW_GBPS, GPU_VRAM_GB, get_price, get_cheapest
     from _cluster import SCALING_GPUS
 
 
@@ -249,15 +249,23 @@ def _plan_from_measured(plan, measured, target_throughput, price, tp):
 
 
 def _find_nearest_baselines(params_b, gpu_type, is_moe=False):
-    """Find the two nearest measured baselines by parameter count for interpolation."""
+    """Find bracketing baselines for interpolation, or two nearest for extrapolation."""
     candidates = []
     for (model_id, gtype), data in MEASURED_BASELINES.items():
         if gtype != gpu_type:
             continue
         if is_moe != data.get("is_moe", False):
             continue
-        candidates.append((abs(data["params_b"] - params_b), data, model_id))
-    candidates.sort(key=lambda x: x[0])
+        candidates.append((data["params_b"], data, model_id))
+    if not candidates:
+        return []
+    below = [(b, d, m) for b, d, m in candidates if b <= params_b]
+    above = [(b, d, m) for b, d, m in candidates if b > params_b]
+    if below and above:
+        lo = max(below, key=lambda x: x[0])
+        hi = min(above, key=lambda x: x[0])
+        return [(lo[1], lo[2]), (hi[1], hi[2])]
+    candidates.sort(key=lambda x: abs(x[0] - params_b))
     return [(c[1], c[2]) for c in candidates[:2]]
 
 
@@ -293,12 +301,18 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
     target_bw = _hw.get("hbm_bw_gbs", GPU_MEM_BW_GBS.get(gpu_type, t4_bw))
     bw_speedup = target_bw / t4_bw
 
+    t4_nic = GPU_NIC_BW_GBPS.get("t4", 25)
+    target_nic = GPU_NIC_BW_GBPS.get(gpu_type, t4_nic)
+    nic_speedup = target_nic / t4_nic
+
     nearest = _find_nearest_baselines(params_b, gpu_type, is_moe)
     if not nearest:
         nearest = _find_nearest_baselines(params_b, "t4", is_moe)
 
     if nearest:
         if len(nearest) >= 2:
+            if nearest[0][0]["params_b"] > nearest[1][0]["params_b"]:
+                nearest[0], nearest[1] = nearest[1], nearest[0]
             (lo, _), (hi, _) = nearest[0], nearest[1]
             lo_b, hi_b = lo["params_b"], hi["params_b"]
             range_b = hi_b - lo_b if hi_b != lo_b else 1
@@ -329,10 +343,17 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
             plan.reasoning.append(
                 f"GPU scaling: {bw_speedup:.1f}x memory BW ({t4_bw} -> {target_bw} GB/s)")
 
+        if tp > 1:
+            tp_eff = max(0.6, 0.85 - 0.05 * (tp - 2))
+            mono_ttft = mono_ttft / (tp * tp_eff)
+            plan.reasoning.append(f"TP={tp} parallelism: TTFT / {tp * tp_eff:.1f}")
+
         kv_bytes = _estimate_kv_bytes(profile)
         nixl_ms = _estimate_nixl_ms(kv_bytes, is_moe)
         if gpu_type != "t4":
-            nixl_ms = nixl_ms / bw_speedup
+            nixl_ms = nixl_ms / nic_speedup
+            plan.reasoning.append(
+                f"NIXL scaling: {nic_speedup:.0f}x NIC BW ({t4_nic} -> {target_nic} Gbps)")
         disagg_ttft = mono_ttft + SCALING_SIDECAR_MS + nixl_ms
 
         plan.mono_est_ttft_ms = round(max(mono_ttft, 10))
@@ -345,10 +366,15 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
             f"est. NIXL: {nixl_ms:.0f}ms + sidecar: {SCALING_SIDECAR_MS}ms")
     else:
         mono_ttft = 200 * params_b / bw_speedup
+        if tp > 1:
+            tp_eff = max(0.6, 0.85 - 0.05 * (tp - 2))
+            mono_ttft = mono_ttft / (tp * tp_eff)
         plan.mono_est_ttft_ms = round(max(mono_ttft, 10))
         plan.mono_est_throughput = round(1000 / max(plan.mono_est_ttft_ms, 1) * 0.7, 2)
         kv_bytes = _estimate_kv_bytes(profile)
         nixl_ms = _estimate_nixl_ms(kv_bytes, is_moe)
+        if gpu_type != "t4":
+            nixl_ms = nixl_ms / nic_speedup
         overhead_ms = SCALING_SIDECAR_MS + nixl_ms
         plan.disagg_est_ttft_ms = round(plan.mono_est_ttft_ms + overhead_ms)
         plan.reasoning.append("Pure heuristic (no matching baseline); run experiments to validate")

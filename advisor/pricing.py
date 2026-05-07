@@ -81,6 +81,12 @@ GPU_MEM_BW_GBS = {
     "h100": 3350, "h200": 4800,
 }
 
+GPU_NIC_BW_GBPS = {
+    "t4": 25, "a10g": 25, "l40s": 50,
+    "a100_40": 200, "a100_80": 200,
+    "h100": 400, "h200": 400,
+}
+
 # Active pricing table -- starts as a deep copy of static, refreshed by
 # ``refresh_pricing()`` when live data is available.
 PRICING: dict[str, dict[str, float]] = {

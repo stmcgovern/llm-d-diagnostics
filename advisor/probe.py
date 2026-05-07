@@ -94,14 +94,15 @@ def _send_probe(url, model, prompt="Hello", max_tokens=5, extra_headers=None):
 class DisaggProber:
     """Sends synthetic disagg requests and tracks TTFT against baseline."""
 
-    def __init__(self, namespace: str, model: str, window_size: int = 20):
+    def __init__(self, namespace: str, model: str, window_size: int = 20,
+                 decode_url: str = "", prefill_host: str = ""):
         self.namespace = namespace
         self.model = model
         self.window_size = window_size
         self._baseline_window: deque[float] = deque(maxlen=window_size)
         self._baseline_ms: float = 0.0
-        self.disagg_url = "https://vllm-decode-svc:8000/v1/completions"
-        self.prefill_host = f"vllm-prefill-svc.{namespace}.svc.cluster.local:8100"
+        self.disagg_url = decode_url or "https://vllm-decode-svc:8000/v1/completions"
+        self.prefill_host = prefill_host or f"vllm-prefill-svc.{namespace}.svc.cluster.local:8100"
 
     def probe(self) -> ProbeResult:
         """Send one synthetic disagg request and evaluate health."""

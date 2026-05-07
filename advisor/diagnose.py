@@ -327,10 +327,11 @@ def _check_transfer_duration(pods, ns="default") -> list[Issue]:
     return issues
 
 
-def _check_probe_health(ns, model) -> list[Issue]:
+def _check_probe_health(ns, model, decode_url="", prefill_host="") -> list[Issue]:
     """Send a test disagg request to verify end-to-end pipeline."""
-    url = "https://vllm-decode-svc:8000/v1/completions"
-    headers = {"x-prefiller-host-port": f"vllm-prefill-svc.{ns}.svc.cluster.local:8100"}
+    url = decode_url or "https://vllm-decode-svc:8000/v1/completions"
+    host = prefill_host or f"vllm-prefill-svc.{ns}.svc.cluster.local:8100"
+    headers = {"x-prefiller-host-port": host}
     r = _send_probe(url, model, extra_headers=headers)
     if r["status"] != 200:
         return [Issue(
