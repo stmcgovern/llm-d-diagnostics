@@ -198,7 +198,7 @@ def print_summary(results):
     results.sort(key=lambda r: r["kv_bytes"])
 
     print(f"\n{'='*80}")
-    print(f"  KV HEAD RATIO SWEEP: NIXL Transfer Physics")
+    print(f"  KV HEAD RATIO SWEEP: NIXL Transfer Analysis")
     print(f"{'='*80}")
     print()
 

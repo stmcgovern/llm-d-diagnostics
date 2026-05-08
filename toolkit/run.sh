@@ -27,6 +27,12 @@
 #     plan          GPU capacity planning + cost model
 #     rebalance     P/D ratio recommendation + watch mode
 #
+#   Infrastructure:
+#     deploy        Deploy P/D topology from env.sh
+#     undeploy      Tear down deployment (--keep-pvc to keep model cache)
+#     sweep         Run experiments across multiple models (JSON config)
+#                   Usage: ./toolkit/run.sh sweeps/kv-ratio.json sweep
+#
 #   Utilities:
 #     analyze       Statistical analysis of collected data (local)
 #     metrics       Standalone Prometheus metrics collection
@@ -49,6 +55,12 @@ CLUSTER_DIR="${1:?Usage: $0 <cluster-dir> <command>}"
 COMMAND="${2:-characterize}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Sweep takes a JSON config as first arg, not a cluster dir
+if [ "$COMMAND" = "sweep" ]; then
+    python3 "$REPO_ROOT/toolkit/sweep.py" "$CLUSTER_DIR" "${@:3}"
+    exit 0
+fi
 
 if [ ! -f "$CLUSTER_DIR/env.sh" ]; then
     echo "ERROR: $CLUSTER_DIR/env.sh not found"
@@ -304,6 +316,16 @@ case "$COMMAND" in
         exec "$0" "$CLUSTER_DIR" characterize
         ;;
 
+    # ── Infrastructure ────────────────────────────────────────────────────
+    deploy)
+        "$REPO_ROOT/scripts/deploy.sh" "$CLUSTER_DIR"
+        ;;
+
+    undeploy)
+        shift 2
+        "$REPO_ROOT/scripts/undeploy.sh" "$CLUSTER_DIR" "$@"
+        ;;
+
     # ── Advisory layer commands ────────────────────────────────────────────
     diagnose)
         shift 2  # remove cluster-dir and command
@@ -343,6 +365,10 @@ case "$COMMAND" in
         echo "  kv-eviction     KV cache persistence under pressure"
         echo "  fault           Fault tolerance (destructive)"
         echo "  model-load      Cold start time (destructive)"
+        echo ""
+        echo "  deploy          Deploy P/D topology from env.sh"
+        echo "  undeploy        Tear down deployment (--keep-pvc to keep model cache)"
+        echo "  sweep           Multi-model sweep (./toolkit/run.sh config.json sweep)"
         echo ""
         echo "  diagnose        Root-cause diagnosis with fix commands"
         echo "  health          Continuous health monitoring"

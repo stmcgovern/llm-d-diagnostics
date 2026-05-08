@@ -551,6 +551,35 @@ spec:
         memory: 1Gi
   restartPolicy: Never
 EOF
+
+    # RBAC for in-pod pod discovery (K8s API path in client.py)
+    echo "Creating RBAC for in-pod discovery..."
+    oc apply -n "$NS" -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  labels:
+    app.kubernetes.io/part-of: vllm-disagg
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: test-client-pod-reader
+  labels:
+    app.kubernetes.io/part-of: vllm-disagg
+subjects:
+- kind: ServiceAccount
+  name: default
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+EOF
 fi
 
 # ── Clean up legacy resources ────────────────────────────────────────────
@@ -601,7 +630,18 @@ echo "  Scale:"
 echo "    oc scale deployment vllm-prefill --replicas=N -n $NS"
 echo "    oc scale deployment vllm-decode  --replicas=N -n $NS"
 echo ""
-echo "Waiting for pods..."
-oc get pods -n "$NS" -l app.kubernetes.io/part-of=vllm-disagg -w --timeout=30s 2>/dev/null || true
+echo "Waiting for deployments to roll out..."
+oc rollout status deployment/vllm-prefill -n "$NS" --timeout=600s &
+oc rollout status deployment/vllm-decode -n "$NS" --timeout=600s &
+wait
+
+echo "Waiting for pods to pass readiness checks..."
+oc wait --for=condition=Ready pod \
+  -l app.kubernetes.io/part-of=vllm-disagg,app!=test-client \
+  -n "$NS" --timeout=600s
+
 echo ""
-echo "Done. Check status with: oc get pods -n $NS"
+echo "All vLLM pods ready."
+oc get pods -n "$NS" -l app.kubernetes.io/part-of=vllm-disagg
+echo ""
+echo "Done."

@@ -1,0 +1,13 @@
+{
+  "base": "clusters/rdu3-t4x5-phi3",
+  "experiments": ["decompose", "latency", "throughput", "seqlen"],
+  "models": [
+    {"model": "Qwen/Qwen2.5-0.5B-Instruct"},
+    {"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"},
+    {"model": "Qwen/Qwen2.5-1.5B-Instruct"},
+    {"model": "stabilityai/stablelm-2-1_6b-chat"},
+    {"model": "HuggingFaceTB/SmolLM2-1.7B-Instruct"},
+    {"model": "Qwen/Qwen2.5-3B-Instruct"},
+    {"model": "microsoft/Phi-3-mini-4k-instruct"}
+  ]
+}
