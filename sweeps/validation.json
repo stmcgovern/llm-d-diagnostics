@@ -1,0 +1,7 @@
+{
+  "base": "clusters/rdu3-t4x5-phi3",
+  "experiments": ["decompose", "latency"],
+  "models": [
+    {"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"}
+  ]
+}

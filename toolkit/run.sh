@@ -134,7 +134,18 @@ print(f'{r.status}|{r.completion_tokens}|{r.error}')
 }
 
 # ── Run remote experiment ──────────────────────────────────────────────────
+# Discover pod IPs from host (where oc works) and pass as env vars.
+# This provides pod discovery without requiring RBAC inside test-client.
+PREFILL_IPS=$(oc get pods -l app=vllm-prefill -n "$NS" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{":"}{.status.podIP}{","}{end}' \
+    2>/dev/null | sed 's/,$//')
+DECODE_IPS=$(oc get pods -l app=vllm-decode -n "$NS" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{":"}{.status.podIP}{","}{end}' \
+    2>/dev/null | sed 's/,$//')
+
 REMOTE_ENV="MODEL=$MODEL NS=$NS DATA_DIR=$REMOTE_DIR/data PREFILL_HOST=$PREFILL_HOST"
+[ -n "$PREFILL_IPS" ] && REMOTE_ENV="$REMOTE_ENV PODS_VLLM_PREFILL=$PREFILL_IPS"
+[ -n "$DECODE_IPS" ] && REMOTE_ENV="$REMOTE_ENV PODS_VLLM_DECODE=$DECODE_IPS"
 [ -n "${SIM:-}" ] && REMOTE_ENV="$REMOTE_ENV SIM=$SIM"
 
 run_remote() {

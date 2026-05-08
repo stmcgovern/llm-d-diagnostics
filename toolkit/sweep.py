@@ -18,12 +18,26 @@ Each model gets deployed, measured, and torn down. Results land in
 clusters/_sweep/<model-slug>/data/ for consumption by kv_sweep.py.
 """
 
+import csv
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
+
+
+EXPERIMENT_CSV = {
+    "latency": "exp1-results.csv",
+    "decompose": "exp1b-results.csv",
+    "throughput": "exp2-results.csv",
+    "isolation": "exp3-results.csv",
+    "seqlen": "exp5-results.csv",
+    "saturation": "exp6-results.csv",
+    "mixed": "exp7-results.csv",
+    "prefix-cache": "exp8-results.csv",
+    "kv-eviction": "exp10-results.csv",
+}
 
 
 def parse_env_sh(path):
@@ -39,6 +53,40 @@ def parse_env_sh(path):
 
 def model_slug(model_id):
     return model_id.split("/")[-1].lower()
+
+
+def model_complete(data_dir, experiments):
+    """Check if all expected experiment CSVs exist with data rows."""
+    for exp in experiments:
+        csv_name = EXPERIMENT_CSV.get(exp)
+        if csv_name is None:
+            return False
+        csv_path = os.path.join(data_dir, csv_name)
+        try:
+            with open(csv_path) as f:
+                lines = sum(1 for _ in f)
+            if lines < 2:
+                return False
+        except FileNotFoundError:
+            return False
+    return True
+
+
+def validate_csv(path):
+    """Check a result CSV for completeness. Returns (ok, message)."""
+    if not os.path.exists(path):
+        return False, "CSV not found"
+    with open(path) as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    if not rows:
+        return False, "CSV empty (header only)"
+    if "status_code" in rows[0]:
+        ok_count = sum(1 for r in rows if r.get("status_code") == "200")
+        rate = ok_count / len(rows)
+        if rate < 0.8:
+            return False, f"only {ok_count}/{len(rows)} rows HTTP 200 ({rate:.0%})"
+    return True, ""
 
 
 def write_env_sh(path, base_env, overrides):
@@ -65,7 +113,8 @@ def run(cmd, label, dry_run=False):
 
 def main():
     dry_run = "--dry-run" in sys.argv
-    args = [a for a in sys.argv[1:] if a != "--dry-run"]
+    resume = "--resume" in sys.argv
+    args = [a for a in sys.argv[1:] if a not in ("--dry-run", "--resume")]
     config_path = args[0]
 
     with open(config_path) as f:
@@ -78,6 +127,8 @@ def main():
     ns = base_env.get("NS", "llm-d")
 
     mode = "DRY RUN" if dry_run else "LIVE"
+    if resume:
+        mode += ", RESUME"
     print(f"Sweep ({mode}): {len(models)} models, {len(experiments)} experiments each")
     print(f"Base:  {base_dir} (namespace={ns})")
     print()
@@ -109,6 +160,12 @@ def main():
         print(f"  [{i}/{len(models)}] {model_id}")
         print(f"  Output: {data_dir}")
         print(f"{'='*60}")
+
+        if resume and model_complete(data_dir, experiments):
+            print(f"  SKIP (--resume): all {len(experiments)} CSVs present")
+            completed.append(model_id)
+            print()
+            continue
 
         overrides = {
             "MODEL": model_id,
@@ -146,8 +203,16 @@ def main():
                     run(["toolkit/run.sh", cluster_dir, exp], exp, dry_run)
                 except RuntimeError as e:
                     print(f"  WARNING: {e}")
+                csv_name = EXPERIMENT_CSV.get(exp)
+                if csv_name and not dry_run:
+                    ok, msg = validate_csv(os.path.join(data_dir, csv_name))
+                    if not ok:
+                        print(f"  WARNING: {exp} data: {msg}")
 
-            run(["scripts/undeploy.sh", cluster_dir], "undeploy", dry_run)
+            undeploy_cmd = ["scripts/undeploy.sh", cluster_dir]
+            if i < len(models):
+                undeploy_cmd.append("--keep-pvc")
+            run(undeploy_cmd, "undeploy", dry_run)
             current_cluster_dir = None
             completed.append(model_id)
             print(f"  DONE: {slug}\n")
@@ -157,7 +222,10 @@ def main():
             failed.append((model_id, str(e)))
             if not dry_run:
                 try:
-                    run(["scripts/undeploy.sh", cluster_dir], "undeploy (cleanup)")
+                    undeploy_cmd = ["scripts/undeploy.sh", cluster_dir]
+                    if i < len(models):
+                        undeploy_cmd.append("--keep-pvc")
+                    run(undeploy_cmd, "undeploy (cleanup)")
                 except RuntimeError:
                     pass
             current_cluster_dir = None

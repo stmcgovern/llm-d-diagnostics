@@ -552,9 +552,11 @@ spec:
   restartPolicy: Never
 EOF
 
-    # RBAC for in-pod pod discovery (K8s API path in client.py)
+    # RBAC for in-pod pod discovery (K8s API path in client.py).
+    # Best-effort: if user lacks RBAC permissions, pod discovery falls
+    # back to env vars injected by run.sh at experiment time.
     echo "Creating RBAC for in-pod discovery..."
-    oc apply -n "$NS" -f - <<EOF
+    if ! oc apply -n "$NS" -f - <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -580,6 +582,10 @@ roleRef:
   name: pod-reader
   apiGroup: rbac.authorization.k8s.io
 EOF
+    then
+        echo "WARNING: RBAC creation failed (insufficient permissions)."
+        echo "  Pod discovery will use env vars from run.sh instead."
+    fi
 fi
 
 # ── Clean up legacy resources ────────────────────────────────────────────
@@ -630,18 +636,31 @@ echo "  Scale:"
 echo "    oc scale deployment vllm-prefill --replicas=N -n $NS"
 echo "    oc scale deployment vllm-decode  --replicas=N -n $NS"
 echo ""
-echo "Waiting for deployments to roll out..."
-oc rollout status deployment/vllm-prefill -n "$NS" --timeout=600s &
-oc rollout status deployment/vllm-decode -n "$NS" --timeout=600s &
-wait
+echo "Waiting for pods to be ready (up to 20 min for model download)..."
+TIMEOUT=1200
+INTERVAL=30
+ELAPSED=0
+EXPECTED=$((PREFILL_REPLICAS + DECODE_REPLICAS))
 
-echo "Waiting for pods to pass readiness checks..."
-oc wait --for=condition=Ready pod \
-  -l app.kubernetes.io/part-of=vllm-disagg,app!=test-client \
-  -n "$NS" --timeout=600s
+while [ $ELAPSED -lt $TIMEOUT ]; do
+    READY=$(oc get pods -n "$NS" \
+        -l app.kubernetes.io/part-of=vllm-disagg,app!=test-client \
+        -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
+        2>/dev/null | grep -c "True" | tr -d '\n' || echo 0)
+    if [ "$READY" -ge "$EXPECTED" ]; then
+        echo ""
+        echo "All $EXPECTED vLLM pods ready."
+        oc get pods -n "$NS" -l app.kubernetes.io/part-of=vllm-disagg
+        echo ""
+        echo "Done."
+        exit 0
+    fi
+    echo "  $READY/$EXPECTED pods ready (${ELAPSED}s elapsed)..."
+    sleep $INTERVAL
+    ELAPSED=$((ELAPSED + INTERVAL))
+done
 
 echo ""
-echo "All vLLM pods ready."
+echo "WARNING: Only $READY/$EXPECTED pods ready after ${TIMEOUT}s."
 oc get pods -n "$NS" -l app.kubernetes.io/part-of=vllm-disagg
-echo ""
-echo "Done."
+exit 1
