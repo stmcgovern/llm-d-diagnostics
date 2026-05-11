@@ -24,10 +24,11 @@ from rebalance import (
 # ── Fixtures ─────────────────────────────────────────────────────────────
 
 def _pod(name, ip="10.0.0.1"):
-    role = "vllm-prefill" if "prefill" in name else "vllm-decode"
+    app = "vllm-prefill" if "prefill" in name else "vllm-decode"
     return {
         "name": name, "ip": ip, "ready": True,
-        "labels": {"app": role},
+        "labels": {"app": app},
+        "role": app,
         "image": "vllm/vllm-openai:v0.18.1",
         "args": "[]",
     }

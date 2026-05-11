@@ -15,9 +15,11 @@ from dataclasses import dataclass
 try:
     from ._cluster import oc_safe, get_pods_full as get_pods, scrape_pod_metrics
     from .probe import _send_probe
+    from .plan import _estimate_nixl_ms, _estimate_kv_bytes, ModelProfile
 except ImportError:
     from _cluster import oc_safe, get_pods_full as get_pods, scrape_pod_metrics
     from probe import _send_probe
+    from plan import _estimate_nixl_ms, _estimate_kv_bytes, ModelProfile
 
 
 @dataclass
@@ -56,7 +58,7 @@ def diagnose(namespace: str, model: str = "") -> list[Issue]:
     issues.extend(_check_stale_kv_timeout(pods, namespace))
     issues.extend(_check_nixl_config(prefill, namespace))
     issues.extend(_check_kv_expiration(pods, namespace))
-    issues.extend(_check_transfer_duration(pods, namespace))
+    issues.extend(_check_transfer_duration(pods, namespace, model=model))
 
     if model:
         issues.extend(_check_probe_health(namespace, model))
@@ -218,7 +220,7 @@ def _check_kv_cache_pressure(pods, ns="default") -> list[Issue]:
 def _check_stale_kv_timeout(pods, ns) -> list[Issue]:
     """Check if NIXL abort timeout is too long (llm-d ops doc)."""
     for p in pods:
-        if "prefill" not in p.get("name", ""):
+        if "prefill" not in p.get("role", ""):
             continue
         out, _ = oc_safe("exec", p["name"], "-n", ns, "-c", "vllm",
                           "--", "printenv", "VLLM_NIXL_ABORT_REQUEST_TIMEOUT", timeout=10)
@@ -292,8 +294,18 @@ def _check_kv_expiration(pods, ns) -> list[Issue]:
     return issues
 
 
-def _check_transfer_duration(pods, ns="default") -> list[Issue]:
-    """Check NIXL transfer duration for anomalies."""
+def _check_transfer_duration(pods, ns="default", model: str = "",
+                             gpu_type: str = "t4") -> list[Issue]:
+    """Check NIXL transfer duration for anomalies against expected model."""
+    threshold_ms = 500
+    try:
+        profile = ModelProfile(model_id=model) if model else ModelProfile(model_id="")
+        kv_bytes = _estimate_kv_bytes(profile)
+        expected_ms = _estimate_nixl_ms(kv_bytes, seq_len=128, gpu_type=gpu_type)
+        threshold_ms = expected_ms * 3
+    except Exception:
+        pass
+
     issues = []
     for p in pods:
         body = scrape_pod_metrics(p, ns)
@@ -314,11 +326,12 @@ def _check_transfer_duration(pods, ns="default") -> list[Issue]:
                     pass
         if transfer_count > 0:
             avg_ms = transfer_sum / transfer_count * 1000
-            if avg_ms > 500:
+            if avg_ms > threshold_ms:
                 issues.append(Issue(
                     "warning",
                     f"High NIXL transfer duration on {p['name']}",
-                    f"Avg transfer: {avg_ms:.0f}ms over {int(transfer_count)} transfers",
+                    f"Avg transfer: {avg_ms:.0f}ms over {int(transfer_count)} transfers "
+                    f"(threshold: {threshold_ms:.0f}ms)",
                     "Network congestion or misconfigured NIXL buffer size. "
                     "Consider RDMA if available, or check for NIC bandwidth saturation.",
                     "https://github.com/ai-dynamo/nixl/blob/main/benchmark/nixlbench/README.md",
@@ -327,10 +340,11 @@ def _check_transfer_duration(pods, ns="default") -> list[Issue]:
     return issues
 
 
-def _check_probe_health(ns, model) -> list[Issue]:
+def _check_probe_health(ns, model, decode_url="", prefill_host="") -> list[Issue]:
     """Send a test disagg request to verify end-to-end pipeline."""
-    url = "https://vllm-decode-svc:8000/v1/completions"
-    headers = {"x-prefiller-host-port": f"vllm-prefill-svc.{ns}.svc.cluster.local:8100"}
+    url = decode_url or "https://vllm-decode-svc:8000/v1/completions"
+    host = prefill_host or f"vllm-prefill-svc.{ns}.svc.cluster.local:8100"
+    headers = {"x-prefiller-host-port": host}
     r = _send_probe(url, model, extra_headers=headers)
     if r["status"] != 200:
         return [Issue(

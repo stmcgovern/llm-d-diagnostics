@@ -467,8 +467,10 @@ def predict_for_model(coefficients, target_model_key, gpu_decode="T4",
         if "bw_eff_gbs" not in coeff or "compute_eff_tflops" not in coeff:
             continue
 
-        # Scale bandwidth by GPU ratio
-        bw_ratio = gpu_d["hbm_bw_gbs"] / measured_gpu["hbm_bw_gbs"]
+        # Scale bandwidth by network ratio (NIXL transfers use NIC, not HBM)
+        measured_net_bw = NETWORKS["TCP"]["bw_gbps"]
+        target_net_bw = net["bw_gbps"] if net else measured_net_bw
+        bw_ratio = target_net_bw / measured_net_bw
         scaled_bw = coeff["bw_eff_gbs"] * bw_ratio
 
         # Scale compute by GPU ratio
@@ -593,7 +595,7 @@ def cross_cluster_comparison(regressions):
             tr_ratio = r1.tr_slope / r0.tr_slope if r0.tr_slope > 0 else float('inf')
             pf_ratio = r1.pf_slope / r0.pf_slope if r0.pf_slope > 0 else float('inf')
 
-            print("  Validation — do measured ratios match physics?")
+            print("  Validation — do measured ratios match expected scaling?")
             print(f"    Model params ratio: {param_ratio:.2f}x")
             print(f"    KV cache ratio:     {kv_ratio:.2f}x (from architecture)")
             print(f"    Transfer slope ratio: {tr_ratio:.2f}x (measured)")

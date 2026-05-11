@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 from pricing import (
+    GPU_NIC_BW_GBPS,
     GPU_TFLOPS_FP16,
     GPU_VRAM_GB,
     PRICING,
@@ -81,6 +82,14 @@ class TestPricingTables(unittest.TestCase):
     def test_tflops_table_completeness(self):
         for gpu in ["t4", "h100", "a100_80"]:
             self.assertIn(gpu, GPU_TFLOPS_FP16)
+
+    def test_nic_bw_table_completeness(self):
+        for gpu in ["t4", "h100", "a100_80", "h200"]:
+            self.assertIn(gpu, GPU_NIC_BW_GBPS)
+            self.assertGreater(GPU_NIC_BW_GBPS[gpu], 0)
+
+    def test_nic_bw_increases_with_tier(self):
+        self.assertLess(GPU_NIC_BW_GBPS["t4"], GPU_NIC_BW_GBPS["h100"])
 
     def test_static_matches_initial(self):
         for provider, gpus in _STATIC_PRICING.items():

@@ -225,6 +225,21 @@ class Exp5Row(TypedDict):
     error: str
 
 
+class Exp5bRow(TypedDict):
+    experiment: str
+    pod: str
+    prompt_tokens_target: str
+    prompt_tokens_actual: str
+    run: str
+    ttft_ms: str
+    total_ms: str
+    status_code: str
+    error: str
+    nixl_bytes_delta: str
+    nixl_xfer_time_delta_ms: str
+    nixl_transfers_delta: str
+
+
 class Exp6Row(TypedDict):
     experiment: str
     config: str

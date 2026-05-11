@@ -90,14 +90,17 @@ class HealthMonitor:
         prefill_pods = [p for p in pods if "prefill" in p.get("role", "")]
         decode_pods = [p for p in pods if "decode" in p.get("role", "")]
 
+        all_pods = prefill_pods + decode_pods
+        metrics = {p["name"]: scrape_pod_metrics(p, self.namespace) for p in all_pods}
+
         snap.checks.append(self._check_pod_health(prefill_pods, decode_pods))
         snap.checks.append(self._check_version_compat(pods))
         snap.checks.append(self._check_kv_roles(pods))
-        snap.checks.append(self._check_nixl_failures(prefill_pods + decode_pods))
-        snap.checks.append(self._check_kv_pressure(prefill_pods + decode_pods))
-        snap.checks.append(self._check_queue_balance(prefill_pods, decode_pods))
-        snap.checks.append(self._check_kv_expiration(prefill_pods + decode_pods))
-        snap.checks.append(self._check_transfer_duration(prefill_pods + decode_pods))
+        snap.checks.append(self._check_nixl_failures(all_pods, metrics))
+        snap.checks.append(self._check_kv_pressure(all_pods, metrics))
+        snap.checks.append(self._check_queue_balance(prefill_pods, decode_pods, metrics))
+        snap.checks.append(self._check_kv_expiration(all_pods, metrics))
+        snap.checks.append(self._check_transfer_duration(all_pods, metrics))
 
         probe = self.prober.probe()
         snap.probe = probe
@@ -139,14 +142,17 @@ class HealthMonitor:
             return HealthCheck("kv_roles", False, "No KV producer found", "critical")
         return HealthCheck("kv_roles", True, f"{len(producers)} producer(s), {len(consumers)} consumer(s)")
 
-    def _check_nixl_failures(self, pods) -> HealthCheck:
+    def _check_nixl_failures(self, pods, metrics) -> HealthCheck:
         for p in pods:
-            body = scrape_pod_metrics(p, self.namespace)
+            body = metrics.get(p["name"], "")
             if not body:
                 continue
             for line in body.split("\n"):
                 if line.startswith("vllm:nixl_num_failed_transfers"):
-                    val = float(line.split()[-1])
+                    try:
+                        val = float(line.split()[-1])
+                    except (ValueError, IndexError):
+                        continue
                     prev = self._prev_nixl_fails.get(p["name"], 0)
                     self._prev_nixl_fails[p["name"]] = val
                     if val > prev:
@@ -154,27 +160,30 @@ class HealthMonitor:
                                            f"{p['name']}: {int(val - prev)} new NIXL failures", "critical")
         return HealthCheck("nixl_failures", True, "No NIXL transfer failures")
 
-    def _check_kv_pressure(self, pods) -> HealthCheck:
+    def _check_kv_pressure(self, pods, metrics) -> HealthCheck:
         for p in pods:
-            body = scrape_pod_metrics(p, self.namespace)
+            body = metrics.get(p["name"], "")
             if not body:
                 continue
             for line in body.split("\n"):
                 if line.startswith("vllm:kv_cache_usage_perc"):
-                    val = float(line.split()[-1])
+                    try:
+                        val = float(line.split()[-1])
+                    except (ValueError, IndexError):
+                        continue
                     if val > 0.9:
                         return HealthCheck("kv_pressure", False,
                                            f"{p['name']}: KV cache at {val*100:.0f}%", "warning")
         return HealthCheck("kv_pressure", True, "KV cache pressure normal")
 
-    def _check_queue_balance(self, prefill, decode) -> HealthCheck:
+    def _check_queue_balance(self, prefill, decode, metrics) -> HealthCheck:
         """Check queue depth balance across decode pods."""
         if len(decode) < 2:
             return HealthCheck("queue_balance", True, f"{len(prefill)}P + {len(decode)}D")
 
         queue_depths = {}
         for p in decode:
-            body = scrape_pod_metrics(p, self.namespace)
+            body = metrics.get(p["name"], "")
             if not body:
                 continue
             for line in body.split("\n"):
@@ -191,16 +200,17 @@ class HealthMonitor:
         avg = sum(queue_depths.values()) / len(queue_depths)
         max_pod = max(queue_depths, key=queue_depths.get)
         max_val = queue_depths[max_pod]
-        if avg > 0 and max_val > avg * 2:
+        min_val = min(queue_depths.values())
+        if max_val >= 5 and (min_val == 0 or max_val / max(min_val, 1) > 3):
             return HealthCheck("queue_balance", False,
                                f"{max_pod} has {max_val:.0f} waiting (avg {avg:.0f})", "warning")
         return HealthCheck("queue_balance", True,
                            f"{len(decode)} decode pods balanced (avg queue: {avg:.0f})")
 
-    def _check_kv_expiration(self, pods) -> HealthCheck:
+    def _check_kv_expiration(self, pods, metrics) -> HealthCheck:
         """Check for KV block expiration (stranded transfers). vLLM PR #32340."""
         for p in pods:
-            body = scrape_pod_metrics(p, self.namespace)
+            body = metrics.get(p["name"], "")
             if not body:
                 continue
             for line in body.split("\n"):
@@ -218,10 +228,10 @@ class HealthMonitor:
                         pass
         return HealthCheck("kv_expiration", True, "No KV block expirations")
 
-    def _check_transfer_duration(self, pods) -> HealthCheck:
+    def _check_transfer_duration(self, pods, metrics) -> HealthCheck:
         """Track NIXL transfer duration for network degradation detection."""
         for p in pods:
-            body = scrape_pod_metrics(p, self.namespace)
+            body = metrics.get(p["name"], "")
             if not body:
                 continue
             for line in body.split("\n"):
