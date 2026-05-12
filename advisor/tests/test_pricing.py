@@ -2,14 +2,14 @@
 
 import json
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 from pricing import (
+    _STATIC_PRICING,
     GPU_NIC_BW_GBPS,
     GPU_TFLOPS_FP16,
     GPU_VRAM_GB,
     PRICING,
-    _STATIC_PRICING,
     cost_per_1k_requests,
     get_cheapest,
     get_price,

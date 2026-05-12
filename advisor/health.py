@@ -17,11 +17,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 try:
-    from ._cluster import oc_safe, get_pods_full as get_pods, scrape_pod_metrics
+    from ._cluster import get_pods_full as get_pods
+    from ._cluster import oc_safe, scrape_pod_metrics
     from .probe import DisaggProber, ProbeResult
 except ImportError:
-    from _cluster import oc_safe, get_pods_full as get_pods, scrape_pod_metrics
-    from probe import DisaggProber, ProbeResult
+    from _cluster import get_pods_full as get_pods  # type: ignore[no-redef]
+    from _cluster import oc_safe, scrape_pod_metrics  # type: ignore[no-redef]
+    from probe import DisaggProber, ProbeResult  # type: ignore[no-redef]
 
 
 @dataclass
@@ -56,7 +58,7 @@ class HealthMonitor:
     def run(self, duration_s: float = 0):
         """Run health monitoring loop. duration_s=0 runs forever."""
         print(f"\n{'='*60}")
-        print(f"  DISAGG HEALTH MONITOR")
+        print("  DISAGG HEALTH MONITOR")
         print(f"{'='*60}")
         print(f"  Namespace: {self.namespace}")
         print(f"  Model:     {self.model}")
@@ -64,7 +66,7 @@ class HealthMonitor:
         print(f"  {'Running for ' + str(int(duration_s)) + 's' if duration_s else 'Running until Ctrl+C'}")
         print()
 
-        print(f"  Warming up probe baseline...", end=" ", flush=True)
+        print("  Warming up probe baseline...", end=" ", flush=True)
         self.prober.warmup(5)
         print(f"done (baseline: {self.prober._baseline_ms:.0f}ms)")
         print()
@@ -198,7 +200,7 @@ class HealthMonitor:
                                f"{len(prefill)}P + {len(decode)}D (queue metrics unavailable)")
 
         avg = sum(queue_depths.values()) / len(queue_depths)
-        max_pod = max(queue_depths, key=queue_depths.get)
+        max_pod = max(queue_depths, key=lambda k: queue_depths[k])
         max_val = queue_depths[max_pod]
         min_val = min(queue_depths.values())
         if max_val >= 5 and (min_val == 0 or max_val / max(min_val, 1) > 3):
@@ -313,7 +315,7 @@ class HealthMonitor:
         degraded = sum(1 for s in self.snapshots if s.overall == "DEGRADED")
         unhealthy = sum(1 for s in self.snapshots if s.overall == "UNHEALTHY")
         print(f"\n{'='*60}")
-        print(f"  HEALTH SUMMARY")
+        print("  HEALTH SUMMARY")
         print(f"{'='*60}")
         print(f"  Snapshots: {total}")
         if total:

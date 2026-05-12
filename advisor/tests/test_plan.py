@@ -4,14 +4,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-
 from unittest.mock import patch
 
 from plan import (
     KV_BYTES_PER_TOKEN,
     MEASURED_BASELINES,
     MOE_NIXL_CORRECTION,
-    NIXL_EFF_BW_GBS,
     NIXL_PROTOCOL_MS,
     CapacityPlan,
     ModelProfile,

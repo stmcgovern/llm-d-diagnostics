@@ -26,7 +26,6 @@ import signal
 import subprocess
 import sys
 
-
 EXPERIMENT_CSV = {
     "latency": "exp1-results.csv",
     "decompose": "exp1b-results.csv",
@@ -37,6 +36,10 @@ EXPERIMENT_CSV = {
     "mixed": "exp7-results.csv",
     "prefix-cache": "exp8-results.csv",
     "kv-eviction": "exp10-results.csv",
+    "tput-seqlen": "exp11-results.csv",
+    "tput-outlen": "exp12-results.csv",
+    "tput-sat": "exp13-results.csv",
+    "overhead-load": "exp14-results.csv",
 }
 
 
@@ -238,8 +241,8 @@ def main():
     if failed:
         print(f"  Failed:    {', '.join(model_slug(m) for m, _ in failed)}")
     print()
-    print(f"  Analyze with:")
-    print(f"    python3 advisor/kv_sweep.py clusters/_sweep/*/data/")
+    print("  Analyze with:")
+    print("    python3 advisor/kv_sweep.py clusters/_sweep/*/data/")
     print(f"{'='*60}")
 
 

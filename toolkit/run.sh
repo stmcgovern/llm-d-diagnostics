@@ -18,6 +18,10 @@
 #     mixed         Mixed workload (realistic traffic)
 #     prefix-cache  KV cache hit rates across requests and pods
 #     kv-eviction   KV cache persistence under delay and pressure
+#     tput-seqlen   Throughput vs prompt length
+#     tput-outlen   Throughput vs output length
+#     tput-sat      Saturation ceiling (high concurrency)
+#     overhead-load Overhead decomposition under concurrent load
 #     fault         Fault tolerance (kills pods — destructive)
 #     model-load    Cold start time (kills pods — destructive)
 #
@@ -227,6 +231,10 @@ run_experiment() {
             return 1
             ;;
         kv-eviction|exp10) run_single "KV Cache Eviction" exp10_kv_eviction.py ;;
+        tput-seqlen|exp11) run_single "Throughput vs Prompt Length" exp11_tput_seqlen.py ;;
+        tput-outlen|exp12) run_single "Throughput vs Output Length" exp12_tput_outlen.py ;;
+        tput-sat|exp13) run_single "Saturation Ceiling" exp13_tput_sat.py ;;
+        overhead-load|exp14) run_single "Overhead Under Load" exp14_overhead_load.py ;;
         *)
             echo "Unknown experiment: $1"
             return 1
@@ -304,7 +312,8 @@ case "$COMMAND" in
     # Individual experiments (old or new names)
     latency|exp1|decompose|exp1b|throughput|exp2|isolation|exp3|\
     seqlen|exp5|saturation|exp6|mixed|exp7|\
-    prefix-cache|exp8|kv-eviction|exp10)
+    prefix-cache|exp8|kv-eviction|exp10|\
+    tput-seqlen|exp11|tput-outlen|exp12|tput-sat|exp13|overhead-load|exp14)
         run_experiment "$COMMAND"
         ;;
 
@@ -374,6 +383,10 @@ case "$COMMAND" in
         echo "  mixed           Mixed workload"
         echo "  prefix-cache    KV cache hit rates"
         echo "  kv-eviction     KV cache persistence under pressure"
+        echo "  tput-seqlen     Throughput vs prompt length"
+        echo "  tput-outlen     Throughput vs output length"
+        echo "  tput-sat        Saturation ceiling (high concurrency)"
+        echo "  overhead-load   Overhead decomposition under load"
         echo "  fault           Fault tolerance (destructive)"
         echo "  model-load      Cold start time (destructive)"
         echo ""

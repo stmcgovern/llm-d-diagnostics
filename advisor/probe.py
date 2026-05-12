@@ -16,9 +16,9 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 try:
-    from ._cluster import oc_safe
+    from ._cluster import oc_safe  # noqa: F401
 except ImportError:
-    from _cluster import oc_safe
+    pass
 
 
 @dataclass

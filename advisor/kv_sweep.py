@@ -18,8 +18,6 @@ import csv
 import json
 import math
 import os
-import sys
-
 
 # Model architecture for KV bytes calculation
 MODEL_ARCH = {
@@ -98,7 +96,7 @@ def _load_exp5(data_dir, model_override=None):
             by_run.setdefault((seq_len, run), {})[config] = ttft
 
     transfer_by_len = {}
-    for (seq_len, run), configs in sorted(by_run.items()):
+    for (seq_len, _run), configs in sorted(by_run.items()):
         c = configs.get("C-sidecar-only")
         d = configs.get("D-disaggregated")
         if c is not None and d is not None:
@@ -198,7 +196,7 @@ def print_summary(results):
     results.sort(key=lambda r: r["kv_bytes"])
 
     print(f"\n{'='*80}")
-    print(f"  KV HEAD RATIO SWEEP: NIXL Transfer Analysis")
+    print("  KV HEAD RATIO SWEEP: NIXL Transfer Analysis")
     print(f"{'='*80}")
     print()
 
@@ -228,20 +226,20 @@ def print_summary(results):
           f"(CV={b_sd/b_mean*100:.0f}%)" if b_mean > 0 else "")
 
     if p_mean > 0 and p_sd / p_mean < 0.3:
-        print(f"  -> Protocol overhead is CONSISTENT across models (as predicted)")
+        print("  -> Protocol overhead is CONSISTENT across models (as predicted)")
     else:
-        print(f"  -> Protocol overhead VARIES by model (unexpected -- investigate)")
+        print("  -> Protocol overhead VARIES by model (unexpected -- investigate)")
 
     if b_mean > 0 and b_sd / b_mean < 0.3:
-        print(f"  -> Effective bandwidth is CONSISTENT (linear model valid)")
+        print("  -> Effective bandwidth is CONSISTENT (linear model valid)")
     else:
-        print(f"  -> Effective bandwidth VARIES (may indicate non-linear transfer)")
+        print("  -> Effective bandwidth VARIES (may indicate non-linear transfer)")
 
     print()
 
     seq_lens = sorted(set(L for r in results for L in r["by_len"]))
     if seq_lens:
-        print(f"  T_transfer by sequence length (mean ms):")
+        print("  T_transfer by sequence length (mean ms):")
         print()
         header = f"  {'Model':>18} |"
         for L in seq_lens:
@@ -253,7 +251,7 @@ def print_summary(results):
             row = f"  {r['short']:>18} |"
             for L in seq_lens:
                 if L in r["by_len"]:
-                    mean, sd, n = r["by_len"][L]
+                    mean, _sd, _n = r["by_len"][L]
                     row += f" {mean:>6.0f}ms |"
                 else:
                     row += f" {'--':>7} |"

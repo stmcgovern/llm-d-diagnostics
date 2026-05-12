@@ -11,7 +11,6 @@ whichever data is current.
 """
 
 import json
-import sys
 import urllib.request
 
 # ── Static fallback tables ───────────────────────────────────────────────

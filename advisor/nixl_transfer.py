@@ -11,10 +11,8 @@ Can update advisor/plan.py constants from measured data.
 """
 
 import csv
-import json
 import math
 import os
-import sys
 
 
 def _linreg(xs, ys):
@@ -155,7 +153,7 @@ def analyze_nixl_transfer(data_dir, kv_bytes_per_token=None):
 
     # Residual analysis
     residuals = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
-    res_mean, res_sd = _stats(residuals)
+    _res_mean, res_sd = _stats(residuals)
 
     return {
         "protocol_ms": intercept,
@@ -181,7 +179,7 @@ def print_nixl_transfer(result):
         return
 
     print(f"\n{'='*70}")
-    print(f"  NIXL TRANSFER MODEL (exp5b direct measurement)")
+    print("  NIXL TRANSFER MODEL (exp5b direct measurement)")
     print(f"{'='*70}")
     print()
     print(f"  Data points:      {result['n_points']}")
@@ -240,10 +238,10 @@ def print_nixl_transfer(result):
 
     # Advisor update recommendation
     print()
-    print(f"  ADVISOR UPDATE:")
+    print("  ADVISOR UPDATE:")
     print(f"    NIXL_PROTOCOL_MS = {proto:.1f}")
     print(f"    NIXL_EFF_BW_GBS  = {bw:.3f}")
-    print(f"    (in advisor/plan.py, lines 149-150)")
+    print("    (in advisor/plan.py, lines 149-150)")
     print()
 
 

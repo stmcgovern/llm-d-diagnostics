@@ -7,11 +7,11 @@ delta tracking for failures/expirations, and duration trend detection.
 
 import time
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-from health import HealthMonitor, HealthCheck, HealthSnapshot
+from health import HealthCheck, HealthMonitor, HealthSnapshot
+
 from probe import ProbeResult
-
 
 # ── Test fixtures ────────────────────────────────────────────────────────
 

@@ -751,7 +751,7 @@ def oc(*args, timeout=60):
     """
     import subprocess
     r = subprocess.run(
-        ["oc"] + list(args), capture_output=True, text=True, timeout=timeout,
+        ["oc", *list(args)], capture_output=True, text=True, timeout=timeout,
     )
     if r.returncode != 0:
         raise RuntimeError(f"oc {' '.join(args)}: {r.stderr.strip()[:200]}")
@@ -762,7 +762,7 @@ def oc_safe(*args, timeout=60):
     """Run an ``oc`` CLI command, returning (stdout, stderr) without raising."""
     import subprocess
     r = subprocess.run(
-        ["oc"] + list(args), capture_output=True, text=True, timeout=timeout,
+        ["oc", *list(args)], capture_output=True, text=True, timeout=timeout,
     )
     return r.stdout.strip(), r.stderr.strip()
 

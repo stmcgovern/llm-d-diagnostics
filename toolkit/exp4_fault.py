@@ -1209,7 +1209,7 @@ def wait_for_steady_state(url, baseline, timeout=120, interval=10, label="settle
 # ── Prediction Ledger ─────────────────────────────────────────────────────────
 # Tracks all predictions and results for the summary table at the end.
 
-_prediction_ledger = []
+_prediction_ledger: list[dict[str, str]] = []
 
 
 def predict(experiment, prediction, reasoning):
@@ -2026,7 +2026,7 @@ def run_exp_4f(ctx: ExperimentContext) -> None:
         # "fallback" (the sidecar served locally), not "transparent" (disagg
         # path survived the fault). Confusing these would claim resilience
         # the disagg path doesn't actually have.
-        if recovered and first_recovery_s is not None:
+        if recovered and first_recovery_s is not None and first_recovery_ttft is not None:
             if fallback_count > 0:
                 # Sidecar logs confirm fallback — definitive, regardless of speed
                 mechanism = "fallback"
@@ -2098,7 +2098,7 @@ def run_exp_4f(ctx: ExperimentContext) -> None:
         progress("  === 4f Summary ===")
         progress(f"  {'Nominal':>8s}  {'Actual':>8s}  {'Recovered':>9s}  "
                  f"{'Recovery Window':>17s}  {'Mechanism'}")
-        for nom, act, _rec, delay, mech, lower in sweep_results:
+        for nom, act, _rec, delay, mech, lower in sweep_results:  # type: ignore[assignment]
             if delay is not None and lower is not None:
                 delay_str = f"{lower:.0f}-{delay:.0f}s"
             elif delay is not None:
@@ -3242,7 +3242,7 @@ def finalize(ctx: ExperimentContext, metrics_proc) -> None:
     for lf in sorted(log_files):
         events = parse_log_timestamps(os.path.join(ctx.log_dir, lf))
         if events:
-            cats = {}
+            cats: dict[str, int] = {}
             for _, cat, _ in events:
                 cats[cat] = cats.get(cat, 0) + 1
             progress(f"  {lf}: {len(events)} events — "

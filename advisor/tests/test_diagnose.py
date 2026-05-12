@@ -6,7 +6,7 @@ at the http.client level.
 """
 
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from diagnose import (
     Issue,
@@ -23,7 +23,6 @@ from diagnose import (
     diagnose,
     print_diagnosis,
 )
-
 
 # ── Test fixtures ────────────────────────────────────────────────────────
 

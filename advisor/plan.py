@@ -18,11 +18,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from .pricing import GPU_MEM_BW_GBS, GPU_NIC_BW_GBPS, GPU_VRAM_GB, get_price, get_cheapest
     from ._cluster import SCALING_GPUS
+    from .pricing import GPU_MEM_BW_GBS, GPU_NIC_BW_GBPS, GPU_VRAM_GB, get_cheapest, get_price
 except ImportError:
-    from pricing import GPU_MEM_BW_GBS, GPU_NIC_BW_GBPS, GPU_VRAM_GB, get_price, get_cheapest
-    from _cluster import SCALING_GPUS
+    from _cluster import SCALING_GPUS  # type: ignore[no-redef]
+    from pricing import (  # type: ignore[no-redef]
+        GPU_MEM_BW_GBS,
+        GPU_NIC_BW_GBPS,
+        GPU_VRAM_GB,
+        get_cheapest,
+        get_price,
+    )
 
 
 DTYPE_BYTES = {"float32": 4, "float16": 2, "bfloat16": 2}
@@ -479,7 +485,7 @@ def _generate_recommendation(plan):
         else:
             plan.recommendation = "RUN EXPERIMENTS TO DECIDE"
             plan.reasoning.append("Close call -- empirical benchmark needed")
-            plan.reasoning.append(f"Run: ./toolkit/run.sh <cluster> characterize")
+            plan.reasoning.append("Run: ./toolkit/run.sh <cluster> characterize")
     elif mono_meets_slo:
         plan.recommendation = "MONOLITHIC"
         plan.reasoning.append("Only monolithic meets TTFT SLO")
@@ -489,7 +495,7 @@ def _generate_recommendation(plan):
     else:
         plan.recommendation = "RUN EXPERIMENTS TO DECIDE"
         plan.reasoning.append("Neither topology meets TTFT SLO at current scale")
-        plan.reasoning.append(f"Run: ./toolkit/run.sh <cluster> characterize")
+        plan.reasoning.append("Run: ./toolkit/run.sh <cluster> characterize")
 
 
 def print_plan(plan: CapacityPlan):
@@ -499,7 +505,7 @@ def print_plan(plan: CapacityPlan):
     print(f"  Target: {plan.target_throughput} req/s, TTFT <= {plan.target_ttft_ms}ms")
     print(f"  GPU: {plan.gpu_type.upper()}    Confidence: {plan.confidence}")
     print()
-    print(f"  Option A: MONOLITHIC")
+    print("  Option A: MONOLITHIC")
     print(f"    GPUs/instance={plan.mono_gpus_per_instance}, Instances={plan.mono_instances}")
     print(f"    GPUs: {plan.mono_total_gpus}    Cost: ${plan.mono_cost_per_hr:.2f}/hr")
     print(f"    Est. TTFT: {plan.mono_est_ttft_ms}ms    Throughput: {plan.mono_est_throughput:.2f} req/s")
