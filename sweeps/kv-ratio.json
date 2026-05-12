@@ -1,5 +1,5 @@
 {
-  "base": "clusters/rdu3-t4x5-phi3",
+  "base": "clusters/my-cluster",
   "experiments": ["decompose", "latency", "throughput", "seqlen"],
   "models": [
     {"model": "Qwen/Qwen2.5-0.5B-Instruct"},

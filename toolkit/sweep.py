@@ -6,7 +6,7 @@ Usage:
 
 Config format:
     {
-      "base": "clusters/rdu3-t4x5-phi3",
+      "base": "clusters/my-cluster",
       "experiments": ["decompose", "latency", "throughput", "seqlen"],
       "models": [
         {"model": "microsoft/Phi-3-mini-4k-instruct"},
@@ -99,10 +99,7 @@ def write_env_sh(path, base_env, overrides):
     with open(path, "w") as f:
         f.write("#!/bin/bash\n")
         for key, val in sorted(merged.items()):
-            if "${" in val:
-                f.write(f'export {key}="{val}"\n')
-            else:
-                f.write(f'export {key}="{val}"\n')
+            f.write(f'export {key}="{val}"\n')
 
 
 def run(cmd, label, dry_run=False):

@@ -14,7 +14,6 @@ synthetic requests.
 import argparse
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 try:
     from ._cluster import get_pods_full as get_pods
@@ -39,7 +38,7 @@ class HealthSnapshot:
     timestamp: float
     checks: list[HealthCheck] = field(default_factory=list)
     overall: str = "HEALTHY"  # "HEALTHY" | "DEGRADED" | "UNHEALTHY"
-    probe: Optional[ProbeResult] = None
+    probe: ProbeResult | None = None
 
 
 class HealthMonitor:

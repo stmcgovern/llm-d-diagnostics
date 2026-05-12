@@ -270,8 +270,10 @@ def build_prompt(target_tokens, cache_bust=None):
     reps = max(1, target_tokens // 10)
     if cache_bust is None:
         return " ".join([BASE_SENTENCE] * reps)
+    import hashlib
     import random
-    rng = random.Random(hash(cache_bust))
+    seed = int(hashlib.sha256(str(cache_bust).encode()).hexdigest()[:16], 16)
+    rng = random.Random(seed)
     words = [rng.choice(_WORD_POOL) for _ in range(target_tokens)]
     return " ".join(words)
 

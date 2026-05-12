@@ -1,5 +1,5 @@
 {
-  "base": "clusters/rdu3-t4x5-phi3",
+  "base": "clusters/my-cluster",
   "experiments": ["decompose", "latency"],
   "models": [
     {"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"}

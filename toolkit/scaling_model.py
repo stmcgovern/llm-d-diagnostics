@@ -9,13 +9,11 @@ All computation uses stdlib only (no numpy/scipy).
 
 Usage:
     python3 toolkit/scaling_model.py \\
-        clusters/rdu3-t4x3/data \\
-        clusters/rdu3-t4x3-phi3/data \\
-        clusters/rdu3-t4x5-phi3/data-v3/
+        clusters/my-cluster/data \\
+        clusters/my-cluster-v2/data
 
     python3 toolkit/scaling_model.py \\
-        clusters/rdu3-t4x3/data \\
-        clusters/rdu3-t4x3-phi3/data \\
+        clusters/my-cluster/data \\
         --predict llama-31b --gpu-decode H200 --gpu-prefill L40S
 """
 

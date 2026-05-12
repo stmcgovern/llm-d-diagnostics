@@ -54,6 +54,41 @@ class TestBuildPrompt(unittest.TestCase):
         self.assertLess(ratio, 2.5)
 
 
+class TestBuildPromptCacheBust(unittest.TestCase):
+    """Cache busting must produce unique prompts across configs and runs.
+
+    The exp12 bug: cache_bust=(max_tokens, run_num) omitted config_name,
+    so BASELINE and DISAGG got identical prompts, causing prefix cache
+    contamination. These tests encode the invariant that prevents that.
+    """
+
+    def test_different_cache_bust_produces_different_prompts(self):
+        p1 = build_prompt(100, cache_bust=("BASELINE", 1))
+        p2 = build_prompt(100, cache_bust=("DISAGG-1D", 1))
+        self.assertNotEqual(p1, p2)
+
+    def test_same_cache_bust_produces_same_prompt(self):
+        p1 = build_prompt(100, cache_bust=("BASELINE", 1))
+        p2 = build_prompt(100, cache_bust=("BASELINE", 1))
+        self.assertEqual(p1, p2)
+
+    def test_different_runs_produce_different_prompts(self):
+        p1 = build_prompt(100, cache_bust=("BASELINE", 1))
+        p2 = build_prompt(100, cache_bust=("BASELINE", 2))
+        self.assertNotEqual(p1, p2)
+
+    def test_cache_bust_differs_from_non_busted(self):
+        p_plain = build_prompt(100)
+        p_busted = build_prompt(100, cache_bust=("config", 1))
+        self.assertNotEqual(p_plain, p_busted)
+
+    def test_three_config_uniqueness(self):
+        """Simulates the actual exp11/12/13 pattern: 3 configs, same run."""
+        configs = ["BASELINE", "DISAGG-1D", "DISAGG-2D"]
+        prompts = [build_prompt(100, cache_bust=(c, 1)) for c in configs]
+        self.assertEqual(len(set(prompts)), 3)
+
+
 class TestRequestResult(unittest.TestCase):
 
     def test_frozen(self):

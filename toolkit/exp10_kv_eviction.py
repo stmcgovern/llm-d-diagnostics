@@ -222,7 +222,7 @@ def run_pressure_test(conn, writer, threshold):
 
         # Resend original — was it evicted?
         r_after = conn.send(CACHE_PROMPT, MAX_TOKENS)
-        hit = "yes" if r_after.ttft_ms < threshold else "no"
+        hit = CacheHit.YES if r_after.ttft_ms < threshold else CacheHit.NO
         record(writer, conn.pod_name, run, 0, False, EvictionPhase.PRESSURE_AFTER, r_after, cache_hit=hit)
         progress(f"    run {run}: {PRESSURE_PROMPTS_N} eviction prompts → "
                  f"{'HIT' if hit == CacheHit.YES else 'MISS'} "

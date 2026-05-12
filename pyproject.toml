@@ -1,5 +1,5 @@
 [tool.ruff]
-target-version = "py39"
+target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
@@ -19,6 +19,8 @@ ignore = [
     "RUF002", # ambiguous unicode in docstring — same
     "RUF003", # ambiguous unicode in comment — same
     "RUF012", # mutable class attrs in test classes — fine for unittest
+    "UP042",  # str(Enum) → StrEnum migration deferred (behavior change)
+    "B905",   # zip(strict=) not needed for same-length math pairs
 ]
 
 [tool.ruff.lint.isort]
