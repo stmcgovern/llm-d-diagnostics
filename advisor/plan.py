@@ -131,6 +131,16 @@ MEASURED_BASELINES = {
         "overhead_ms": 279, "overhead_pct": 9.3,
         "sidecar_ms": 25, "nixl_ms": 267,
     },
+    ("microsoft/Phi-3-mini-4k-instruct", "t4"): {
+        "params_b": 3.8, "is_moe": False,
+        "mono_ttft_ms": 770, "disagg_ttft_ms": 1022,
+        "mono_ttft_base_ms": 560, "mono_ttft_rate": 1.70,
+        "disagg_ttft_base_ms": 636, "disagg_ttft_rate": 3.25,
+        "ref_seq_len": 100,
+        "mono_throughput": 1.30, "disagg_throughput": 0.98,
+        "overhead_ms": 252, "overhead_pct": 32.7,
+        "sidecar_ms": 0, "nixl_ms": 252,
+    },
 }
 
 # KV cache bytes per token = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
@@ -143,6 +153,7 @@ KV_BYTES_PER_TOKEN = {
     "Qwen/Qwen2.5-3B-Instruct": 2 * 36 * 2 * 128 * 2,
     "microsoft/Phi-3.5-mini-instruct": 2 * 32 * 32 * 96 * 2,
     "allenai/OLMoE-1B-7B-0924-Instruct": 2 * 16 * 16 * 128 * 2,
+    "microsoft/Phi-3-mini-4k-instruct": 2 * 32 * 32 * 96 * 2,
 }
 
 # Scaling constants from exp5 regression (Pearson r=0.987)
@@ -235,7 +246,7 @@ def plan_capacity(
     measured = MEASURED_BASELINES.get((model_id, gpu_type))
     if measured:
         plan.confidence = "measured"
-        _plan_from_measured(plan, measured, target_throughput, price)
+        _plan_from_measured(plan, measured, target_throughput, price, seq_len)
     else:
         _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp, seq_len)
 
@@ -244,28 +255,50 @@ def plan_capacity(
     return plan
 
 
-def _plan_from_measured(plan, measured, target_throughput, price):
+def _baseline_ttft(baseline, seq_len, field="mono"):
+    """Get TTFT from a baseline, seq_len-aware if rate data available."""
+    base_key = f"{field}_ttft_base_ms"
+    rate_key = f"{field}_ttft_rate"
+    if base_key in baseline and rate_key in baseline:
+        return baseline[base_key] + baseline[rate_key] * seq_len
+    return baseline[f"{field}_ttft_ms"]
+
+
+def _plan_from_measured(plan, measured, target_throughput, price, seq_len=128):
     """Plan using actual measured data from our experiments."""
     mono_rps = measured["mono_throughput"]
     disagg_rps = measured["disagg_throughput"]
     gpus_per = plan.mono_gpus_per_instance
 
+    mono_ttft = _baseline_ttft(measured, seq_len)
+    disagg_ttft = _baseline_ttft(measured, seq_len, "disagg")
+
     plan.mono_instances = max(1, math.ceil(target_throughput / mono_rps)) if mono_rps > 0 else 1
     plan.mono_total_gpus = plan.mono_instances * gpus_per
-    plan.mono_est_ttft_ms = measured["mono_ttft_ms"]
+    plan.mono_est_ttft_ms = round(mono_ttft)
     plan.mono_est_throughput = mono_rps * plan.mono_instances
     plan.mono_cost_per_hr = plan.mono_total_gpus * price
 
     disagg_instances = max(1, math.ceil(target_throughput / disagg_rps)) if disagg_rps > 0 else 1
-    prefill_capacity = 1000 / measured["mono_ttft_ms"]
+    prefill_capacity = 1000 / max(mono_ttft, 1)
     min_prefill = max(1, math.ceil(target_throughput / prefill_capacity))
     plan.disagg_prefill_gpus = min_prefill * gpus_per
     plan.disagg_decode_gpus = disagg_instances * gpus_per
     plan.disagg_total_gpus = plan.disagg_prefill_gpus + plan.disagg_decode_gpus
-    plan.disagg_est_ttft_ms = measured["disagg_ttft_ms"]
+    plan.disagg_est_ttft_ms = round(disagg_ttft)
     plan.disagg_est_throughput = disagg_rps * disagg_instances
     plan.disagg_cost_per_hr = plan.disagg_total_gpus * price
 
+    has_rates = "mono_ttft_base_ms" in measured
+    if has_rates:
+        plan.reasoning.append(
+            f"TTFT scaled for {seq_len} tokens "
+            f"(linear model, valid 50-1000 tokens)")
+    elif seq_len > 150 or seq_len < 50:
+        ref = measured.get("ref_seq_len", 100)
+        plan.reasoning.append(
+            f"TTFT measured at ~{ref} tokens; prediction at {seq_len} "
+            f"tokens may diverge — run experiments to calibrate")
     plan.reasoning.append(f"Based on measured data: mono {mono_rps:.2f} req/s, disagg {disagg_rps:.2f} req/s")
 
 
@@ -345,7 +378,7 @@ def _check_vram_feasibility(weight_gb, kv_bytes_per_token, seq_len, gpus_per_ins
             f"Increase TP or use a larger GPU.")
 
 
-def _proportional_scale(ref, params_b, plan):
+def _proportional_scale(ref, params_b, plan, seq_len=128):
     """Scale TTFT and throughput proportionally from a reference baseline."""
     scale = params_b / ref["params_b"] if ref["params_b"] > 0 else 1
     if scale > 5:
@@ -353,7 +386,7 @@ def _proportional_scale(ref, params_b, plan):
             f"LOW CONFIDENCE: extrapolating {scale:.0f}x beyond nearest baseline "
             f"({ref['params_b']:.1f}B -> {params_b:.1f}B). TTFT estimate is unreliable.")
         plan.confidence = "low"
-    return ref["mono_ttft_ms"] * scale, ref["mono_throughput"] / max(scale, 0.5)
+    return _baseline_ttft(ref, seq_len) * scale, ref["mono_throughput"] / max(scale, 0.5)
 
 
 def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp, seq_len=128):
@@ -389,20 +422,22 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
 
             if lo_b <= params_b <= hi_b:
                 t = (params_b - lo_b) / range_b
-                mono_ttft = lo["mono_ttft_ms"] + t * (hi["mono_ttft_ms"] - lo["mono_ttft_ms"])
+                lo_ttft = _baseline_ttft(lo, seq_len)
+                hi_ttft = _baseline_ttft(hi, seq_len)
+                mono_ttft = lo_ttft + t * (hi_ttft - lo_ttft)
                 mono_rps = lo["mono_throughput"] + t * (hi["mono_throughput"] - lo["mono_throughput"])
                 interpolated = True
                 plan.reasoning.append(
                     f"Interpolated between {lo_b:.1f}B and {hi_b:.1f}B baselines")
             else:
                 ref = lo if abs(lo_b - params_b) < abs(hi_b - params_b) else hi
-                mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan)
+                mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan, seq_len)
                 plan.reasoning.append(
                     f"Proportional scaling from {ref['params_b']:.1f}B baseline "
                     f"(target {params_b:.1f}B is outside measured range)")
         else:
             (ref, _) = nearest[0]
-            mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan)
+            mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan, seq_len)
             plan.reasoning.append(f"Scaled from single baseline ({ref['params_b']:.1f}B)")
 
         if gpu_type != "t4":

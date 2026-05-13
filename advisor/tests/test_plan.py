@@ -13,6 +13,7 @@ from plan import (
     NIXL_PROTOCOL_MS,
     CapacityPlan,
     ModelProfile,
+    _baseline_ttft,
     _check_vram_feasibility,
     _estimate_kv_bytes,
     _estimate_nixl_ms,
@@ -165,12 +166,102 @@ class TestMeasuredBaselines(unittest.TestCase):
     def test_all_baselines_have_required_keys(self):
         required = {"params_b", "is_moe", "mono_ttft_ms", "disagg_ttft_ms",
                      "mono_throughput", "disagg_throughput"}
+        rate_fields = {"mono_ttft_base_ms", "mono_ttft_rate",
+                       "disagg_ttft_base_ms", "disagg_ttft_rate", "ref_seq_len"}
         for key, data in MEASURED_BASELINES.items():
             for rk in required:
                 self.assertIn(rk, data, f"{key} missing {rk}")
+            has_any_rate = rate_fields & set(data.keys())
+            if has_any_rate:
+                for rf in rate_fields:
+                    self.assertIn(rf, data,
+                                  f"{key} has partial rate fields — missing {rf}")
 
     def test_eight_models(self):
-        self.assertEqual(len(MEASURED_BASELINES), 8)
+        self.assertEqual(len(MEASURED_BASELINES), 9)
+
+
+# ── Seq-len-aware TTFT ────────────────────────────────────────────────────
+
+class TestBaselineTtft(unittest.TestCase):
+
+    def test_with_rates(self):
+        baseline = {"mono_ttft_ms": 770, "mono_ttft_base_ms": 560,
+                     "mono_ttft_rate": 1.70}
+        self.assertAlmostEqual(_baseline_ttft(baseline, 100), 730.0)
+        self.assertAlmostEqual(_baseline_ttft(baseline, 1000), 2260.0)
+
+    def test_without_rates(self):
+        baseline = {"mono_ttft_ms": 73}
+        self.assertEqual(_baseline_ttft(baseline, 100), 73)
+        self.assertEqual(_baseline_ttft(baseline, 1000), 73)
+
+    def test_disagg_field(self):
+        baseline = {"disagg_ttft_ms": 1022, "disagg_ttft_base_ms": 636,
+                     "disagg_ttft_rate": 3.25}
+        self.assertAlmostEqual(_baseline_ttft(baseline, 100, "disagg"), 961.0)
+
+
+class TestSeqLenScaling(unittest.TestCase):
+
+    def test_phi3_mini_scales_with_seq_len(self):
+        plan_short = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=50,
+        )
+        plan_long = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000,
+        )
+        self.assertLess(plan_short.mono_est_ttft_ms, 700)
+        self.assertGreater(plan_long.mono_est_ttft_ms, 2000)
+        self.assertLess(plan_short.disagg_est_ttft_ms, 900)
+        self.assertGreater(plan_long.disagg_est_ttft_ms, 3000)
+
+    def test_constant_baseline_unchanged_by_seq_len(self):
+        plan_50 = plan_capacity(
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            target_throughput=1.0, target_ttft_ms=500,
+            gpu_type="t4", seq_len=50,
+        )
+        plan_1000 = plan_capacity(
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            target_throughput=1.0, target_ttft_ms=500,
+            gpu_type="t4", seq_len=1000,
+        )
+        self.assertEqual(plan_50.mono_est_ttft_ms, 73)
+        self.assertEqual(plan_1000.mono_est_ttft_ms, 73)
+        self.assertEqual(plan_50.disagg_est_ttft_ms, 109)
+        self.assertEqual(plan_1000.disagg_est_ttft_ms, 109)
+
+    def test_seq_len_noted_in_reasoning(self):
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500,
+        )
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("500 tokens", reasoning)
+
+    def test_domain_warning_without_rates(self):
+        plan = plan_capacity(
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            target_throughput=1.0, target_ttft_ms=500,
+            gpu_type="t4", seq_len=500,
+        )
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("may diverge", reasoning)
+
+    def test_no_warning_near_ref_seq_len(self):
+        plan = plan_capacity(
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            target_throughput=1.0, target_ttft_ms=500,
+            gpu_type="t4", seq_len=100,
+        )
+        reasoning = " ".join(plan.reasoning)
+        self.assertNotIn("may diverge", reasoning)
 
 
 # ── KV bytes estimation ──────────────────────────────────────────────────
