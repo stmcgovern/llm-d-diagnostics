@@ -127,7 +127,7 @@ ROLLOUT_AT_S = 10
 # Prompt for 4i mid-transfer kill tests. Larger prompts extend the KV transfer
 # window, making it easier to land a kill during transfer.
 #
-# Sizing rationale (from exp4 metrics on rdu3-t4x3):
+# Sizing rationale (from exp4 metrics on a 3xT4 cluster):
 #   - Observed: 352KB per transfer for 3-token prompt at 103 MB/s
 #   - Empirical: ~120KB/token (includes NIXL framing, 5.7x theoretical KV size)
 #   - 1024 tokens: 12-123 MB transfer, 115-1194ms window (two scenarios)

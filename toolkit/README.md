@@ -54,31 +54,31 @@ privileges).
 
 ```bash
 # Full performance characterization (preflight + all experiments + analysis)
-./toolkit/run.sh clusters/rdu3-t4x3 characterize
+./toolkit/run.sh clusters/my-cluster characterize
 
 # Just check the cluster is ready
-./toolkit/run.sh clusters/rdu3-t4x3 preflight
+./toolkit/run.sh clusters/my-cluster preflight
 
 # Run a single experiment
-./toolkit/run.sh clusters/rdu3-t4x3 latency
-./toolkit/run.sh clusters/rdu3-t4x3 decompose
-./toolkit/run.sh clusters/rdu3-t4x3 throughput
+./toolkit/run.sh clusters/my-cluster latency
+./toolkit/run.sh clusters/my-cluster decompose
+./toolkit/run.sh clusters/my-cluster throughput
 
 # Fault tolerance assessment (destructive — kills pods)
-./toolkit/run.sh clusters/rdu3-t4x3 fault-test
+./toolkit/run.sh clusters/my-cluster fault-test
 
 # Run specific fault sub-experiments
-./toolkit/run.sh clusters/rdu3-t4x3 fault 4h 4k --skip-control
+./toolkit/run.sh clusters/my-cluster fault 4h 4k --skip-control
 
 # Re-run analysis on existing data
-./toolkit/run.sh clusters/rdu3-t4x3 analyze
+./toolkit/run.sh clusters/my-cluster analyze
 ```
 
 ### Standalone metrics collection
 
 ```bash
 # Scrape vLLM /metrics for 60 seconds
-COLLECT_DURATION=60 ./toolkit/run.sh clusters/rdu3-t4x3 metrics
+COLLECT_DURATION=60 ./toolkit/run.sh clusters/my-cluster metrics
 ```
 
 ## Experiments
@@ -120,10 +120,10 @@ Exp4 includes:
 
 ```bash
 # Full fault tolerance assessment
-./toolkit/run.sh clusters/rdu3-t4x3 fault-test
+./toolkit/run.sh clusters/my-cluster fault-test
 
 # Run specific sub-experiments
-./toolkit/run.sh clusters/rdu3-t4x3 fault 4h 4k --skip-control
+./toolkit/run.sh clusters/my-cluster fault 4h 4k --skip-control
 
 # Or invoke directly
 python3 toolkit/exp4_fault.py 4h --skip-control
@@ -239,7 +239,7 @@ Streaming experiments (exp3, exp7) add: `itl_mean_ms`, `itl_p99_ms`, `token_coun
 ## Analysis
 
 ```bash
-./toolkit/run.sh clusters/rdu3-t4x3 analyze
+./toolkit/run.sh clusters/my-cluster analyze
 ```
 
 The analyzer (`analyze.py`) reads all CSV files from `$DATA_DIR` and produces:

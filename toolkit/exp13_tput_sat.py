@@ -21,6 +21,8 @@ Env vars:
     PROMPT_TOKENS        Prompt length in tokens (default: 100)
     MAX_TOKENS           Output tokens per request (default: 20)
     TOTAL_REQUESTS       Requests per config per concurrency level (default: 64)
+    CONFIGS              Comma-separated configs to run (default: all)
+                         Options: BASELINE, DISAGG-1D, DISAGG-2D
 """
 
 import os
@@ -51,6 +53,15 @@ CONCURRENCY_LEVELS = [int(x) for x in env("CONCURRENCY_LEVELS", "16,32,64,128").
 PROMPT_TOKENS = int(env("PROMPT_TOKENS", "100"))
 MAX_TOKENS = int(env("MAX_TOKENS", "20"))
 TOTAL_REQUESTS = int(env("TOTAL_REQUESTS", "64"))
+
+_CONFIG_MAP = {
+    "BASELINE": ConfigThroughput.BASELINE,
+    "DISAGG-1D": ConfigThroughput.DISAGG_1D,
+    "DISAGG-2D": ConfigThroughput.DISAGG_2D,
+}
+_ALL_CONFIGS = [ConfigThroughput.BASELINE, ConfigThroughput.DISAGG_1D, ConfigThroughput.DISAGG_2D]
+CONFIGS = ([_CONFIG_MAP[x.strip()] for x in env("CONFIGS", "").split(",") if x.strip()]
+           or _ALL_CONFIGS)
 
 DISAGG_HEADERS = {"x-prefiller-host-port": PREFILL_HOST}
 
@@ -85,11 +96,7 @@ def main():
     for concurrency in CONCURRENCY_LEVELS:
         progress(f"--- Concurrency: {concurrency} ---")
 
-        config_order = [
-            ConfigThroughput.BASELINE,
-            ConfigThroughput.DISAGG_1D,
-            ConfigThroughput.DISAGG_2D,
-        ]
+        config_order = list(CONFIGS)
         random.shuffle(config_order)
 
         for config_name in config_order:
@@ -181,7 +188,7 @@ def main():
 
         progress("")
 
-        if len(saturated) >= len(config_order):
+        if len(saturated) >= len(CONFIGS):
             progress("  All configs saturated, stopping")
             break
 

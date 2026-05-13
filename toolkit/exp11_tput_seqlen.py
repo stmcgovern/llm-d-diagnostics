@@ -21,6 +21,8 @@ Env vars:
     CONCURRENCY_LEVELS   Comma-separated concurrency levels (default: 1,4,8,16)
     MAX_TOKENS           Output tokens per request (default: 20)
     TOTAL_REQUESTS       Requests per config per (length, concurrency) (default: 24)
+    CONFIGS              Comma-separated configs to run (default: all)
+                         Options: BASELINE, DISAGG-1D, DISAGG-2D
 """
 
 import os
@@ -51,6 +53,15 @@ SWEEP_LENGTHS = [int(x) for x in env("SWEEP_LENGTHS", "50,100,250,500,1000").spl
 CONCURRENCY_LEVELS = [int(x) for x in env("CONCURRENCY_LEVELS", "1,4,8,16").split(",")]
 MAX_TOKENS = int(env("MAX_TOKENS", "20"))
 TOTAL_REQUESTS = int(env("TOTAL_REQUESTS", "24"))
+
+_CONFIG_MAP = {
+    "BASELINE": ConfigThroughput.BASELINE,
+    "DISAGG-1D": ConfigThroughput.DISAGG_1D,
+    "DISAGG-2D": ConfigThroughput.DISAGG_2D,
+}
+_ALL_CONFIGS = [ConfigThroughput.BASELINE, ConfigThroughput.DISAGG_1D, ConfigThroughput.DISAGG_2D]
+CONFIGS = ([_CONFIG_MAP[x.strip()] for x in env("CONFIGS", "").split(",") if x.strip()]
+           or _ALL_CONFIGS)
 
 DISAGG_HEADERS = {"x-prefiller-host-port": PREFILL_HOST}
 
@@ -87,11 +98,7 @@ def main():
 
             warmup_prompt = build_prompt(ptokens)
 
-            config_order = [
-                ConfigThroughput.BASELINE,
-                ConfigThroughput.DISAGG_1D,
-                ConfigThroughput.DISAGG_2D,
-            ]
+            config_order = list(CONFIGS)
             random.shuffle(config_order)
 
             for config_name in config_order:

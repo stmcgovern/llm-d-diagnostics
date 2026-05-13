@@ -47,11 +47,11 @@
 #   2. Cluster env is at <cluster-dir>/env.sh
 #
 # Examples:
-#   ./toolkit/run.sh clusters/rdu3-t4x3 characterize
-#   ./toolkit/run.sh clusters/rdu3-t4x3 latency
-#   ./toolkit/run.sh clusters/rdu3-t4x3 fault-test
-#   ./toolkit/run.sh clusters/rdu3-t4x3 fault 4a 4h --skip-control
-#   ./toolkit/run.sh clusters/rdu3-t4x3 analyze
+#   ./toolkit/run.sh clusters/my-cluster characterize
+#   ./toolkit/run.sh clusters/my-cluster latency
+#   ./toolkit/run.sh clusters/my-cluster fault-test
+#   ./toolkit/run.sh clusters/my-cluster fault 4a 4h --skip-control
+#   ./toolkit/run.sh clusters/my-cluster analyze
 
 set -euo pipefail
 
@@ -151,6 +151,7 @@ REMOTE_ENV="MODEL=$MODEL NS=$NS DATA_DIR=$REMOTE_DIR/data PREFILL_HOST=$PREFILL_
 [ -n "$PREFILL_IPS" ] && REMOTE_ENV="$REMOTE_ENV PODS_VLLM_PREFILL=$PREFILL_IPS"
 [ -n "$DECODE_IPS" ] && REMOTE_ENV="$REMOTE_ENV PODS_VLLM_DECODE=$DECODE_IPS"
 [ -n "${SIM:-}" ] && REMOTE_ENV="$REMOTE_ENV SIM=$SIM"
+[ -n "${CONFIGS:-}" ] && REMOTE_ENV="$REMOTE_ENV CONFIGS=$CONFIGS"
 
 run_remote() {
     local label="$1"
@@ -280,7 +281,7 @@ case "$COMMAND" in
         echo ""
 
         # Forward remaining args for sub-experiment selection:
-        #   ./run.sh clusters/rdu3 fault 4a 4h --skip-control
+        #   ./run.sh clusters/my-cluster fault 4a 4h --skip-control
         shift 2  # remove cluster-dir and command
         python3 "$SCRIPT_DIR/exp4_fault.py" "$@"
 
