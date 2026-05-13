@@ -19,6 +19,7 @@ from plan import (
     _check_vram_feasibility,
     _estimate_kv_bytes,
     _estimate_nixl_ms,
+    _estimate_overhead_asymptote,
     _find_nearest_baselines,
     _generate_recommendation,
     _validate_profile,
@@ -981,6 +982,246 @@ class TestNearestSeqLen(unittest.TestCase):
         self.assertTrue(
             plan.mono_est_ttft_ms in (700, 1300),
             f"Expected TTFT from nearest measured seq_len, got {plan.mono_est_ttft_ms}")
+
+
+class TestContentionTable(unittest.TestCase):
+    """Contention table stores R/T at ALL (c>1, s) conditions, not just crossovers."""
+
+    def _make_data_dir(self, rows):
+        d = tempfile.mkdtemp()
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        return d
+
+    def test_non_crossover_conditions_stored(self):
+        """Near-miss conditions (R < T) appear in contention_table."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 500, [1200] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+            + _make_exp11_rows("BASELINE", 8, 500, [5000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 500, [7000] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        self.assertEqual(len(plan.crossovers), 0, "No crossover expected")
+        self.assertEqual(len(plan.contention_table), 1,
+                         "Non-crossover condition should be in contention_table")
+        entry = plan.contention_table[0]
+        self.assertEqual(entry["seq_len"], 500)
+        self.assertEqual(entry["concurrency"], 8)
+        self.assertFalse(entry["p50_cross"])
+        self.assertGreater(entry["contention_ratio"], 0)
+        self.assertGreater(entry["threshold"], 0)
+
+    def test_crossover_in_both_tables(self):
+        """Crossover entries appear in BOTH contention_table and crossovers."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [3000] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000, [14000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 1000, [10000] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        self.assertEqual(len(plan.crossovers), 1)
+        self.assertEqual(len(plan.contention_table), 1)
+        self.assertIs(plan.contention_table[0], plan.crossovers[0])
+
+    def test_mixed_conditions(self):
+        """Multiple seq_lens: some cross, some don't — all in contention_table."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 500, [1200] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+            + _make_exp11_rows("BASELINE", 8, 500, [5000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 500, [7000] * 24)
+            + _make_exp11_rows("BASELINE", 1, 1000, [2000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [3000] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000, [14000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 1000, [10000] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        self.assertEqual(len(plan.contention_table), 2,
+                         "Both (c=8,s=500) and (c=8,s=1000) should be in table")
+        self.assertEqual(len(plan.crossovers), 1,
+                         "Only (c=8,s=1000) should cross")
+        seqs = {e["seq_len"] for e in plan.contention_table}
+        self.assertEqual(seqs, {500, 1000})
+
+
+class TestOverheadAsymptote(unittest.TestCase):
+    """T(∞) = 1 + nixl_rate / prefill_rate — long-prompt overhead floor."""
+
+    def test_asymptote_computed_preexperiment(self):
+        """Pre-experiment plans have T(∞) > 1."""
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500,
+        )
+        self.assertGreater(plan.overhead_asymptote, 1.0)
+
+    def test_asymptote_less_than_short_prompt_threshold(self):
+        """T(∞) < T(short_s) when T is decreasing, or T(∞) ≈ T(large_s)."""
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500,
+        )
+        t_at_seq = plan.disagg_est_ttft_ms / max(plan.mono_est_ttft_ms, 1)
+        self.assertGreater(plan.overhead_asymptote, 0)
+        self.assertLess(abs(plan.overhead_asymptote - t_at_seq), 1.0,
+                        "T(∞) should be in the same ballpark as T at the seq_len")
+
+    def test_low_kv_model_has_lower_asymptote(self):
+        """GQA model (few KV heads) should have lower T(∞) than MHA."""
+        plan_gqa = plan_capacity(
+            "Qwen/Qwen2.5-3B-Instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500,
+        )
+        plan_mha = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500,
+        )
+        self.assertLess(plan_gqa.overhead_asymptote, plan_mha.overhead_asymptote,
+                        "GQA (4 KV heads) should have lower T(∞) than MHA (32 KV heads)")
+
+    def test_asymptote_function_directly(self):
+        """_estimate_overhead_asymptote computes 1 + nixl_rate/prefill_rate."""
+        kv_bytes = 2 * 32 * 32 * 96 * 2  # Phi-3-like
+        prefill_rate = 1.70  # ms/token (measured)
+        t_inf = _estimate_overhead_asymptote(kv_bytes, prefill_rate, "t4")
+        self.assertGreater(t_inf, 1.0)
+        self.assertLess(t_inf, 5.0)
+
+    def test_asymptote_from_experiment_data(self):
+        """With experiment data, T(∞) is estimated from overhead_thresholds."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 100, [700] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 100, [1000] * 24)
+            + _make_exp11_rows("BASELINE", 1, 1000, [2300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [3500] * 24)
+        )
+        d = tempfile.mkdtemp()
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=100, data_dir=d,
+        )
+        self.assertAlmostEqual(plan.overhead_asymptote, 3500 / 2300, places=1)
+
+
+class TestContentionGap(unittest.TestCase):
+    """Contention table entries include R-T gap for distance-to-crossover."""
+
+    def _make_data_dir(self, rows):
+        d = tempfile.mkdtemp()
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        return d
+
+    def test_gap_negative_when_no_crossover(self):
+        """R < T → gap is negative."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 500, [1200] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+            + _make_exp11_rows("BASELINE", 8, 500, [5000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 500, [7000] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        entry = plan.contention_table[0]
+        gap = entry["contention_ratio"] - entry["threshold"]
+        self.assertLess(gap, 0, "R < T should produce negative gap")
+
+    def test_gap_positive_at_crossover(self):
+        """R > T → gap is positive."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [3000] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000, [14000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 1000, [10000] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        cross = plan.crossovers[0]
+        gap = cross["contention_ratio"] - cross["threshold"]
+        self.assertGreater(gap, 0, "R > T at crossover should produce positive gap")
+
+
+class TestConfigConsistentThreshold(unittest.TestCase):
+    """T(s) in crossover check uses the SAME disagg config as R(c,s)."""
+
+    def _make_data_dir(self, rows):
+        d = tempfile.mkdtemp()
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        return d
+
+    def test_threshold_matches_config(self):
+        """T uses same config baseline as R — not a different disagg variant."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [2800] * 24)
+            + _make_exp11_rows("DISAGG-2D", 1, 1000, [3200] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000, [14000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 1000, [10000] * 24)
+            + _make_exp11_rows("DISAGG-2D", 8, 1000, [10500] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        for entry in plan.contention_table:
+            if entry["config"] == "DISAGG-1D":
+                self.assertAlmostEqual(entry["threshold"], 2800 / 2000, places=1)
+            elif entry["config"] == "DISAGG-2D":
+                self.assertAlmostEqual(entry["threshold"], 3200 / 2000, places=1)
+
+    def test_different_configs_get_different_thresholds(self):
+        """Two disagg configs at same seq_len get config-specific T values."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [2800] * 24)
+            + _make_exp11_rows("DISAGG-2D", 1, 1000, [3200] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000, [14000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 1000, [10000] * 24)
+            + _make_exp11_rows("DISAGG-2D", 8, 1000, [10500] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        thresholds = {e["config"]: e["threshold"] for e in plan.contention_table}
+        self.assertIn("DISAGG-1D", thresholds)
+        self.assertIn("DISAGG-2D", thresholds)
+        self.assertNotAlmostEqual(thresholds["DISAGG-1D"],
+                                  thresholds["DISAGG-2D"], places=1,
+                                  msg="Different configs should yield different T")
 
 
 if __name__ == "__main__":

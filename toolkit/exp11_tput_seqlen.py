@@ -18,7 +18,7 @@ Usage: python3 toolkit/exp11_tput_seqlen.py
 
 Env vars:
     SWEEP_LENGTHS        Comma-separated prompt token targets (default: 50,100,250,500,1000)
-    CONCURRENCY_LEVELS   Comma-separated concurrency levels (default: 1,8)
+    CONCURRENCY_LEVELS   Comma-separated concurrency levels (default: 1,4,8,16)
     MAX_TOKENS           Output tokens per request (default: 20)
     TOTAL_REQUESTS       Requests per config per (length, concurrency) (default: 24)
 """
@@ -48,7 +48,7 @@ from client import (
 from schemas import ConfigThroughput, Exp11Row, TypedCSVWriter
 
 SWEEP_LENGTHS = [int(x) for x in env("SWEEP_LENGTHS", "50,100,250,500,1000").split(",")]
-CONCURRENCY_LEVELS = [int(x) for x in env("CONCURRENCY_LEVELS", "1,8").split(",")]
+CONCURRENCY_LEVELS = [int(x) for x in env("CONCURRENCY_LEVELS", "1,4,8,16").split(",")]
 MAX_TOKENS = int(env("MAX_TOKENS", "20"))
 TOTAL_REQUESTS = int(env("TOTAL_REQUESTS", "24"))
 

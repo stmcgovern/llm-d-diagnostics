@@ -195,6 +195,8 @@ class CapacityPlan:
     confidence: str = ""
     reasoning: list = field(default_factory=list)
     crossovers: list = field(default_factory=list)
+    contention_table: list = field(default_factory=list)
+    overhead_asymptote: float = 0.0
     measured_conditions: str = ""
     overhead_thresholds: list = field(default_factory=list)
 
@@ -259,6 +261,19 @@ def plan_capacity(
                            target_throughput, price, seq_len)
     else:
         _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp, seq_len)
+
+    if plan.overhead_thresholds and len(plan.overhead_thresholds) >= 2:
+        ts = sorted(plan.overhead_thresholds, key=lambda t: t["seq_len"])
+        plan.overhead_asymptote = round(ts[-1]["threshold"], 2)
+    elif plan.mono_est_ttft_ms > 0 and plan.disagg_est_ttft_ms > 0:
+        kv_bytes = _estimate_kv_bytes(profile)
+        measured = MEASURED_BASELINES.get((model_id, gpu_type), {})
+        prefill_rate = measured.get("mono_ttft_rate", 0)
+        if not prefill_rate and seq_len > 0:
+            prefill_rate = plan.mono_est_ttft_ms / seq_len
+        plan.overhead_asymptote = round(
+            _estimate_overhead_asymptote(kv_bytes, prefill_rate, gpu_type,
+                                        profile.is_moe), 2)
 
     _generate_recommendation(plan)
 
@@ -327,8 +342,6 @@ def _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price):
                 "overhead_pct": round((t - 1) * 100),
             })
 
-    threshold_by_s = {t["seq_len"]: t["threshold"] for t in plan.overhead_thresholds}
-
     for (cfg, conc, pt), dg_stats in exp11.items():
         if not cfg.startswith("DISAGG"):
             continue
@@ -347,7 +360,7 @@ def _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price):
         alpha_mono = bl_cn["median"] / bl_c1_pt["median"]
         alpha_disagg = dg_stats["median"] / dg_c1_pt["median"]
         contention_ratio = alpha_mono / alpha_disagg if alpha_disagg > 0 else 0
-        threshold = threshold_by_s.get(pt, 0)
+        threshold = dg_c1_pt["median"] / bl_c1_pt["median"]
 
         p50_delta = (dg_stats["median"] - bl_cn["median"]) / bl_cn["median"] * 100
         p90_delta = (dg_stats["p90"] - bl_cn["p90"]) / bl_cn["p90"] * 100
@@ -357,26 +370,28 @@ def _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price):
         alpha_mono_p90 = bl_cn["p90"] / bl_c1_pt["p90"] if bl_c1_pt["p90"] > 0 else 0
         alpha_disagg_p90 = dg_stats["p90"] / dg_c1_pt["p90"] if dg_c1_pt["p90"] > 0 else 0
         contention_ratio_p90 = alpha_mono_p90 / alpha_disagg_p90 if alpha_disagg_p90 > 0 else 0
-        threshold_p90_val = bl_cn["p90"] and dg_c1_pt["p90"] and bl_c1_pt["p90"]
-        threshold_p90 = (dg_c1_pt["p90"] / bl_c1_pt["p90"]) if threshold_p90_val else threshold
+        has_p90 = bl_c1_pt["p90"] > 0 and dg_c1_pt["p90"] > 0
+        threshold_p90 = (dg_c1_pt["p90"] / bl_c1_pt["p90"]) if has_p90 else threshold
 
+        mono_cv = bl_cn.get("cv")
+        disagg_cv = dg_stats.get("cv")
+        entry = {
+            "seq_len": pt, "concurrency": conc, "config": cfg,
+            "p50_delta_pct": round(p50_delta, 1),
+            "p90_delta_pct": round(p90_delta, 1),
+            "p50_cross": p50_cross, "p90_cross": p90_cross,
+            "mono_cv": round(mono_cv, 3) if mono_cv is not None else None,
+            "disagg_cv": round(disagg_cv, 3) if disagg_cv is not None else None,
+            "alpha_mono": round(alpha_mono, 2),
+            "alpha_disagg": round(alpha_disagg, 2),
+            "contention_ratio": round(contention_ratio, 2),
+            "threshold": round(threshold, 2),
+            "contention_ratio_p90": round(contention_ratio_p90, 2),
+            "threshold_p90": round(threshold_p90, 2),
+        }
+        plan.contention_table.append(entry)
         if p50_cross or p90_cross:
-            mono_cv = bl_cn.get("cv")
-            disagg_cv = dg_stats.get("cv")
-            plan.crossovers.append({
-                "seq_len": pt, "concurrency": conc, "config": cfg,
-                "p50_delta_pct": round(p50_delta, 1),
-                "p90_delta_pct": round(p90_delta, 1),
-                "p50_cross": p50_cross, "p90_cross": p90_cross,
-                "mono_cv": round(mono_cv, 3) if mono_cv is not None else None,
-                "disagg_cv": round(disagg_cv, 3) if disagg_cv is not None else None,
-                "alpha_mono": round(alpha_mono, 2),
-                "alpha_disagg": round(alpha_disagg, 2),
-                "contention_ratio": round(contention_ratio, 2),
-                "threshold": round(threshold, 2),
-                "contention_ratio_p90": round(contention_ratio_p90, 2),
-                "threshold_p90": round(threshold_p90, 2),
-            })
+            plan.crossovers.append(entry)
 
     if max(measured_concs) <= 1:
         plan.reasoning.append(
@@ -487,6 +502,25 @@ def _estimate_nixl_ms(kv_bytes_per_token: int, seq_len: int = 128,
     if is_moe:
         data_ms *= MOE_NIXL_CORRECTION
     return NIXL_PROTOCOL_MS + data_ms
+
+
+def _estimate_overhead_asymptote(kv_bytes_per_token: int, prefill_rate: float,
+                                 gpu_type: str = "t4", is_moe: bool = False) -> float:
+    """T(∞) = 1 + nixl_rate / prefill_rate.
+
+    As seq_len → ∞, protocol overhead and base TTFT become negligible.
+    T(∞) is the per-token overhead ratio — the minimum contention advantage
+    disagg needs at very long prompts.
+    """
+    if prefill_rate <= 0:
+        return 0.0
+    t4_nic = GPU_NIC_BW_GBPS.get("t4", 25)
+    target_nic = GPU_NIC_BW_GBPS.get(gpu_type, t4_nic)
+    scaled_bw = NIXL_EFF_BW_GBS * (target_nic / t4_nic)
+    nixl_rate_ms = kv_bytes_per_token / (scaled_bw * 1e9) * 1000
+    if is_moe:
+        nixl_rate_ms *= MOE_NIXL_CORRECTION
+    return 1 + nixl_rate_ms / prefill_rate
 
 
 def _validate_profile(profile):
@@ -723,19 +757,18 @@ def print_plan(plan: CapacityPlan):
                 print(f"    {',  '.join(parts[i:i+3])}")
             print()
 
-        p50_crosses = [c for c in plan.crossovers if c["p50_cross"]]
-        p90_crosses = [c for c in plan.crossovers if c["p90_cross"]]
-
-        if p50_crosses or p90_crosses:
+        if plan.contention_table:
             print("  Contention analysis (R = α_mono/α_disagg, crosses when R > T):")
-            for c in sorted(plan.crossovers, key=lambda x: (x["concurrency"], x["seq_len"])):
+            for c in sorted(plan.contention_table, key=lambda x: (x["concurrency"], x["seq_len"])):
                 p50_w = "CROSS" if c["p50_cross"] else "no"
                 p90_w = "CROSS" if c["p90_cross"] else "no"
-                print(f"    c={c['concurrency']}, s={c['seq_len']} ({c['config']}):")
-                print(f"      α_mono={c['alpha_mono']:.2f}  "
-                      f"α_disagg={c['alpha_disagg']:.2f}  "
-                      f"R={c['contention_ratio']:.2f} vs T={c['threshold']:.2f}  "
-                      f"p50: {p50_w}")
+                label = " ***" if c["p50_cross"] or c["p90_cross"] else ""
+                gap = c["contention_ratio"] - c["threshold"]
+                gap_pct = gap / c["threshold"] * 100 if c["threshold"] > 0 else 0
+                gap_str = f"+{gap:.2f}" if gap >= 0 else f"{gap:.2f}"
+                print(f"    c={c['concurrency']}, s={c['seq_len']} ({c['config']}){label}:")
+                print(f"      R={c['contention_ratio']:.2f} vs T={c['threshold']:.2f}  "
+                      f"gap={gap_str} ({gap_pct:+.0f}%)  p50: {p50_w}")
                 print(f"      R_p90={c['contention_ratio_p90']:.2f} vs "
                       f"T_p90={c['threshold_p90']:.2f}  p90: {p90_w}")
                 mono_cv = c["mono_cv"]
@@ -744,7 +777,7 @@ def print_plan(plan: CapacityPlan):
                     cv_ratio = disagg_cv / mono_cv
                     print(f"      Variance: disagg {cv_ratio:.0f}x higher "
                           f"(CV {disagg_cv*100:.0f}% vs {mono_cv*100:.0f}%)")
-        else:
+        elif not plan.crossovers:
             print("  No crossover detected: mono wins at all conditions.")
         print()
 
@@ -754,6 +787,10 @@ def print_plan(plan: CapacityPlan):
         overhead = plan.disagg_est_ttft_ms - plan.mono_est_ttft_ms
         overhead_pct = overhead / plan.mono_est_ttft_ms * 100
         print(f"  Overhead:    {overhead:.0f}ms ({overhead_pct:+.0f}%)")
+        if plan.overhead_asymptote > 0:
+            asym_pct = round((plan.overhead_asymptote - 1) * 100)
+            print(f"  T(∞):        {plan.overhead_asymptote:.2f} — "
+                  f"long-prompt floor is {asym_pct}% overhead")
         if not is_experiment:
             print(f"  Threshold:   disagg needs >{overhead_pct:.0f}% contention "
                   f"advantage to justify overhead")
@@ -783,6 +820,8 @@ def save_plan(plan: CapacityPlan, path: Path):
                    "throughput": plan.disagg_est_throughput, "cost_hr": plan.disagg_cost_per_hr},
         "recommendation": plan.recommendation, "confidence": plan.confidence,
         "reasoning": plan.reasoning, "crossovers": plan.crossovers,
+        "contention_table": plan.contention_table,
+        "overhead_asymptote": plan.overhead_asymptote,
         "overhead_thresholds": plan.overhead_thresholds,
         "measured_conditions": plan.measured_conditions,
     }, indent=2))
