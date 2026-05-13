@@ -367,6 +367,11 @@ case "$COMMAND" in
         python3 "$REPO_ROOT/advisor/rebalance.py" --namespace "$NS" "$@"
         ;;
 
+    validate)
+        shift 2
+        python3 "$REPO_ROOT/advisor/validate.py" "$DATA_DIR" "$@"
+        ;;
+
     *)
         echo "Unknown command: $COMMAND"
         echo ""
@@ -398,6 +403,7 @@ case "$COMMAND" in
         echo "  health          Continuous health monitoring"
         echo "  plan            GPU capacity planning"
         echo "  rebalance       P/D ratio recommendation"
+        echo "  validate        Validate advisor predictions against data"
         echo ""
         echo "  analyze         Run analysis on collected data"
         echo "  preflight       Verify cluster is ready"
