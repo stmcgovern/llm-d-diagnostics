@@ -359,7 +359,8 @@ case "$COMMAND" in
 
     plan)
         shift 2
-        python3 "$REPO_ROOT/advisor/plan.py" "$@"
+        python3 "$REPO_ROOT/advisor/plan.py" --model "$MODEL" \
+            --gpu-type "${GPU_TYPE:-t4}" --data-dir "$DATA_DIR" "$@"
         ;;
 
     rebalance)

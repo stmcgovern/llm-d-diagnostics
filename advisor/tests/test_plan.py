@@ -1,6 +1,8 @@
 """Tests for advisor/plan.py — capacity planning, no cluster needed."""
 
+import csv
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -52,9 +54,7 @@ class TestPlanCapacityMeasured(unittest.TestCase):
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             target_throughput=1.0, target_ttft_ms=500, gpu_type="t4",
         )
-        self.assertIn(plan.recommendation, [
-            "MONOLITHIC", "DISAGGREGATE", "RUN EXPERIMENTS TO DECIDE",
-        ])
+        self.assertIn("MONOLITHIC", plan.recommendation)
 
     def test_cost_is_positive(self):
         plan = plan_capacity(
@@ -118,7 +118,8 @@ class TestFindNearestBaselines(unittest.TestCase):
 
 class TestGenerateRecommendation(unittest.TestCase):
 
-    def test_monolithic_when_fewer_gpus(self):
+    def test_pre_experiment_monolithic(self):
+        """Without experiment data, always recommends MONOLITHIC (c=1 estimate)."""
         plan = CapacityPlan(
             model="test", gpu_type="t4",
             target_throughput=1.0, target_ttft_ms=500,
@@ -126,10 +127,11 @@ class TestGenerateRecommendation(unittest.TestCase):
             disagg_total_gpus=4, disagg_est_throughput=1.0, disagg_est_ttft_ms=150,
         )
         _generate_recommendation(plan)
-        self.assertEqual(plan.recommendation, "MONOLITHIC")
+        self.assertIn("MONOLITHIC", plan.recommendation)
+        self.assertIn("c=1", plan.recommendation)
 
-    def test_disagg_when_fewer_gpus(self):
-        """Disagg uses fewer GPUs with higher TTFT — both meet SLO."""
+    def test_experiment_disagg_requires_p90(self):
+        """Even with fewer disagg GPUs, without experiment data cannot recommend DISAGGREGATE."""
         plan = CapacityPlan(
             model="test", gpu_type="t4",
             target_throughput=1.0, target_ttft_ms=500,
@@ -137,7 +139,7 @@ class TestGenerateRecommendation(unittest.TestCase):
             disagg_total_gpus=7, disagg_est_throughput=1.0, disagg_est_ttft_ms=161,
         )
         _generate_recommendation(plan)
-        self.assertEqual(plan.recommendation, "DISAGGREGATE")
+        self.assertNotEqual(plan.recommendation, "DISAGGREGATE")
 
 
 class TestSavePlan(unittest.TestCase):
@@ -356,8 +358,8 @@ class TestEstimateNixlMs(unittest.TestCase):
 
 class TestGenerateRecommendationBranches(unittest.TestCase):
 
-    def test_only_disagg_meets_slo(self):
-        """Only disagg meets the TTFT SLO — mono exceeds target."""
+    def test_pre_experiment_always_mono(self):
+        """Without experiment data, recommendation is always MONOLITHIC (c=1)."""
         plan = CapacityPlan(
             model="test", gpu_type="t4",
             target_throughput=1.0, target_ttft_ms=200,
@@ -365,9 +367,10 @@ class TestGenerateRecommendationBranches(unittest.TestCase):
             disagg_total_gpus=3, disagg_est_throughput=1.0, disagg_est_ttft_ms=180,
         )
         _generate_recommendation(plan)
-        self.assertEqual(plan.recommendation, "DISAGGREGATE")
+        self.assertIn("MONOLITHIC", plan.recommendation)
+        self.assertIn("c=1", plan.recommendation)
 
-    def test_close_call_runs_experiments(self):
+    def test_pre_experiment_prescribes_experiments(self):
         plan = CapacityPlan(
             model="test", gpu_type="t4",
             target_throughput=1.0, target_ttft_ms=500,
@@ -375,7 +378,89 @@ class TestGenerateRecommendationBranches(unittest.TestCase):
             disagg_total_gpus=3, disagg_est_throughput=1.0, disagg_est_ttft_ms=210,
         )
         _generate_recommendation(plan)
-        self.assertEqual(plan.recommendation, "RUN EXPERIMENTS TO DECIDE")
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("run experiments", reasoning.lower())
+
+    def test_experiment_no_crossover(self):
+        """With experiment data but no crossover → MONOLITHIC."""
+        plan = CapacityPlan(
+            model="test", gpu_type="t4",
+            target_throughput=1.0, target_ttft_ms=500,
+            confidence="experiment",
+        )
+        _generate_recommendation(plan)
+        self.assertEqual(plan.recommendation, "MONOLITHIC")
+
+    def test_experiment_p90_crossover(self):
+        """With p90 crossover and p50 crossover → DISAGGREGATE."""
+        plan = CapacityPlan(
+            model="test", gpu_type="t4",
+            target_throughput=1.0, target_ttft_ms=500,
+            confidence="experiment",
+            crossovers=[{
+                "seq_len": 1000, "concurrency": 8, "config": "DISAGG-1D",
+                "p50_delta_pct": -10.0, "p90_delta_pct": -5.0,
+                "p50_cross": True, "p90_cross": True,
+                "mono_cv": 0.02, "disagg_cv": 0.05,
+                "alpha_mono": 5.67, "alpha_disagg": 2.95,
+                "contention_ratio": 1.92, "threshold": 1.72,
+                "contention_ratio_p90": 1.80, "threshold_p90": 1.74,
+            }],
+        )
+        _generate_recommendation(plan)
+        self.assertEqual(plan.recommendation, "DISAGGREGATE")
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("p50 AND p90", reasoning)
+        self.assertIn("R=1.92", reasoning)
+        self.assertIn("T=1.72", reasoning)
+
+    def test_experiment_p90_only_crossover(self):
+        """p90 crosses but p50 does not — still DISAGGREGATE, correct text."""
+        plan = CapacityPlan(
+            model="test", gpu_type="t4",
+            target_throughput=1.0, target_ttft_ms=500,
+            confidence="experiment",
+            crossovers=[{
+                "seq_len": 1000, "concurrency": 8, "config": "DISAGG-1D",
+                "p50_delta_pct": 3.0, "p90_delta_pct": -8.0,
+                "p50_cross": False, "p90_cross": True,
+                "mono_cv": 0.15, "disagg_cv": 0.04,
+                "alpha_mono": 4.0, "alpha_disagg": 4.2,
+                "contention_ratio": 0.95, "threshold": 1.50,
+                "contention_ratio_p90": 1.80, "threshold_p90": 1.60,
+            }],
+        )
+        _generate_recommendation(plan)
+        self.assertEqual(plan.recommendation, "DISAGGREGATE")
+        reasoning = " ".join(plan.reasoning)
+        self.assertNotIn("p50 AND p90", reasoning)
+        self.assertIn("R_p90=1.80", reasoning)
+        self.assertIn("T_p90=1.60", reasoning)
+
+    def test_experiment_p50_only_crossover(self):
+        """With p50 crossover but not p90 → MONOLITHIC with R/T explanation."""
+        plan = CapacityPlan(
+            model="test", gpu_type="t4",
+            target_throughput=1.0, target_ttft_ms=500,
+            confidence="experiment",
+            crossovers=[{
+                "seq_len": 1000, "concurrency": 8, "config": "DISAGG-1D",
+                "p50_delta_pct": -10.0, "p90_delta_pct": 14.0,
+                "p50_cross": True, "p90_cross": False,
+                "mono_cv": 0.02, "disagg_cv": 0.39,
+                "alpha_mono": 5.67, "alpha_disagg": 2.95,
+                "contention_ratio": 1.92, "threshold": 1.72,
+                "contention_ratio_p90": 1.53, "threshold_p90": 1.74,
+            }],
+        )
+        _generate_recommendation(plan)
+        self.assertEqual(plan.recommendation, "MONOLITHIC")
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("R=1.92", reasoning)
+        self.assertIn("T=1.72", reasoning)
+        self.assertIn("R=1.53", reasoning)
+        self.assertIn("T=1.74", reasoning)
+        self.assertIn("variance", reasoning.lower())
 
 
 # ── BW scaling ───────────────────────────────────────────────────────────
@@ -652,6 +737,250 @@ class TestConfidenceLabels(unittest.TestCase):
         )
         reasoning = " ".join(plan.reasoning)
         self.assertIn("Run experiments for empirical validation", reasoning)
+
+
+# ── Experiment-aware planning ──────────────────────────────────────────
+
+EXP11_FIELDS = [
+    "experiment", "config", "prompt_tokens_target", "max_tokens",
+    "concurrency", "run", "ttft_ms", "total_ms", "status_code",
+    "prompt_tokens_actual", "completion_tokens", "target", "error",
+]
+
+
+def _write_csv(path, fieldnames, rows):
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _make_exp11_rows(config, concurrency, prompt_tokens, ttft_values):
+    rows = []
+    for i, ttft in enumerate(ttft_values):
+        rows.append({
+            "experiment": "exp11", "config": config,
+            "prompt_tokens_target": prompt_tokens, "max_tokens": 20,
+            "concurrency": concurrency, "run": i + 1,
+            "ttft_ms": ttft, "total_ms": ttft + 5,
+            "status_code": 200, "prompt_tokens_actual": prompt_tokens + 10,
+            "completion_tokens": 20, "target": "d1", "error": "",
+        })
+    return rows
+
+
+class TestPlanFromExperiments(unittest.TestCase):
+
+    def _make_data_dir(self, rows):
+        d = tempfile.mkdtemp()
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        return d
+
+    def test_strong_crossover(self):
+        """Disagg wins at BOTH p50 AND p90 → DISAGGREGATE with T/R values."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [2800] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000, [13000 + i * 10 for i in range(24)])
+            + _make_exp11_rows("DISAGG-1D", 8, 1000, [9000 + i * 10 for i in range(24)])
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        self.assertEqual(plan.confidence, "experiment")
+        self.assertTrue(any(c["p50_cross"] and c["p90_cross"] for c in plan.crossovers))
+        self.assertEqual(plan.recommendation, "DISAGGREGATE")
+
+        cross = plan.crossovers[0]
+        self.assertAlmostEqual(cross["threshold"], 2800 / 2300, places=1)
+        self.assertGreater(cross["alpha_mono"], cross["alpha_disagg"])
+        self.assertGreater(cross["contention_ratio"], cross["threshold"])
+
+    def test_weak_crossover(self):
+        """Disagg wins at p50 but loses at p90 → MONOLITHIC."""
+        mono_c8 = [13000 + i * 10 for i in range(24)]
+        disagg_c8 = ([10000 + i * 5 for i in range(12)]
+                     + [15000 + i * 5 for i in range(12)])
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [2800] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000, mono_c8)
+            + _make_exp11_rows("DISAGG-1D", 8, 1000, disagg_c8)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        self.assertEqual(plan.confidence, "experiment")
+        p50_only = [c for c in plan.crossovers
+                    if c["p50_cross"] and not c["p90_cross"]]
+        self.assertTrue(len(p50_only) > 0)
+        self.assertEqual(plan.recommendation, "MONOLITHIC")
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("p90", reasoning)
+        self.assertIn("variance", reasoning.lower())
+
+    def test_no_crossover(self):
+        """Mono wins everywhere → MONOLITHIC, no crossovers."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 500, [1200] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+            + _make_exp11_rows("BASELINE", 8, 500, [5000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 500, [7000] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        self.assertEqual(plan.confidence, "experiment")
+        self.assertEqual(plan.recommendation, "MONOLITHIC")
+        p50_crosses = [c for c in plan.crossovers if c["p50_cross"]]
+        self.assertEqual(len(p50_crosses), 0)
+
+    def test_c1_excluded_from_crossover_scan(self):
+        """Even if disagg beats mono at c=1 (noise), no crossover recorded."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 500, [1500] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1400] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        self.assertEqual(len(plan.crossovers), 0)
+        self.assertEqual(plan.recommendation, "MONOLITHIC")
+
+    def test_c1_only_data_warns(self):
+        """With only c=1 data, warn that crossovers require concurrency."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 500, [1200] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("c=1", reasoning.lower())
+        self.assertIn("concurrent", reasoning.lower())
+
+
+class TestOverheadThresholds(unittest.TestCase):
+
+    def test_thresholds_computed_per_seq_len(self):
+        """T(s) = disagg_c1 / mono_c1 computed for each measured seq_len."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 100, [700] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 100, [1000] * 24)
+            + _make_exp11_rows("BASELINE", 1, 500, [1300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+        )
+        d = tempfile.mkdtemp()
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=100, data_dir=d,
+        )
+        self.assertEqual(len(plan.overhead_thresholds), 2)
+        t100 = next(t for t in plan.overhead_thresholds if t["seq_len"] == 100)
+        t500 = next(t for t in plan.overhead_thresholds if t["seq_len"] == 500)
+        self.assertAlmostEqual(t100["threshold"], 1000 / 700, places=1)
+        self.assertAlmostEqual(t500["threshold"], 1800 / 1300, places=1)
+        self.assertEqual(t100["overhead_pct"], round((1000 / 700 - 1) * 100))
+        self.assertEqual(t500["overhead_pct"], round((1800 / 1300 - 1) * 100))
+
+    def test_contention_ratio_exceeds_threshold_at_crossover(self):
+        """At crossover points, R > T (by definition)."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [3000] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000, [14000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 1000, [10000] * 24)
+        )
+        d = tempfile.mkdtemp()
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        cross = plan.crossovers[0]
+        self.assertAlmostEqual(cross["alpha_mono"], 14000 / 2000, places=1)
+        self.assertAlmostEqual(cross["alpha_disagg"], 10000 / 3000, places=1)
+        self.assertGreater(cross["contention_ratio"], cross["threshold"])
+
+
+class TestPreExperimentHonesty(unittest.TestCase):
+
+    def test_no_data_dir_gives_c1_estimate(self):
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500,
+        )
+        self.assertIn("c=1", plan.recommendation)
+
+    def test_no_data_dir_prescribes_experiments(self):
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500,
+        )
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("run experiments", reasoning.lower())
+
+    def test_no_data_dir_reports_contention_threshold(self):
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500,
+        )
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("contention advantage", reasoning.lower())
+
+    def test_never_recommends_disagg_without_data(self):
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000,
+        )
+        self.assertNotEqual(plan.recommendation, "DISAGGREGATE")
+
+
+class TestNearestSeqLen(unittest.TestCase):
+
+    def test_uses_nearest_when_exact_unavailable(self):
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 100, [700] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 100, [1000] * 24)
+            + _make_exp11_rows("BASELINE", 1, 500, [1300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+        )
+        d = tempfile.mkdtemp()
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=300, data_dir=d,
+        )
+        self.assertEqual(plan.confidence, "experiment")
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("nearest", reasoning.lower())
+        self.assertTrue(
+            plan.mono_est_ttft_ms in (700, 1300),
+            f"Expected TTFT from nearest measured seq_len, got {plan.mono_est_ttft_ms}")
 
 
 if __name__ == "__main__":
