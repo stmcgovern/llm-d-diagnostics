@@ -21,6 +21,8 @@ Env vars:
     PROMPT_TOKENS    Prompt length in tokens (default: 500)
     CONCURRENCY      Concurrent requests per batch (default: 8)
     TOTAL_REQUESTS   Requests per config per output length (default: 24)
+    CONFIGS          Comma-separated configs to run (default: all)
+                     Options: BASELINE, DISAGG-1D, DISAGG-2D
 """
 
 import os
@@ -52,6 +54,15 @@ OUTPUT_LENGTHS = [int(x) for x in env("OUTPUT_LENGTHS", "20,50,100,200").split("
 PROMPT_TOKENS = int(env("PROMPT_TOKENS", "500"))
 CONCURRENCY = int(env("CONCURRENCY", "8"))
 TOTAL_REQUESTS = int(env("TOTAL_REQUESTS", "24"))
+
+_CONFIG_MAP = {
+    "BASELINE": ConfigThroughput.BASELINE,
+    "DISAGG-1D": ConfigThroughput.DISAGG_1D,
+    "DISAGG-2D": ConfigThroughput.DISAGG_2D,
+}
+_ALL_CONFIGS = [ConfigThroughput.BASELINE, ConfigThroughput.DISAGG_1D, ConfigThroughput.DISAGG_2D]
+CONFIGS = ([_CONFIG_MAP[x.strip()] for x in env("CONFIGS", "").split(",") if x.strip()]
+           or _ALL_CONFIGS)
 
 DISAGG_HEADERS = {"x-prefiller-host-port": PREFILL_HOST}
 
@@ -85,11 +96,7 @@ def main():
 
         warmup_prompt = build_prompt(PROMPT_TOKENS)
 
-        config_order = [
-            ConfigThroughput.BASELINE,
-            ConfigThroughput.DISAGG_1D,
-            ConfigThroughput.DISAGG_2D,
-        ]
+        config_order = list(CONFIGS)
         random.shuffle(config_order)
 
         for config_name in config_order:

@@ -116,7 +116,7 @@ automatically.
 
 ## Security notes
 
-This toolkit is designed for **internal cluster diagnostics with trusted
+This toolkit is designed for **cluster diagnostics by trusted
 operators**. A few things to be aware of:
 
 - **TLS verification is disabled** in client.py (`ssl.CERT_NONE`). The

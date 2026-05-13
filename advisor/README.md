@@ -62,7 +62,7 @@ python3 advisor/diagnose.py --namespace prod
 
 Every check maps to a real production bug from llm-d, NVIDIA Dynamo, or vLLM. Every issue comes with the GitHub reference and the exact command to fix it.
 
-### P/D ratio optimization -- know when to scale
+### Prefill/decode ratio optimization -- know when to scale
 
 ```bash
 python3 advisor/rebalance.py --namespace prod
@@ -101,7 +101,7 @@ Combines passive metrics scraping (NIXL failures, KV pressure, queue balance, tr
 | Uses real hardware | **Yes** | No (simulation) | Yes | Yes | Yes |
 | Cost estimation | **6 providers + live** | No | No | No | No |
 | Diagnoses failures | **Yes** | No | No | No | No |
-| P/D rebalancing | **Yes** | No | No | No | No |
+| Prefill/decode rebalancing | **Yes** | No | No | No | No |
 | Dependencies | **None (stdlib)** | pip + GPU | Helm | Go + Helm | pip |
 
 ## All commands
@@ -136,11 +136,11 @@ python3 advisor/health.py --namespace NS --model MODEL [--interval S] [--duratio
 ## Tests
 
 ```bash
-python3 -m pytest advisor/tests/ -v   # 87 tests, ~4 seconds
+python3 -m pytest advisor/tests/ -v
 ```
 
 Covers every decision path: capacity planning (measured + extrapolated), all diagnostic checks, all rebalance thresholds, probe baseline tracking, pricing (static + live fetch), and the cluster adapter.
 
 ## Attribution
 
-Advisory tools originated in [disagg-advisor](https://github.com/llm-d/llm-d-diagnostics) by Arkadip Maitra.
+Advisory tools originated in [disagg-advisor](https://github.com/llm-d/disagg-advisor) by Arkadip Maitra.

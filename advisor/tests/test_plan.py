@@ -1224,5 +1224,345 @@ class TestConfigConsistentThreshold(unittest.TestCase):
                                   msg="Different configs should yield different T")
 
 
+class TestAsymptoteGuard(unittest.TestCase):
+    """T(∞) only computed when mono_ttft_rate exists — no fallback."""
+
+    def test_model_with_rate_gets_asymptote(self):
+        """Phi-3 has mono_ttft_rate → T(∞) computed."""
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500,
+        )
+        self.assertGreater(plan.overhead_asymptote, 1.0)
+
+    def test_model_without_rate_no_asymptote(self):
+        """TinyLlama has no mono_ttft_rate → T(∞) stays 0."""
+        plan = plan_capacity(
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=128,
+        )
+        self.assertEqual(plan.overhead_asymptote, 0.0,
+                         "Model without mono_ttft_rate should NOT get T(∞)")
+
+    def test_experiment_data_overrides_guard(self):
+        """With ≥2 experiment overhead thresholds, T(∞) comes from data."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 100, [700] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 100, [1000] * 24)
+            + _make_exp11_rows("BASELINE", 1, 1000, [2300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [3500] * 24)
+        )
+        d = tempfile.mkdtemp()
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        plan = plan_capacity(
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=100, data_dir=d,
+        )
+        self.assertGreater(plan.overhead_asymptote, 1.0,
+                           "Experiment data should produce T(∞) even for models without rate")
+
+
+class TestSignificance(unittest.TestCase):
+    """Crossover significance: |R-T| vs R × CV_disagg."""
+
+    def _make_data_dir(self, rows):
+        d = tempfile.mkdtemp()
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        return d
+
+    def test_tight_cluster_significant(self):
+        """Low-variance crossover (CV < 2%) → significant=True."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [2800] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000,
+                               [13000 + i * 10 for i in range(24)])
+            + _make_exp11_rows("DISAGG-1D", 8, 1000,
+                               [9000 + i * 10 for i in range(24)])
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        cross = plan.crossovers[0]
+        self.assertTrue(cross["significant"],
+                        "Large gap with low CV should be significant")
+        self.assertEqual(plan.recommendation, "DISAGGREGATE")
+
+    def test_high_variance_not_significant(self):
+        """Bimodal disagg: p50 crossover but gap within noise → significant=False."""
+        # Bimodal: half fast (8000s), half slow (18000s).
+        # Median ≈ 13055 < mono 13115 → p50 cross.
+        # p90 ≈ 18087 > mono 13207 → no p90 cross.
+        # CV ≈ 0.39 → R*CV >> |R-T| → significant=False.
+        disagg_c8 = ([8000 + i * 10 for i in range(12)]
+                     + [18000 + i * 10 for i in range(12)])
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [2800] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000,
+                               [13000 + i * 10 for i in range(24)])
+            + _make_exp11_rows("DISAGG-1D", 8, 1000, disagg_c8)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        ct = [e for e in plan.contention_table if e["concurrency"] == 8]
+        self.assertEqual(len(ct), 1)
+        entry = ct[0]
+        self.assertTrue(entry["p50_cross"], "Bimodal data should produce p50 crossover")
+        self.assertFalse(entry["p90_cross"], "High p90 tail should prevent p90 crossover")
+        self.assertFalse(entry["significant"],
+                         "High-CV narrow gap should not be significant")
+
+    def test_zero_variance_significance_is_none(self):
+        """Zero CV (constant values) → significant=None (indeterminate)."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 500, [1200] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+            + _make_exp11_rows("BASELINE", 8, 500, [5000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 500, [7000] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        entry = plan.contention_table[0]
+        self.assertIsNone(entry["significant"],
+                          "Zero-variance data should give significant=None")
+
+    def test_disaggregate_within_noise_label(self):
+        """Non-significant p90 crossover → 'DISAGGREGATE (within noise)'."""
+        # Bimodal: half fast (8000s), half just below mono p90 (13500s).
+        # All disagg values < mono p90 (14207) → p90 crossover.
+        # Wide bimodal spread → high CV → gap within noise.
+        disagg_c8 = ([8000 + i * 10 for i in range(12)]
+                     + [13500 + i * 10 for i in range(12)])
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [2800] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000,
+                               [14000 + i * 10 for i in range(24)])
+            + _make_exp11_rows("DISAGG-1D", 8, 1000, disagg_c8)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        p90_crosses = [c for c in plan.crossovers if c["p90_cross"]]
+        self.assertTrue(len(p90_crosses) > 0,
+                        "Bimodal data with all values < mono p90 should produce p90 crossover")
+        self.assertFalse(p90_crosses[0]["significant"],
+                         "Wide bimodal spread should make gap non-significant")
+        self.assertIn("within noise", plan.recommendation)
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("noise", reasoning.lower())
+
+    def test_significance_pins_down_formula(self):
+        """Verify significant = (|R-T| > R × CV), not |R-T| > 2R×CV or other variant.
+
+        Constructs data where gap/(R*CV) ≈ 1.5 — significant under the correct
+        formula (k=1) but NOT under k=2. A wrong coefficient would fail this test.
+        """
+        # disagg c=8: step=145 around 4250..7585 → median≈5918, cv≈0.173
+        # mono c=8: constant 8000 → α_mono = 8000/2000 = 4.0
+        # T = 3000/2000 = 1.5, R ≈ 2.03, gap ≈ 0.53, R*CV ≈ 0.35
+        # ratio gap/(R*CV) ≈ 1.5 — between 1 and 2
+        disagg_c8 = [4250 + i * 145 for i in range(24)]
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [3000] * 24)
+            + _make_exp11_rows("BASELINE", 8, 1000, [8000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 1000, disagg_c8)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        entry = plan.contention_table[0]
+        self.assertTrue(entry["p50_cross"],
+                        "Disagg median should be below mono at c=8")
+        self.assertTrue(entry["significant"],
+                        "gap/(R*CV) ≈ 1.5 should be significant under |gap| > R*CV")
+
+    def test_single_threshold_no_experiment_asymptote(self):
+        """Experiment with 1 seq_len produces 1 threshold — T(∞) falls to baseline."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 500, [1300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+        )
+        d = self._make_data_dir(rows)
+        # TinyLlama has no mono_ttft_rate → fallback should give 0
+        plan = plan_capacity(
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        self.assertEqual(plan.confidence, "experiment")
+        self.assertEqual(len(plan.overhead_thresholds), 1)
+        self.assertEqual(plan.overhead_asymptote, 0.0,
+                         "1 threshold + no rate → T(∞) should stay 0")
+
+
+class TestCriticalConcurrency(unittest.TestCase):
+    """c* detection: mono phase transition where CV crosses 0.10."""
+
+    def _make_data_dir(self, rows):
+        d = tempfile.mkdtemp()
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        return d
+
+    def test_phase_transition_detected(self):
+        """Mono CV low at c=4, high at c=8 → c*=4."""
+        # c=1,4: tight (CV<0.10). c=8: noisy (CV>0.10).
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 500, [1200] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+            + _make_exp11_rows("BASELINE", 4, 500, [3000 + i * 5 for i in range(24)])
+            + _make_exp11_rows("DISAGG-1D", 4, 500, [5000 + i * 5 for i in range(24)])
+            + _make_exp11_rows("BASELINE", 8, 500,
+                               [5000 + i * 200 for i in range(24)])
+            + _make_exp11_rows("DISAGG-1D", 8, 500,
+                               [7000 + i * 200 for i in range(24)])
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        self.assertEqual(plan.critical_concurrency, 4)
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("phase transition", reasoning.lower())
+
+    def test_no_transition_when_all_stable(self):
+        """Mono CV stays low → c*=0 (no transition detected)."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 500, [1200] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+            + _make_exp11_rows("BASELINE", 8, 500,
+                               [5000 + i * 5 for i in range(24)])
+            + _make_exp11_rows("DISAGG-1D", 8, 500,
+                               [7000 + i * 5 for i in range(24)])
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        self.assertEqual(plan.critical_concurrency, 0)
+
+    def test_cv_table_populated(self):
+        """mono_cv_by_concurrency has entries for each measured concurrency."""
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 500, [1200] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1800] * 24)
+            + _make_exp11_rows("BASELINE", 4, 500, [3000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 4, 500, [5000] * 24)
+            + _make_exp11_rows("BASELINE", 8, 500, [5000] * 24)
+            + _make_exp11_rows("DISAGG-1D", 8, 500, [7000] * 24)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        concs = [e["concurrency"] for e in plan.mono_cv_by_concurrency]
+        self.assertEqual(concs, [1, 4, 8])
+
+    def test_preexperiment_no_cstar(self):
+        """Pre-experiment plans have no c* (no data to detect transition)."""
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=500,
+        )
+        self.assertEqual(plan.critical_concurrency, 0)
+        self.assertEqual(plan.mono_cv_by_concurrency, [])
+
+    def test_p90_crossover_above_cstar_recommends_mono(self):
+        """p90 crossover above c* → MONOLITHIC (disagg wins by default, not advantage).
+
+        c=4: tight data (CV<10%), no crossover.
+        c=8: mono noisy (CV>10%), disagg wins at both p50 and p90.
+        c*=4 since mono transitions between c=4 and c=8.
+        All p90 crossovers at c=8 > c*=4 → MONOLITHIC.
+        """
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [2800] * 24)
+            + _make_exp11_rows("BASELINE", 4, 1000,
+                               [6000 + i * 5 for i in range(24)])
+            + _make_exp11_rows("DISAGG-1D", 4, 1000,
+                               [9000 + i * 5 for i in range(24)])
+            + _make_exp11_rows("BASELINE", 8, 1000,
+                               [13000 + i * 300 for i in range(24)])
+            + _make_exp11_rows("DISAGG-1D", 8, 1000,
+                               [9000 + i * 10 for i in range(24)])
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        self.assertEqual(plan.critical_concurrency, 4)
+        p90_crosses = [c for c in plan.crossovers if c["p90_cross"]]
+        self.assertTrue(len(p90_crosses) > 0)
+        self.assertTrue(all(c["concurrency"] > 4 for c in p90_crosses))
+        self.assertEqual(plan.recommendation, "MONOLITHIC")
+        reasoning = " ".join(plan.reasoning)
+        self.assertIn("above c*", reasoning)
+        self.assertIn("unstable", reasoning)
+
+    def test_p90_crossover_below_cstar_recommends_disagg(self):
+        """p90 crossover below c* → DISAGGREGATE (genuine advantage).
+
+        c=4: tight data, disagg wins at both p50 and p90.
+        c=8: mono noisy (CV>10%).
+        c*=4 since mono transitions between c=4 and c=8.
+        p90 crossover at c=4 ≤ c*=4 → DISAGGREGATE.
+        """
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 1000, [2300] * 24)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [2800] * 24)
+            + _make_exp11_rows("BASELINE", 4, 1000,
+                               [13000 + i * 10 for i in range(24)])
+            + _make_exp11_rows("DISAGG-1D", 4, 1000,
+                               [9000 + i * 10 for i in range(24)])
+            + _make_exp11_rows("BASELINE", 8, 1000,
+                               [18000 + i * 350 for i in range(24)])
+            + _make_exp11_rows("DISAGG-1D", 8, 1000,
+                               [12000 + i * 10 for i in range(24)])
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, target_ttft_ms=99999,
+            gpu_type="t4", seq_len=1000, data_dir=d,
+        )
+        self.assertEqual(plan.critical_concurrency, 4)
+        p90_crosses = [c for c in plan.crossovers if c["p90_cross"]]
+        self.assertTrue(len(p90_crosses) > 0)
+        self.assertTrue(any(c["concurrency"] <= 4 for c in p90_crosses))
+        self.assertIn("DISAGGREGATE", plan.recommendation)
+
+
 if __name__ == "__main__":
     unittest.main()
