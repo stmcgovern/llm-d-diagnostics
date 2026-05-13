@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 
 _advisor_dir = os.path.dirname(__file__)
@@ -65,43 +66,31 @@ def load_run_info(data_dir: str) -> dict:
         return json.load(f)
 
 
+def _grouped_stats(path, key_fn):
+    """Load CSV, group rows by key_fn, return {key: stats(ttft_ms)}."""
+    rows = load_csv(path)
+    groups = defaultdict(list)
+    for r in rows:
+        if get_status(r) != 200:
+            continue
+        groups[key_fn(r)].append(safe_float(r["ttft_ms"]))
+    return {k: stats(v) for k, v in groups.items()}
+
+
 def load_exp_baselines(data_dir: str) -> dict:
     """Extract measured TTFT and overhead from exp11 + exp14 data.
 
     Returns dict keyed by metric type with measured values per condition.
     """
-    result = {"exp11": {}, "exp14": {}}
-
-    rows11 = load_csv(os.path.join(data_dir, "exp11-results.csv"))
-    if rows11:
-        from collections import defaultdict
-        by_key = defaultdict(list)
-        for r in rows11:
-            if get_status(r) != 200:
-                continue
-            key = (r["config"], safe_int(r["concurrency"]),
-                   safe_int(r["prompt_tokens_target"]))
-            by_key[key].append(safe_float(r["ttft_ms"]))
-
-        for (cfg, conc, pt), vals in by_key.items():
-            s = stats(vals)
-            result["exp11"][(cfg, conc, pt)] = s
-
-    rows14 = load_csv(os.path.join(data_dir, "exp14-results.csv"))
-    if rows14:
-        from collections import defaultdict
-        by_key = defaultdict(list)
-        for r in rows14:
-            if get_status(r) != 200:
-                continue
-            key = (r["config"], safe_int(r["prompt_tokens_target"]))
-            by_key[key].append(safe_float(r["ttft_ms"]))
-
-        for (cfg, pt), vals in by_key.items():
-            s = stats(vals)
-            result["exp14"][(cfg, pt)] = s
-
-    return result
+    return {
+        "exp11": _grouped_stats(
+            os.path.join(data_dir, "exp11-results.csv"),
+            lambda r: (r["config"], safe_int(r["concurrency"]),
+                       safe_int(r["prompt_tokens_target"]))),
+        "exp14": _grouped_stats(
+            os.path.join(data_dir, "exp14-results.csv"),
+            lambda r: (r["config"], safe_int(r["prompt_tokens_target"]))),
+    }
 
 
 def get_predictions(model: str, gpu_type: str, seq_lens: list) -> dict:
