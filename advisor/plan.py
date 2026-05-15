@@ -1,28 +1,36 @@
 """
-GPU capacity planner for disaggregated inference.
+Deployment advisor for disaggregated inference.
 
-Answers "how many GPUs do I need?" given a model, target throughput,
-TTFT SLO, and GPU type. Uses measured data when available, otherwise
-extrapolates using the scaling model and known GPU performance ratios.
+Pre-experiment: feasibility check and cost estimate at c=1. Reports the
+overhead threshold — how much contention advantage disagg needs to justify
+its transfer cost.
 
-Integrates with ``toolkit/scaling_model.py`` for the hardware database
-(MODELS, GPUS) and keeps ``fetch_model_profile`` locally since it only
-talks to HuggingFace (no cluster dependency).
+Post-experiment (--data-dir): data-backed mono vs disagg recommendation
+using measured crossover points from exp11 throughput sweeps. Detects
+crossovers at both p50 and p90 and reports variance asymmetry between
+topologies under concurrent load.
 """
 
 import argparse
 import json
 import math
+import os
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from .pricing import GPU_MEM_BW_GBS, GPU_NIC_BW_GBPS, GPU_VRAM_GB, get_price, get_cheapest
     from ._cluster import SCALING_GPUS
+    from .pricing import GPU_MEM_BW_GBS, GPU_NIC_BW_GBPS, GPU_VRAM_GB, get_cheapest, get_price
 except ImportError:
-    from pricing import GPU_MEM_BW_GBS, GPU_NIC_BW_GBPS, GPU_VRAM_GB, get_price, get_cheapest
-    from _cluster import SCALING_GPUS
+    from _cluster import SCALING_GPUS  # type: ignore[no-redef]
+    from pricing import (  # type: ignore[no-redef]
+        GPU_MEM_BW_GBS,
+        GPU_NIC_BW_GBPS,
+        GPU_VRAM_GB,
+        get_cheapest,
+        get_price,
+    )
 
 
 DTYPE_BYTES = {"float32": 4, "float16": 2, "bfloat16": 2}
@@ -125,6 +133,16 @@ MEASURED_BASELINES = {
         "overhead_ms": 279, "overhead_pct": 9.3,
         "sidecar_ms": 25, "nixl_ms": 267,
     },
+    ("microsoft/Phi-3-mini-4k-instruct", "t4"): {
+        "params_b": 3.8, "is_moe": False,
+        "mono_ttft_ms": 770, "disagg_ttft_ms": 1022,
+        "mono_ttft_base_ms": 560, "mono_ttft_rate": 1.70,
+        "disagg_ttft_base_ms": 636, "disagg_ttft_rate": 3.25,
+        "ref_seq_len": 100,
+        "mono_throughput": 1.30, "disagg_throughput": 0.98,
+        "overhead_ms": 252, "overhead_pct": 32.7,
+        "sidecar_ms": 0, "nixl_ms": 252,
+    },
 }
 
 # KV cache bytes per token = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
@@ -137,6 +155,7 @@ KV_BYTES_PER_TOKEN = {
     "Qwen/Qwen2.5-3B-Instruct": 2 * 36 * 2 * 128 * 2,
     "microsoft/Phi-3.5-mini-instruct": 2 * 32 * 32 * 96 * 2,
     "allenai/OLMoE-1B-7B-0924-Instruct": 2 * 16 * 16 * 128 * 2,
+    "microsoft/Phi-3-mini-4k-instruct": 2 * 32 * 32 * 96 * 2,
 }
 
 # Scaling constants from exp5 regression (Pearson r=0.987)
@@ -175,6 +194,13 @@ class CapacityPlan:
     recommendation: str = ""
     confidence: str = ""
     reasoning: list = field(default_factory=list)
+    crossovers: list = field(default_factory=list)
+    contention_table: list = field(default_factory=list)
+    overhead_asymptote: float = 0.0
+    measured_conditions: str = ""
+    overhead_thresholds: list = field(default_factory=list)
+    critical_concurrency: int = 0
+    mono_cv_by_concurrency: list = field(default_factory=list)
 
 
 def plan_capacity(
@@ -184,6 +210,7 @@ def plan_capacity(
     gpu_type: str = "t4",
     provider: str = "aws",
     seq_len: int = 128,
+    data_dir: str = "",
 ) -> CapacityPlan:
     """Generate a capacity plan for the given model and requirements."""
 
@@ -226,40 +253,232 @@ def plan_capacity(
             f"Each instance uses {tp * pp} GPUs."
         )
 
-    measured = MEASURED_BASELINES.get((model_id, gpu_type))
-    if measured:
+    exp11_path = os.path.join(data_dir, "exp11-results.csv") if data_dir else ""
+    if data_dir and os.path.exists(exp11_path):
+        plan.confidence = "experiment"
+        _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price)
+    elif (model_id, gpu_type) in MEASURED_BASELINES:
         plan.confidence = "measured"
-        _plan_from_measured(plan, measured, target_throughput, price)
+        _plan_from_measured(plan, MEASURED_BASELINES[(model_id, gpu_type)],
+                           target_throughput, price, seq_len)
     else:
         _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp, seq_len)
+
+    if plan.overhead_thresholds and len(plan.overhead_thresholds) >= 2:
+        ts = sorted(plan.overhead_thresholds, key=lambda t: t["seq_len"])
+        plan.overhead_asymptote = round(ts[-1]["threshold"], 2)
+    else:
+        measured = MEASURED_BASELINES.get((model_id, gpu_type), {})
+        prefill_rate = measured.get("mono_ttft_rate", 0)
+        if prefill_rate > 0:
+            kv_bytes = _estimate_kv_bytes(profile)
+            plan.overhead_asymptote = round(
+                _estimate_overhead_asymptote(kv_bytes, prefill_rate, gpu_type,
+                                            profile.is_moe), 2)
 
     _generate_recommendation(plan)
 
     return plan
 
 
-def _plan_from_measured(plan, measured, target_throughput, price):
+def _baseline_ttft(baseline, seq_len, field="mono"):
+    """Get TTFT from a baseline, seq_len-aware if rate data available."""
+    base_key = f"{field}_ttft_base_ms"
+    rate_key = f"{field}_ttft_rate"
+    if base_key in baseline and rate_key in baseline:
+        return baseline[base_key] + baseline[rate_key] * seq_len
+    return baseline[f"{field}_ttft_ms"]
+
+
+def _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price):
+    """Plan from exp11 experiment data: detect crossovers at p50 and p90."""
+    import sys
+    _advisor_dir = os.path.dirname(__file__)
+    _toolkit_dir = os.path.join(os.path.dirname(_advisor_dir), "toolkit")
+    if _advisor_dir not in sys.path:
+        sys.path.insert(0, _advisor_dir)
+    if _toolkit_dir not in sys.path:
+        sys.path.insert(0, _toolkit_dir)
+    from validate import load_exp_baselines
+
+    measurements = load_exp_baselines(data_dir)
+    exp11 = measurements.get("exp11", {})
+    if not exp11:
+        plan.confidence = "extrapolated"
+        plan.reasoning.append("No exp11 data found in data dir; falling back")
+        return
+
+    measured_seqs = sorted(set(k[2] for k in exp11 if k[0] == "BASELINE" and k[1] == 1))
+    measured_concs = sorted(set(k[1] for k in exp11))
+
+    plan.measured_conditions = (
+        f"c∈{{{','.join(str(c) for c in measured_concs)}}}, "
+        f"s∈{{{','.join(str(s) for s in measured_seqs)}}}")
+
+    if seq_len in measured_seqs:
+        target_s = seq_len
+    else:
+        target_s = min(measured_seqs, key=lambda s: abs(s - seq_len))
+        plan.reasoning.append(
+            f"Requested seq_len={seq_len} not measured; using nearest: {target_s}")
+
+    bl_c1 = exp11.get(("BASELINE", 1, target_s))
+    if bl_c1:
+        plan.mono_est_ttft_ms = round(bl_c1["median"])
+
+    dg_c1 = exp11.get(("DISAGG-1D", 1, target_s))
+    if not dg_c1:
+        dg_c1 = exp11.get(("DISAGG-2D", 1, target_s))
+    if dg_c1:
+        plan.disagg_est_ttft_ms = round(dg_c1["median"])
+
+    for s in measured_seqs:
+        bl_c1_s = exp11.get(("BASELINE", 1, s))
+        dg_c1_s = exp11.get(("DISAGG-1D", 1, s)) or exp11.get(("DISAGG-2D", 1, s))
+        if bl_c1_s and dg_c1_s and bl_c1_s["median"] > 0:
+            t = dg_c1_s["median"] / bl_c1_s["median"]
+            plan.overhead_thresholds.append({
+                "seq_len": s,
+                "threshold": round(t, 2),
+                "overhead_pct": round((t - 1) * 100),
+            })
+
+    for (cfg, conc, pt), dg_stats in exp11.items():
+        if not cfg.startswith("DISAGG"):
+            continue
+        if conc <= 1:
+            continue
+        bl_cn = exp11.get(("BASELINE", conc, pt))
+        if not bl_cn or bl_cn["median"] <= 0 or bl_cn["p90"] <= 0:
+            continue
+        bl_c1_pt = exp11.get(("BASELINE", 1, pt))
+        dg_c1_pt = exp11.get((cfg, 1, pt))
+        if not bl_c1_pt or not dg_c1_pt:
+            continue
+        if bl_c1_pt["median"] <= 0 or dg_c1_pt["median"] <= 0:
+            continue
+
+        alpha_mono = bl_cn["median"] / bl_c1_pt["median"]
+        alpha_disagg = dg_stats["median"] / dg_c1_pt["median"]
+        contention_ratio = alpha_mono / alpha_disagg if alpha_disagg > 0 else 0
+        threshold = dg_c1_pt["median"] / bl_c1_pt["median"]
+
+        p50_delta = (dg_stats["median"] - bl_cn["median"]) / bl_cn["median"] * 100
+        p90_delta = (dg_stats["p90"] - bl_cn["p90"]) / bl_cn["p90"] * 100
+        p50_cross = dg_stats["median"] < bl_cn["median"]
+        p90_cross = dg_stats["p90"] < bl_cn["p90"]
+
+        alpha_mono_p90 = bl_cn["p90"] / bl_c1_pt["p90"] if bl_c1_pt["p90"] > 0 else 0
+        alpha_disagg_p90 = dg_stats["p90"] / dg_c1_pt["p90"] if dg_c1_pt["p90"] > 0 else 0
+        contention_ratio_p90 = alpha_mono_p90 / alpha_disagg_p90 if alpha_disagg_p90 > 0 else 0
+        has_p90 = bl_c1_pt["p90"] > 0 and dg_c1_pt["p90"] > 0
+        threshold_p90 = (dg_c1_pt["p90"] / bl_c1_pt["p90"]) if has_p90 else threshold
+
+        mono_cv = bl_cn.get("cv")
+        disagg_cv = dg_stats.get("cv")
+        gap = contention_ratio - threshold
+        r_uncertainty = contention_ratio * (disagg_cv or 0)
+        significant = abs(gap) > r_uncertainty if r_uncertainty > 0 else None
+        entry = {
+            "seq_len": pt, "concurrency": conc, "config": cfg,
+            "p50_delta_pct": round(p50_delta, 1),
+            "p90_delta_pct": round(p90_delta, 1),
+            "p50_cross": p50_cross, "p90_cross": p90_cross,
+            "mono_cv": round(mono_cv, 3) if mono_cv is not None else None,
+            "disagg_cv": round(disagg_cv, 3) if disagg_cv is not None else None,
+            "alpha_mono": round(alpha_mono, 2),
+            "alpha_disagg": round(alpha_disagg, 2),
+            "contention_ratio": round(contention_ratio, 2),
+            "threshold": round(threshold, 2),
+            "contention_ratio_p90": round(contention_ratio_p90, 2),
+            "threshold_p90": round(threshold_p90, 2),
+            "significant": significant,
+        }
+        plan.contention_table.append(entry)
+        if p50_cross or p90_cross:
+            plan.crossovers.append(entry)
+
+    if max(measured_concs) <= 1:
+        plan.reasoning.append(
+            "Only c=1 measured — crossovers require concurrent load. "
+            "Re-run with concurrency > 1 to detect crossover")
+
+    cv_threshold = 0.10
+    mono_cv_by_c = {}
+    for (cfg, conc, _pt), st in exp11.items():
+        if cfg != "BASELINE" or conc < 1:
+            continue
+        cv = st.get("cv")
+        if cv is not None:
+            mono_cv_by_c.setdefault(conc, []).append(cv)
+
+    for conc in sorted(mono_cv_by_c):
+        median_cv = sorted(mono_cv_by_c[conc])[len(mono_cv_by_c[conc]) // 2]
+        plan.mono_cv_by_concurrency.append({
+            "concurrency": conc, "median_cv": round(median_cv, 3),
+        })
+
+    prev_c, prev_cv = 0, 0.0
+    for entry in plan.mono_cv_by_concurrency:
+        c, cv = entry["concurrency"], entry["median_cv"]
+        if cv >= cv_threshold and prev_cv < cv_threshold and prev_c > 0:
+            plan.critical_concurrency = prev_c
+            break
+        prev_c, prev_cv = c, cv
+
+    gpus_per = plan.mono_gpus_per_instance
+    mono_rps = 1000 / max(plan.mono_est_ttft_ms, 1)
+    plan.mono_instances = max(1, math.ceil(target_throughput / mono_rps))
+    plan.mono_total_gpus = plan.mono_instances * gpus_per
+    plan.mono_cost_per_hr = plan.mono_total_gpus * price
+
+    plan.mono_est_throughput = round(mono_rps * plan.mono_instances, 2)
+    plan.disagg_prefill_gpus = gpus_per
+    plan.disagg_decode_gpus = plan.mono_instances * gpus_per
+    plan.disagg_total_gpus = plan.disagg_prefill_gpus + plan.disagg_decode_gpus
+    plan.disagg_est_throughput = plan.mono_est_throughput
+    plan.disagg_cost_per_hr = plan.disagg_total_gpus * price
+
+    plan.reasoning.append(
+        f"Based on {sum(v['n'] for v in exp11.values())} measurements "
+        f"({plan.measured_conditions})")
+
+
+def _plan_from_measured(plan, measured, target_throughput, price, seq_len=128):
     """Plan using actual measured data from our experiments."""
     mono_rps = measured["mono_throughput"]
     disagg_rps = measured["disagg_throughput"]
     gpus_per = plan.mono_gpus_per_instance
 
+    mono_ttft = _baseline_ttft(measured, seq_len)
+    disagg_ttft = _baseline_ttft(measured, seq_len, "disagg")
+
     plan.mono_instances = max(1, math.ceil(target_throughput / mono_rps)) if mono_rps > 0 else 1
     plan.mono_total_gpus = plan.mono_instances * gpus_per
-    plan.mono_est_ttft_ms = measured["mono_ttft_ms"]
+    plan.mono_est_ttft_ms = round(mono_ttft)
     plan.mono_est_throughput = mono_rps * plan.mono_instances
     plan.mono_cost_per_hr = plan.mono_total_gpus * price
 
     disagg_instances = max(1, math.ceil(target_throughput / disagg_rps)) if disagg_rps > 0 else 1
-    prefill_capacity = 1000 / measured["mono_ttft_ms"]
+    prefill_capacity = 1000 / max(mono_ttft, 1)
     min_prefill = max(1, math.ceil(target_throughput / prefill_capacity))
     plan.disagg_prefill_gpus = min_prefill * gpus_per
     plan.disagg_decode_gpus = disagg_instances * gpus_per
     plan.disagg_total_gpus = plan.disagg_prefill_gpus + plan.disagg_decode_gpus
-    plan.disagg_est_ttft_ms = measured["disagg_ttft_ms"]
+    plan.disagg_est_ttft_ms = round(disagg_ttft)
     plan.disagg_est_throughput = disagg_rps * disagg_instances
     plan.disagg_cost_per_hr = plan.disagg_total_gpus * price
 
+    has_rates = "mono_ttft_base_ms" in measured
+    if has_rates:
+        plan.reasoning.append(
+            f"TTFT scaled for {seq_len} tokens "
+            f"(linear model, valid 50-1000 tokens)")
+    elif seq_len > 150 or seq_len < 50:
+        ref = measured.get("ref_seq_len", 100)
+        plan.reasoning.append(
+            f"TTFT measured at ~{ref} tokens; prediction at {seq_len} "
+            f"tokens may diverge — run experiments to calibrate")
     plan.reasoning.append(f"Based on measured data: mono {mono_rps:.2f} req/s, disagg {disagg_rps:.2f} req/s")
 
 
@@ -313,6 +532,25 @@ def _estimate_nixl_ms(kv_bytes_per_token: int, seq_len: int = 128,
     return NIXL_PROTOCOL_MS + data_ms
 
 
+def _estimate_overhead_asymptote(kv_bytes_per_token: int, prefill_rate: float,
+                                 gpu_type: str = "t4", is_moe: bool = False) -> float:
+    """T(∞) = 1 + nixl_rate / prefill_rate.
+
+    As seq_len → ∞, protocol overhead and base TTFT become negligible.
+    T(∞) is the per-token overhead ratio — the minimum contention advantage
+    disagg needs at very long prompts.
+    """
+    if prefill_rate <= 0:
+        return 0.0
+    t4_nic = GPU_NIC_BW_GBPS.get("t4", 25)
+    target_nic = GPU_NIC_BW_GBPS.get(gpu_type, t4_nic)
+    scaled_bw = NIXL_EFF_BW_GBS * (target_nic / t4_nic)
+    nixl_rate_ms = kv_bytes_per_token / (scaled_bw * 1e9) * 1000
+    if is_moe:
+        nixl_rate_ms *= MOE_NIXL_CORRECTION
+    return 1 + nixl_rate_ms / prefill_rate
+
+
 def _validate_profile(profile):
     """Flag plans built on missing or implausible profile data."""
     issues = []
@@ -339,7 +577,7 @@ def _check_vram_feasibility(weight_gb, kv_bytes_per_token, seq_len, gpus_per_ins
             f"Increase TP or use a larger GPU.")
 
 
-def _proportional_scale(ref, params_b, plan):
+def _proportional_scale(ref, params_b, plan, seq_len=128):
     """Scale TTFT and throughput proportionally from a reference baseline."""
     scale = params_b / ref["params_b"] if ref["params_b"] > 0 else 1
     if scale > 5:
@@ -347,7 +585,7 @@ def _proportional_scale(ref, params_b, plan):
             f"LOW CONFIDENCE: extrapolating {scale:.0f}x beyond nearest baseline "
             f"({ref['params_b']:.1f}B -> {params_b:.1f}B). TTFT estimate is unreliable.")
         plan.confidence = "low"
-    return ref["mono_ttft_ms"] * scale, ref["mono_throughput"] / max(scale, 0.5)
+    return _baseline_ttft(ref, seq_len) * scale, ref["mono_throughput"] / max(scale, 0.5)
 
 
 def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp, seq_len=128):
@@ -383,20 +621,22 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
 
             if lo_b <= params_b <= hi_b:
                 t = (params_b - lo_b) / range_b
-                mono_ttft = lo["mono_ttft_ms"] + t * (hi["mono_ttft_ms"] - lo["mono_ttft_ms"])
+                lo_ttft = _baseline_ttft(lo, seq_len)
+                hi_ttft = _baseline_ttft(hi, seq_len)
+                mono_ttft = lo_ttft + t * (hi_ttft - lo_ttft)
                 mono_rps = lo["mono_throughput"] + t * (hi["mono_throughput"] - lo["mono_throughput"])
                 interpolated = True
                 plan.reasoning.append(
                     f"Interpolated between {lo_b:.1f}B and {hi_b:.1f}B baselines")
             else:
                 ref = lo if abs(lo_b - params_b) < abs(hi_b - params_b) else hi
-                mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan)
+                mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan, seq_len)
                 plan.reasoning.append(
                     f"Proportional scaling from {ref['params_b']:.1f}B baseline "
                     f"(target {params_b:.1f}B is outside measured range)")
         else:
             (ref, _) = nearest[0]
-            mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan)
+            mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan, seq_len)
             plan.reasoning.append(f"Scaled from single baseline ({ref['params_b']:.1f}B)")
 
         if gpu_type != "t4":
@@ -460,58 +700,206 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
 
 
 def _generate_recommendation(plan):
-    """Compare mono vs disagg on SLO compliance and GPU cost."""
-    mono_meets_slo = plan.mono_est_ttft_ms <= plan.target_ttft_ms
-    disagg_meets_slo = plan.disagg_est_ttft_ms <= plan.target_ttft_ms
+    """Generate topology recommendation based on available evidence."""
+    if plan.confidence == "experiment" and plan.crossovers:
+        p90_crosses = [c for c in plan.crossovers if c["p90_cross"]]
+        p50_crosses = [c for c in plan.crossovers if c["p50_cross"]]
 
-    if mono_meets_slo and disagg_meets_slo:
-        gpu_ratio = plan.disagg_total_gpus / max(plan.mono_total_gpus, 1)
-        if gpu_ratio < 0.8:
-            plan.recommendation = "DISAGGREGATE"
-            plan.reasoning.append(
-                f"Both meet SLO; disagg uses fewer GPUs "
-                f"({plan.disagg_total_gpus} vs {plan.mono_total_gpus})")
-        elif gpu_ratio > 1.2:
+        if p90_crosses:
+            best = min(p90_crosses, key=lambda c: c["seq_len"])
+            sig = best.get("significant")
+            all_above_cstar = (plan.critical_concurrency > 0
+                               and all(c["concurrency"] > plan.critical_concurrency
+                                       for c in p90_crosses))
+            if all_above_cstar:
+                plan.recommendation = "MONOLITHIC"
+                plan.reasoning.append(
+                    f"p90 crossover exists at c≥{best['concurrency']}, "
+                    f"s≥{best['seq_len']} — but only above c*={plan.critical_concurrency} "
+                    f"where mono is already unstable")
+                plan.reasoning.append(
+                    "Both topologies degrade above c*; "
+                    "disagg wins by default, not by advantage")
+            else:
+                plan.recommendation = "DISAGGREGATE" if sig is not False else "DISAGGREGATE (within noise)"
+                r = best.get("contention_ratio", 0)
+                t = best.get("threshold", 0)
+                if best["p50_cross"]:
+                    plan.reasoning.append(
+                        f"Contention advantage R={r:.2f} exceeds threshold "
+                        f"T={t:.2f} at p50 AND p90 "
+                        f"(c≥{best['concurrency']}, s≥{best['seq_len']})")
+                else:
+                    plan.reasoning.append(
+                        f"Contention advantage R_p90={best.get('contention_ratio_p90', 0):.2f} "
+                        f"exceeds threshold T_p90={best.get('threshold_p90', 0):.2f} at p90 "
+                        f"(c≥{best['concurrency']}, s≥{best['seq_len']}; "
+                        f"median {best['p50_delta_pct']:+.0f}%)")
+            if sig is False:
+                plan.reasoning.append(
+                    "Gap is within measurement noise (R × CV_disagg > |R - T|) — "
+                    "increase sample size or concurrency to confirm")
+        elif p50_crosses:
+            best = max(p50_crosses, key=lambda c: abs(c["p50_delta_pct"]))
             plan.recommendation = "MONOLITHIC"
+            r = best.get("contention_ratio", 0)
+            t = best.get("threshold", 0)
+            r_p90 = best.get("contention_ratio_p90", 0)
+            t_p90 = best.get("threshold_p90", 0)
+            sig = best.get("significant")
+            sig_note = "" if sig is not False else " (within noise)"
             plan.reasoning.append(
-                f"Both meet SLO; mono uses fewer GPUs "
-                f"({plan.mono_total_gpus} vs {plan.disagg_total_gpus})")
-        else:
-            plan.recommendation = "RUN EXPERIMENTS TO DECIDE"
-            plan.reasoning.append("Close call -- empirical benchmark needed")
-            plan.reasoning.append(f"Run: ./toolkit/run.sh <cluster> characterize")
-    elif mono_meets_slo:
+                f"p50: R={r:.2f} > T={t:.2f} — disagg wins by "
+                f"{abs(best['p50_delta_pct']):.0f}%{sig_note} "
+                f"(c={best['concurrency']}, s={best['seq_len']})")
+            plan.reasoning.append(
+                f"p90: R={r_p90:.2f} < T={t_p90:.2f} — mono wins by "
+                f"{abs(best['p90_delta_pct']):.0f}%")
+            mono_cv = best["mono_cv"]
+            disagg_cv = best["disagg_cv"]
+            if mono_cv is not None and disagg_cv is not None and mono_cv > 0:
+                cv_ratio = disagg_cv / mono_cv
+                plan.reasoning.append(
+                    f"Disagg variance {cv_ratio:.0f}x higher — "
+                    f"R drops at tail while T rises")
+            plan.reasoning.append(
+                "For SLO compliance (p90/p99): mono wins everywhere")
+
+    elif plan.confidence == "experiment":
         plan.recommendation = "MONOLITHIC"
-        plan.reasoning.append("Only monolithic meets TTFT SLO")
-    elif disagg_meets_slo:
-        plan.recommendation = "DISAGGREGATE"
-        plan.reasoning.append("Only disaggregated meets TTFT SLO")
+        plan.reasoning.append(
+            "Measured: mono wins at all tested conditions (p50 and p90)")
+
     else:
-        plan.recommendation = "RUN EXPERIMENTS TO DECIDE"
-        plan.reasoning.append("Neither topology meets TTFT SLO at current scale")
-        plan.reasoning.append(f"Run: ./toolkit/run.sh <cluster> characterize")
+        overhead_pct = round(
+            (plan.disagg_est_ttft_ms - plan.mono_est_ttft_ms)
+            / max(plan.mono_est_ttft_ms, 1) * 100)
+        plan.recommendation = "MONOLITHIC (c=1 estimate)"
+        plan.reasoning.append(
+            f"At c=1, mono always faster "
+            f"(disagg adds {overhead_pct}% overhead)")
+        plan.reasoning.append(
+            f"Disagg needs >{overhead_pct}% contention advantage under load — "
+            f"run experiments to measure")
+        plan.reasoning.append(
+            "To measure: ./toolkit/run.sh <cluster> tput-seqlen")
+
+    if plan.confidence == "experiment" and plan.critical_concurrency > 0:
+        c_star = plan.critical_concurrency
+        cv_entries = {e["concurrency"]: e["median_cv"]
+                      for e in plan.mono_cv_by_concurrency}
+        below = cv_entries.get(c_star, 0)
+        above_c = min((c for c in cv_entries if c > c_star), default=0)
+        above = cv_entries.get(above_c, 0) if above_c else 0
+        plan.reasoning.append(
+            f"Mono stability threshold c*={c_star}: "
+            f"CV={below:.0%} at c={c_star}, "
+            f"CV={above:.0%} at c={above_c}. "
+            f"Below c* mono is deterministic; above c* tail latency explodes")
 
 
 def print_plan(plan: CapacityPlan):
+    is_experiment = plan.confidence == "experiment"
+    header = "DEPLOYMENT RECOMMENDATION" if is_experiment else "FEASIBILITY ESTIMATE"
+
     print(f"\n{'='*60}")
-    print(f"  CAPACITY PLAN: {plan.model}")
+    print(f"  {header}: {plan.model}")
     print(f"{'='*60}")
-    print(f"  Target: {plan.target_throughput} req/s, TTFT <= {plan.target_ttft_ms}ms")
-    print(f"  GPU: {plan.gpu_type.upper()}    Confidence: {plan.confidence}")
+
+    if is_experiment:
+        print(f"  Data: {plan.measured_conditions}")
+        print()
+
+        if plan.mono_cv_by_concurrency:
+            if plan.critical_concurrency > 0:
+                c_star = plan.critical_concurrency
+                print(f"  STABILITY THRESHOLD: c* = {c_star}")
+                cv_parts = [f"c={e['concurrency']}: {e['median_cv']:.0%}"
+                            for e in plan.mono_cv_by_concurrency]
+                print(f"    Mono CV:  {',  '.join(cv_parts)}")
+                print("    Below c*: mono is deterministic and always wins")
+                print("    Above c*: mono tail latency explodes")
+            else:
+                max_c = max(e["concurrency"] for e in plan.mono_cv_by_concurrency)
+                max_cv = max(e["median_cv"] for e in plan.mono_cv_by_concurrency)
+                print(f"  STABILITY THRESHOLD: none detected (c* > {max_c})")
+                cv_parts = [f"c={e['concurrency']}: {e['median_cv']:.0%}"
+                            for e in plan.mono_cv_by_concurrency]
+                print(f"    Mono CV:  {',  '.join(cv_parts)}")
+                print(f"    Mono stays deterministic through c={max_c} "
+                      f"(CV {max_cv:.0%})")
+            print()
+
+        print("  OVERHEAD AT c=1")
+        print(f"    Mono:   {plan.mono_est_ttft_ms}ms    "
+              f"Disagg: {plan.disagg_est_ttft_ms}ms")
+        if plan.mono_est_ttft_ms > 0:
+            overhead = plan.disagg_est_ttft_ms - plan.mono_est_ttft_ms
+            overhead_pct = overhead / plan.mono_est_ttft_ms * 100
+            print(f"    Overhead: {overhead:.0f}ms ({overhead_pct:+.0f}%)")
+        if plan.overhead_asymptote > 0:
+            asym_pct = round((plan.overhead_asymptote - 1) * 100)
+            print(f"    T(∞) = {plan.overhead_asymptote:.2f} — "
+                  f"long-prompt floor ({asym_pct}% overhead)")
+        if plan.overhead_thresholds:
+            parts = [f"s={t['seq_len']}:{t['threshold']:.2f}"
+                     for t in plan.overhead_thresholds]
+            print(f"    T(s):  {',  '.join(parts)}")
+        print()
+
+        crosses = sorted(
+            [c for c in plan.contention_table if c["p50_cross"] or c["p90_cross"]],
+            key=lambda x: (x["concurrency"], x["seq_len"]))
+        n_total = len(plan.contention_table)
+        n_cross = len(crosses)
+        n_no = n_total - n_cross
+
+        print("  CROSSOVER ANALYSIS")
+        if crosses:
+            for c in crosses:
+                sig = c.get("significant")
+                sig_str = "" if sig is None else (" sig" if sig else " ~noise")
+                p50_w = "CROSS" if c["p50_cross"] else "no"
+                p90_w = "CROSS" if c["p90_cross"] else "no"
+                mono_cv = c["mono_cv"]
+                disagg_cv = c["disagg_cv"]
+                cv_str = ""
+                if mono_cv is not None and disagg_cv is not None:
+                    cv_str = f"  CV: {disagg_cv:.0%} vs {mono_cv:.0%}"
+                above_cstar = ""
+                if plan.critical_concurrency > 0 and c["concurrency"] > plan.critical_concurrency:
+                    above_cstar = " [above c*]"
+                print(f"    c={c['concurrency']}, s={c['seq_len']} ({c['config']}){above_cstar}:")
+                print(f"      R={c['contention_ratio']:.2f} vs T={c['threshold']:.2f}{sig_str}  "
+                      f"p50: {p50_w}  p90: {p90_w}{cv_str}")
+            if n_no > 0:
+                print(f"    No crossover: {n_no}/{n_total} conditions")
+        else:
+            print(f"    No crossover at any condition ({n_total} tested)")
+        print()
+
+    else:
+        print(f"  Mono TTFT:   {plan.mono_est_ttft_ms}ms (c=1)")
+        print(f"  Disagg TTFT: {plan.disagg_est_ttft_ms}ms (c=1)")
+        if plan.mono_est_ttft_ms > 0:
+            overhead = plan.disagg_est_ttft_ms - plan.mono_est_ttft_ms
+            overhead_pct = overhead / plan.mono_est_ttft_ms * 100
+            print(f"  Overhead:    {overhead:.0f}ms ({overhead_pct:+.0f}%)")
+            if plan.overhead_asymptote > 0:
+                asym_pct = round((plan.overhead_asymptote - 1) * 100)
+                print(f"  T(∞):        {plan.overhead_asymptote:.2f} — "
+                      f"long-prompt floor is {asym_pct}% overhead")
+            print(f"  Threshold:   disagg needs >{overhead_pct:.0f}% contention "
+                  f"advantage to justify overhead")
+        print()
+
+    print(f"  GPU: {plan.mono_total_gpus} mono vs "
+          f"{plan.disagg_total_gpus} disagg "
+          f"({plan.disagg_prefill_gpus}P+{plan.disagg_decode_gpus}D)")
+    print(f"  Cost: ${plan.mono_cost_per_hr:.2f}/hr vs "
+          f"${plan.disagg_cost_per_hr:.2f}/hr")
     print()
-    print(f"  Option A: MONOLITHIC")
-    print(f"    GPUs/instance={plan.mono_gpus_per_instance}, Instances={plan.mono_instances}")
-    print(f"    GPUs: {plan.mono_total_gpus}    Cost: ${plan.mono_cost_per_hr:.2f}/hr")
-    print(f"    Est. TTFT: {plan.mono_est_ttft_ms}ms    Throughput: {plan.mono_est_throughput:.2f} req/s")
-    slo_status = "MEETS SLO" if plan.mono_est_ttft_ms <= plan.target_ttft_ms else "EXCEEDS SLO"
-    print(f"    SLO: {slo_status}")
-    print()
-    print(f"  Option B: DISAGGREGATED ({plan.disagg_prefill_gpus}P + {plan.disagg_decode_gpus}D)")
-    print(f"    GPUs: {plan.disagg_total_gpus}    Cost: ${plan.disagg_cost_per_hr:.2f}/hr")
-    print(f"    Est. TTFT: {plan.disagg_est_ttft_ms}ms    Throughput: {plan.disagg_est_throughput:.2f} req/s")
-    slo_status = "MEETS SLO" if plan.disagg_est_ttft_ms <= plan.target_ttft_ms else "EXCEEDS SLO"
-    print(f"    SLO: {slo_status}")
-    print()
+
     print(f"  RECOMMENDATION: {plan.recommendation}")
     for r in plan.reasoning:
         print(f"    - {r}")
@@ -528,7 +916,13 @@ def save_plan(plan: CapacityPlan, path: Path):
         "disagg": {"gpus": plan.disagg_total_gpus, "ttft_ms": plan.disagg_est_ttft_ms,
                    "throughput": plan.disagg_est_throughput, "cost_hr": plan.disagg_cost_per_hr},
         "recommendation": plan.recommendation, "confidence": plan.confidence,
-        "reasoning": plan.reasoning,
+        "reasoning": plan.reasoning, "crossovers": plan.crossovers,
+        "contention_table": plan.contention_table,
+        "overhead_asymptote": plan.overhead_asymptote,
+        "overhead_thresholds": plan.overhead_thresholds,
+        "measured_conditions": plan.measured_conditions,
+        "critical_concurrency": plan.critical_concurrency,
+        "mono_cv_by_concurrency": plan.mono_cv_by_concurrency,
     }, indent=2))
 
 
@@ -542,6 +936,8 @@ if __name__ == "__main__":
     parser.add_argument("--provider", default="aws", help="Cloud provider for pricing (default: aws)")
     parser.add_argument("--seq-len", type=int, default=128,
                         help="Prompt sequence length in tokens (default: 128)")
+    parser.add_argument("--data-dir", default="",
+                        help="Path to experiment data dir (enables data-backed recommendations)")
     parser.add_argument("--save", default="", help="Path to save plan JSON")
     args = parser.parse_args()
 
@@ -552,6 +948,7 @@ if __name__ == "__main__":
         gpu_type=args.gpu_type,
         provider=args.provider,
         seq_len=args.seq_len,
+        data_dir=args.data_dir,
     )
     print_plan(plan)
 

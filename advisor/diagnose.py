@@ -13,13 +13,15 @@ import sys
 from dataclasses import dataclass
 
 try:
-    from ._cluster import oc_safe, get_pods_full as get_pods, scrape_pod_metrics
+    from ._cluster import get_pods_full as get_pods
+    from ._cluster import oc_safe, scrape_pod_metrics
+    from .plan import ModelProfile, _estimate_kv_bytes, _estimate_nixl_ms
     from .probe import _send_probe
-    from .plan import _estimate_nixl_ms, _estimate_kv_bytes, ModelProfile
 except ImportError:
-    from _cluster import oc_safe, get_pods_full as get_pods, scrape_pod_metrics
-    from probe import _send_probe
-    from plan import _estimate_nixl_ms, _estimate_kv_bytes, ModelProfile
+    from _cluster import get_pods_full as get_pods  # type: ignore[no-redef]
+    from _cluster import oc_safe, scrape_pod_metrics  # type: ignore[no-redef]
+    from plan import ModelProfile, _estimate_kv_bytes, _estimate_nixl_ms  # type: ignore[no-redef]
+    from probe import _send_probe  # type: ignore[no-redef]
 
 
 @dataclass
@@ -101,7 +103,7 @@ def _check_image_mismatch(pods, ns) -> list[Issue]:
     vllm_pods = [p for p in pods if "prefill" in p.get("role", "") or "decode" in p.get("role", "")]
     if not vllm_pods:
         vllm_pods = pods
-    images = {}
+    images: dict[str, set[str]] = {}
     for p in vllm_pods:
         role = p.get("role", p["labels"].get("app", "unknown"))
         images.setdefault(role, set()).add(p["image"])
@@ -111,7 +113,7 @@ def _check_image_mismatch(pods, ns) -> list[Issue]:
         all_images.update(imgs)
 
     if len(all_images) > 1:
-        img_list = ", ".join(f"{role}: {list(imgs)[0]}" for role, imgs in images.items())
+        img_list = ", ".join(f"{role}: {next(iter(imgs))}" for role, imgs in images.items())
         target_image = sorted(all_images)[0]
         return [Issue(
             "critical",
@@ -258,11 +260,11 @@ def _check_nixl_config(prefill, ns) -> list[Issue]:
                 "Without this, NIXL uses localhost which prevents cross-pod "
                 "KV cache transfer. Set it to status.podIP via fieldRef.",
                 "",
-                f"# Add to prefill deployment env:\n"
-                f"# - name: VLLM_NIXL_SIDE_CHANNEL_HOST\n"
-                f"#   valueFrom:\n"
-                f"#     fieldRef:\n"
-                f"#       fieldPath: status.podIP",
+                "# Add to prefill deployment env:\n"
+                "# - name: VLLM_NIXL_SIDE_CHANNEL_HOST\n"
+                "#   valueFrom:\n"
+                "#     fieldRef:\n"
+                "#       fieldPath: status.podIP",
             )]
     return []
 
@@ -297,7 +299,7 @@ def _check_kv_expiration(pods, ns) -> list[Issue]:
 def _check_transfer_duration(pods, ns="default", model: str = "",
                              gpu_type: str = "t4") -> list[Issue]:
     """Check NIXL transfer duration for anomalies against expected model."""
-    threshold_ms = 500
+    threshold_ms: float = 500
     try:
         profile = ModelProfile(model_id=model) if model else ModelProfile(model_id="")
         kv_bytes = _estimate_kv_bytes(profile)
@@ -311,8 +313,8 @@ def _check_transfer_duration(pods, ns="default", model: str = "",
         body = scrape_pod_metrics(p, ns)
         if not body:
             continue
-        transfer_sum = 0
-        transfer_count = 0
+        transfer_sum = 0.0
+        transfer_count = 0.0
         for line in body.split("\n"):
             if "nixl_transfer_duration_seconds_sum" in line and not line.startswith("#"):
                 try:
@@ -362,14 +364,14 @@ def _check_probe_health(ns, model, decode_url="", prefill_host="") -> list[Issue
 def print_diagnosis(issues: list[Issue]):
     """Print diagnosis results to console."""
     if not issues:
-        print(f"\n  ALL CHECKS PASSED -- no issues detected.\n")
+        print("\n  ALL CHECKS PASSED -- no issues detected.\n")
         return
 
     print(f"\n{'='*60}")
     print(f"  DIAGNOSIS: {len(issues)} issue(s) found")
     print(f"{'='*60}")
 
-    for i, issue in enumerate(issues, 1):
+    for _i, issue in enumerate(issues, 1):
         sev = {"critical": "CRIT", "warning": "WARN", "info": "INFO"}[issue.severity]
         print(f"\n  [{sev}] {issue.title}")
         print(f"  Evidence: {issue.evidence}")
@@ -379,7 +381,7 @@ def print_diagnosis(issues: list[Issue]):
             print(f"  Ref:      {issue.reference}")
         print(f"  Fix:      {issue.fix}")
         if issue.auto_fixable:
-            print(f"            (auto-fixable: copy-paste the command above)")
+            print("            (auto-fixable: copy-paste the command above)")
 
     print(f"\n{'='*60}\n")
 

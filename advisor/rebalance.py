@@ -16,9 +16,11 @@ import time
 from dataclasses import dataclass, field
 
 try:
-    from ._cluster import get_pods_full as get_pods, scrape_pod_metrics
+    from ._cluster import get_pods_full as get_pods
+    from ._cluster import scrape_pod_metrics
 except ImportError:
-    from _cluster import get_pods_full as get_pods, scrape_pod_metrics
+    from _cluster import get_pods_full as get_pods  # type: ignore[no-redef]
+    from _cluster import scrape_pod_metrics  # type: ignore[no-redef]
 
 
 @dataclass
@@ -155,7 +157,7 @@ def rebalance(namespace: str) -> RebalanceResult:
 def rebalance_watch(namespace: str, interval_s: float = 15, duration_s: float = 300):
     """Watch mode: scrape metrics over time and predict when scaling is needed."""
     print(f"\n{'='*60}")
-    print(f"  PREDICTIVE P/D SCALING (watch mode)")
+    print("  PREDICTIVE P/D SCALING (watch mode)")
     print(f"{'='*60}")
     print(f"  Namespace: {namespace}")
     print(f"  Interval: {interval_s}s, Duration: {duration_s}s")
@@ -223,7 +225,7 @@ def rebalance_watch(namespace: str, interval_s: float = 15, duration_s: float = 
 
 def print_rebalance(r: RebalanceResult):
     print(f"\n{'='*60}")
-    print(f"  P/D RATIO ANALYSIS")
+    print("  P/D RATIO ANALYSIS")
     print(f"{'='*60}")
     print(f"  Current: {r.prefill_count}P + {r.decode_count}D")
     print()

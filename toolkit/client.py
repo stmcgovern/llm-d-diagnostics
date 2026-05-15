@@ -270,8 +270,10 @@ def build_prompt(target_tokens, cache_bust=None):
     reps = max(1, target_tokens // 10)
     if cache_bust is None:
         return " ".join([BASE_SENTENCE] * reps)
+    import hashlib
     import random
-    rng = random.Random(hash(cache_bust))
+    seed = int(hashlib.sha256(str(cache_bust).encode()).hexdigest()[:16], 16)
+    rng = random.Random(seed)
     words = [rng.choice(_WORD_POOL) for _ in range(target_tokens)]
     return " ".join(words)
 
@@ -751,7 +753,7 @@ def oc(*args, timeout=60):
     """
     import subprocess
     r = subprocess.run(
-        ["oc"] + list(args), capture_output=True, text=True, timeout=timeout,
+        ["oc", *list(args)], capture_output=True, text=True, timeout=timeout,
     )
     if r.returncode != 0:
         raise RuntimeError(f"oc {' '.join(args)}: {r.stderr.strip()[:200]}")
@@ -762,7 +764,7 @@ def oc_safe(*args, timeout=60):
     """Run an ``oc`` CLI command, returning (stdout, stderr) without raising."""
     import subprocess
     r = subprocess.run(
-        ["oc"] + list(args), capture_output=True, text=True, timeout=timeout,
+        ["oc", *list(args)], capture_output=True, text=True, timeout=timeout,
     )
     return r.stdout.strip(), r.stderr.strip()
 

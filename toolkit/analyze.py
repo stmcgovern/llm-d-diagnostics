@@ -1890,6 +1890,369 @@ def analyze_exp7(data_dir):
         print()
 
 
+# ── Experiment 11: Throughput vs Prompt Length ────────────────────────────────
+
+def analyze_exp11(data_dir):
+    """Experiment 11: Throughput vs Prompt Length — Crossover Detection."""
+    rows = load_csv(os.path.join(data_dir, "exp11-results.csv"))
+    if not rows:
+        print("  No data found")
+        return
+
+    ok = [r for r in rows if get_status(r) == 200]
+    errs = len(rows) - len(ok)
+    if errs:
+        print(f"  Data quality: {errs}/{len(rows)} errors ({errs/len(rows):.0%})")
+    else:
+        print(f"  Data quality: {len(rows)} rows, 0 errors")
+    print()
+
+    configs = sorted(set(r["config"] for r in ok))
+    concurrencies = sorted(set(safe_int(r["concurrency"]) for r in ok))
+    prompt_lens = sorted(set(safe_int(r["prompt_tokens_target"]) for r in ok))
+
+    by_key = defaultdict(list)
+    for r in ok:
+        key = (r["config"], safe_int(r["concurrency"]), safe_int(r["prompt_tokens_target"]))
+        by_key[key].append(safe_float(r["ttft_ms"]))
+
+    for conc in concurrencies:
+        print(f"  TTFT by config (concurrency={conc}):")
+        print(f"  {'Config':>12} | {'Prompt':>6} | {'n':>4} | {'p50':>8} | "
+              f"{'p90':>8} | {'CV':>5} | {'95%CI':>18}")
+        print(f"  {'-'*12}-+-{'-'*6}-+-{'-'*4}-+-{'-'*8}-+-"
+              f"{'-'*8}-+-{'-'*5}-+-{'-'*18}")
+
+        for cfg in configs:
+            for pt in prompt_lens:
+                vals = by_key.get((cfg, conc, pt), [])
+                if not vals:
+                    continue
+                s = stats(vals)
+                print(f"  {cfg:>12} | {pt:>6} | {s['n']:>4} | {s['p50']:>7.1f}ms | "
+                      f"{s['p90']:>7.1f}ms | {s['cv']:>.3f} | "
+                      f"[{s['ci95_lo']:.1f}, {s['ci95_hi']:.1f}]")
+        print()
+
+    baseline_cfg = "BASELINE"
+    disagg_cfgs = [c for c in configs if c != baseline_cfg]
+
+    print("  Disagg overhead (% slower than BASELINE):")
+    print(f"  {'Concurrency':>12} | {'Prompt':>6}", end="")
+    for dc in disagg_cfgs:
+        print(f" | {dc:>12}", end="")
+    print()
+    print(f"  {'-'*12}-+-{'-'*6}", end="")
+    for _ in disagg_cfgs:
+        print(f"-+-{'-'*12}", end="")
+    print()
+
+    crossovers = []
+    for conc in concurrencies:
+        for pt in prompt_lens:
+            bl_vals = by_key.get((baseline_cfg, conc, pt), [])
+            if not bl_vals:
+                continue
+            bl_med = stats(bl_vals)["median"]
+            row_str = f"  {conc:>12} | {pt:>6}"
+            for dc in disagg_cfgs:
+                dc_vals = by_key.get((dc, conc, pt), [])
+                if not dc_vals or bl_med == 0:
+                    row_str += f" | {'':>12}"
+                    continue
+                dc_med = stats(dc_vals)["median"]
+                overhead = (dc_med - bl_med) / bl_med * 100
+                marker = " *" if overhead < 0 else ""
+                row_str += f" | {overhead:>+10.1f}%{marker}"
+                if overhead < 0:
+                    crossovers.append((conc, pt, dc, overhead))
+            print(row_str)
+    print()
+
+    if crossovers:
+        print("  CROSSOVER DETECTED (* = disagg faster than mono):")
+        for conc, pt, dc, overhead in crossovers:
+            print(f"    c={conc}, {pt} tokens, {dc}: {overhead:+.1f}%")
+        print()
+    else:
+        print("  No crossover detected: mono wins at all conditions.")
+        print()
+
+    if len(concurrencies) >= 2:
+        c_lo, c_hi = concurrencies[0], concurrencies[-1]
+        print(f"  Concurrency scaling (TTFT ratio c={c_hi} / c={c_lo}):")
+        for cfg in configs:
+            for pt in prompt_lens:
+                lo_vals = by_key.get((cfg, c_lo, pt), [])
+                hi_vals = by_key.get((cfg, c_hi, pt), [])
+                if lo_vals and hi_vals:
+                    lo_med = stats(lo_vals)["median"]
+                    hi_med = stats(hi_vals)["median"]
+                    ratio = hi_med / lo_med if lo_med > 0 else 0
+                    print(f"    {cfg:>12} @ {pt:>5}tok: {lo_med:.0f}ms → "
+                          f"{hi_med:.0f}ms ({ratio:.1f}x)")
+        print()
+
+
+# ── Experiment 12: Throughput vs Output Length ────────────────────────────────
+
+def analyze_exp12(data_dir):
+    """Experiment 12: Throughput vs Output Length — Decode-Dominated Regime."""
+    rows = load_csv(os.path.join(data_dir, "exp12-results.csv"))
+    if not rows:
+        print("  No data found")
+        return
+
+    ok = [r for r in rows if get_status(r) == 200]
+    errs = len(rows) - len(ok)
+    if errs:
+        print(f"  Data quality: {errs}/{len(rows)} errors ({errs/len(rows):.0%})")
+    else:
+        print(f"  Data quality: {len(rows)} rows, 0 errors")
+    print()
+
+    configs = sorted(set(r["config"] for r in ok))
+    max_tokens_vals = sorted(set(safe_int(r["max_tokens"]) for r in ok))
+
+    by_key = defaultdict(lambda: {"ttft": [], "total": []})
+    for r in ok:
+        key = (r["config"], safe_int(r["max_tokens"]))
+        by_key[key]["ttft"].append(safe_float(r["ttft_ms"]))
+        by_key[key]["total"].append(safe_float(r["total_ms"]))
+
+    print(f"  {'Config':>12} | {'MaxTok':>6} | {'n':>4} | {'TTFT p50':>9} | "
+          f"{'Total p50':>10} | {'Decode p50':>10} | {'CV(total)':>9}")
+    print(f"  {'-'*12}-+-{'-'*6}-+-{'-'*4}-+-{'-'*9}-+-"
+          f"{'-'*10}-+-{'-'*10}-+-{'-'*9}")
+
+    for cfg in configs:
+        for mt in max_tokens_vals:
+            d = by_key.get((cfg, mt))
+            if not d or not d["ttft"]:
+                continue
+            s_ttft = stats(d["ttft"])
+            s_total = stats(d["total"])
+            decode_ms = s_total["median"] - s_ttft["median"]
+            print(f"  {cfg:>12} | {mt:>6} | {s_ttft['n']:>4} | "
+                  f"{s_ttft['median']:>7.1f}ms | {s_total['median']:>8.1f}ms | "
+                  f"{decode_ms:>8.1f}ms | {s_total['cv']:>.3f}")
+    print()
+
+    baseline_cfg = "BASELINE"
+    if baseline_cfg in configs:
+        print("  Disagg overhead fraction of total request time:")
+        for mt in max_tokens_vals:
+            bl = by_key.get((baseline_cfg, mt))
+            if not bl or not bl["total"]:
+                continue
+            bl_total = stats(bl["total"])["median"]
+            for cfg in configs:
+                if cfg == baseline_cfg:
+                    continue
+                d = by_key.get((cfg, mt))
+                if not d or not d["total"]:
+                    continue
+                cfg_total = stats(d["total"])["median"]
+                overhead = cfg_total - bl_total
+                pct_of_total = overhead / cfg_total * 100 if cfg_total > 0 else 0
+                print(f"    {cfg} @ max_tokens={mt}: overhead={overhead:.0f}ms "
+                      f"({pct_of_total:.0f}% of total)")
+        print()
+
+
+# ── Experiment 13: Saturation Ceiling ─────────────────────────────────────────
+
+def analyze_exp13(data_dir):
+    """Experiment 13: Saturation Ceiling — Max Sustainable Throughput."""
+    rows = load_csv(os.path.join(data_dir, "exp13-results.csv"))
+    if not rows:
+        print("  No data found")
+        return
+
+    configs = sorted(set(r["config"] for r in rows))
+    concurrencies = sorted(set(safe_int(r["concurrency"]) for r in rows))
+
+    print(f"  {'Config':>12} | {'Conc':>5} | {'Total':>5} | {'OK':>4} | "
+          f"{'Err%':>5} | {'TTFT p50':>9} | {'Goodput':>10}")
+    print(f"  {'-'*12}-+-{'-'*5}-+-{'-'*5}-+-{'-'*4}-+-"
+          f"{'-'*5}-+-{'-'*9}-+-{'-'*10}")
+
+    prev_goodput = {}
+    for cfg in configs:
+        for conc in concurrencies:
+            cfg_rows = [r for r in rows
+                        if r["config"] == cfg
+                        and safe_int(r["concurrency"]) == conc]
+            if not cfg_rows:
+                continue
+
+            ok_rows = [r for r in cfg_rows if get_status(r) == 200]
+            total_n = len(cfg_rows)
+            ok_n = len(ok_rows)
+            err_pct = (total_n - ok_n) / total_n * 100 if total_n > 0 else 0
+
+            ttft_vals = [safe_float(r["ttft_ms"]) for r in ok_rows]
+            s = stats(ttft_vals)
+            total_vals = [safe_float(r["total_ms"]) for r in ok_rows]
+            s_total = stats(total_vals)
+            goodput = ok_n / (s_total["max"] / 1000) if s_total.get("max", 0) > 0 else 0
+
+            marker = ""
+            if err_pct > 10:
+                marker = " SATURATED"
+            elif cfg in prev_goodput and goodput < prev_goodput[cfg] * 0.9:
+                marker = " DECLINING"
+
+            prev_goodput[cfg] = goodput
+
+            if s["n"] > 0:
+                print(f"  {cfg:>12} | {conc:>5} | {total_n:>5} | {ok_n:>4} | "
+                      f"{err_pct:>4.0f}% | {s['p50']:>7.1f}ms | "
+                      f"{goodput:>8.1f} r/s{marker}")
+            else:
+                print(f"  {cfg:>12} | {conc:>5} | {total_n:>5} | {ok_n:>4} | "
+                      f"{err_pct:>4.0f}% | {'N/A':>9} | {'N/A':>10}{marker}")
+    print()
+
+    print("  Max sustainable throughput per config:")
+    for cfg in configs:
+        best_gp = 0
+        best_conc = 0
+        for conc in concurrencies:
+            cfg_rows = [r for r in rows
+                        if r["config"] == cfg
+                        and safe_int(r["concurrency"]) == conc]
+            ok_rows = [r for r in cfg_rows if get_status(r) == 200]
+            err_pct = (len(cfg_rows) - len(ok_rows)) / len(cfg_rows) * 100 if cfg_rows else 100
+            if err_pct > 10:
+                continue
+            total_vals = [safe_float(r["total_ms"]) for r in ok_rows]
+            s_total = stats(total_vals)
+            if s_total.get("max", 0) > 0:
+                gp = len(ok_rows) / (s_total["max"] / 1000)
+                if gp > best_gp:
+                    best_gp = gp
+                    best_conc = conc
+        if best_gp > 0:
+            print(f"    {cfg}: {best_gp:.1f} req/s at c={best_conc}")
+        else:
+            print(f"    {cfg}: no error-free data")
+    print()
+
+
+# ── Experiment 14: Overhead Decomposition Under Load ─────────────────────────
+
+def analyze_exp14(data_dir):
+    """Experiment 14: Overhead Decomposition Under Load — Sidecar vs NIXL."""
+    rows = load_csv(os.path.join(data_dir, "exp14-results.csv"))
+    if not rows:
+        print("  No data found")
+        return
+
+    ok = [r for r in rows if get_status(r) == 200]
+    errs = len(rows) - len(ok)
+    if errs:
+        print(f"  Data quality: {errs}/{len(rows)} errors ({errs/len(rows):.0%})")
+    else:
+        print(f"  Data quality: {len(rows)} rows, 0 errors")
+
+    concurrency = safe_int(ok[0].get("concurrency", "1")) if ok else 1
+    print(f"  Concurrency: {concurrency}")
+    print()
+
+    configs = sorted(set(r["config"] for r in ok))
+    prompt_lens = sorted(set(safe_int(r["prompt_tokens_target"]) for r in ok))
+
+    by_key = defaultdict(list)
+    for r in ok:
+        key = (r["config"], safe_int(r["prompt_tokens_target"]))
+        by_key[key].append(safe_float(r["ttft_ms"]))
+
+    # Per-config TTFT table
+    print(f"  {'Config':>22} | {'Prompt':>6} | {'n':>4} | {'p50':>8} | "
+          f"{'p90':>8} | {'CV':>5}")
+    print(f"  {'-'*22}-+-{'-'*6}-+-{'-'*4}-+-{'-'*8}-+-"
+          f"{'-'*8}-+-{'-'*5}")
+
+    for cfg in configs:
+        for pt in prompt_lens:
+            vals = by_key.get((cfg, pt), [])
+            if not vals:
+                continue
+            s = stats(vals)
+            print(f"  {cfg:>22} | {pt:>6} | {s['n']:>4} | {s['p50']:>7.1f}ms | "
+                  f"{s['p90']:>7.1f}ms | {s['cv']:>.3f}")
+    print()
+
+    # Decomposition table (requires configs A, B, C, D)
+    has_a = any(c.startswith("A-") for c in configs)
+    has_b = any(c.startswith("B-") for c in configs)
+    has_c = any(c.startswith("C-") for c in configs)
+    has_d = any(c.startswith("D-") for c in configs)
+
+    cfg_a = next((c for c in configs if c.startswith("A-")), None)
+    cfg_b = next((c for c in configs if c.startswith("B-")), None)
+    cfg_c = next((c for c in configs if c.startswith("C-")), None)
+    cfg_d = next((c for c in configs if c.startswith("D-")), None)
+
+    if has_b and has_c and has_d:
+        print("  Overhead Decomposition (median TTFT):")
+        print(f"  {'Prompt':>6} | {'Sidecar(C-B)':>13} | {'NIXL(D-C)':>12} | "
+              f"{'Total(D-B)':>12}")
+        print(f"  {'-'*6}-+-{'-'*13}-+-{'-'*12}-+-{'-'*12}")
+
+        sidecar_vals = []
+        nixl_vals = []
+        for pt in prompt_lens:
+            b_med = stats(by_key.get((cfg_b, pt), []))
+            c_med = stats(by_key.get((cfg_c, pt), []))
+            d_med = stats(by_key.get((cfg_d, pt), []))
+
+            if b_med["n"] == 0 or c_med["n"] == 0 or d_med["n"] == 0:
+                continue
+
+            sidecar = c_med["median"] - b_med["median"]
+            nixl = d_med["median"] - c_med["median"]
+            total = d_med["median"] - b_med["median"]
+
+            sidecar_vals.append(sidecar)
+            nixl_vals.append((pt, nixl))
+
+            print(f"  {pt:>6} | {sidecar:>11.0f}ms | {nixl:>10.0f}ms | "
+                  f"{total:>10.0f}ms")
+        print()
+
+        # Compare to advisor constants
+        if sidecar_vals:
+            avg_sidecar = sum(sidecar_vals) / len(sidecar_vals)
+            print("  Advisor comparison:")
+            print(f"    Sidecar overhead:  measured={avg_sidecar:.0f}ms  "
+                  f"advisor=12ms (SCALING_SIDECAR_MS)")
+
+        if nixl_vals and len(nixl_vals) >= 3:
+            xs = [float(pt) for pt, _ in nixl_vals]
+            ys = [v for _, v in nixl_vals]
+            r = pearson_r(xs, ys)
+            print(f"    NIXL linearity:    Pearson r={r:.3f} "
+                  f"({'linear' if abs(r) > 0.95 else 'NON-LINEAR'})")
+            if abs(r) <= 0.95:
+                peak_pt, peak_val = max(nixl_vals, key=lambda x: x[1])
+                print(f"    NIXL peaks at {peak_pt} tokens ({peak_val:.0f}ms), "
+                      "then drops — likely prefill pipeline amortization under load")
+        print()
+
+    if has_a and has_b:
+        print("  Pod comparison (A=prefill GPU, B=decode GPU):")
+        for pt in prompt_lens:
+            a = stats(by_key.get((cfg_a, pt), []))
+            b = stats(by_key.get((cfg_b, pt), []))
+            if a["n"] > 0 and b["n"] > 0:
+                diff_pct = (a["median"] - b["median"]) / b["median"] * 100 if b["median"] > 0 else 0
+                print(f"    {pt:>5}tok: prefill={a['median']:.0f}ms, "
+                      f"decode={b['median']:.0f}ms ({diff_pct:+.0f}%)")
+        print()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1909,6 +2272,10 @@ def main():
         ("Experiment 5: Sequence Length Sweep", "exp5-results.csv", analyze_exp5),
         ("Experiment 6: Saturation Profiling", "exp6-results.csv", analyze_exp6),
         ("Experiment 7: Mixed Workload", "exp7-results.csv", analyze_exp7),
+        ("Experiment 11: Throughput vs Prompt Length", "exp11-results.csv", analyze_exp11),
+        ("Experiment 12: Throughput vs Output Length", "exp12-results.csv", analyze_exp12),
+        ("Experiment 13: Saturation Ceiling", "exp13-results.csv", analyze_exp13),
+        ("Experiment 14: Overhead Under Load", "exp14-results.csv", analyze_exp14),
     ]
 
     print("llm-d Diagnostics — Analysis")

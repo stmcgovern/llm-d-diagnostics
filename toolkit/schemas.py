@@ -328,6 +328,39 @@ class Exp10Row(TypedDict):
     error: str
 
 
+class Exp11Row(TypedDict):
+    """Throughput scaling (exp11/exp12/exp13). Shared schema."""
+    experiment: str
+    config: str
+    prompt_tokens_target: str
+    max_tokens: str
+    concurrency: str
+    run: str
+    ttft_ms: str
+    total_ms: str
+    status_code: str
+    prompt_tokens_actual: str
+    completion_tokens: str
+    target: str
+    error: str
+
+
+class Exp14Row(TypedDict):
+    """Overhead decomposition under concurrent load."""
+    experiment: str
+    config: str
+    pod: str
+    prompt_tokens_target: str
+    concurrency: str
+    run: str
+    ttft_ms: str
+    total_ms: str
+    status_code: str
+    prompt_tokens_actual: str
+    completion_tokens: str
+    error: str
+
+
 # ── Typed CSV Writer ────────────────────────────────────────────────────────
 
 class TypedCSVWriter:

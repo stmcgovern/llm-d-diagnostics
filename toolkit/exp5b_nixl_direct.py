@@ -27,6 +27,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
+from metrics_collector import parse_prometheus_text, scrape_metrics
+
 from client import (
     DATA_DIR,
     MAX_TOKENS,
@@ -36,12 +38,10 @@ from client import (
     discover_pod_ips,
     dot,
     env,
-    prefill_pod_url_by_ip,
     print_config,
     progress,
     write_run_info,
 )
-from metrics_collector import scrape_metrics, parse_prometheus_text
 from schemas import Exp5bRow, TypedCSVWriter
 
 SWEEP_LENGTHS = [int(x) for x in env("SWEEP_LENGTHS", "10,50,100,250,500,1000").split(",")]

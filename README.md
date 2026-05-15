@@ -1,8 +1,8 @@
 # llm-d Diagnostics Toolkit
 
 Portable diagnostics for [llm-d](https://github.com/llm-d/llm-d)
-disaggregated inference deployments. Point it at a cluster, run
-experiments, get a performance characterization.
+disaggregated (prefill/decode) inference deployments. Point it at a
+cluster, run experiments, get a performance characterization.
 
 Python 3.8+, zero external dependencies. Runs inside any Kubernetes
 cluster via a test-client pod. Requires `oc` (OpenShift CLI) or
@@ -34,9 +34,9 @@ confidence intervals, and flags data quality issues.
 | Command | What it measures |
 |---------|-----------------|
 | `latency` | Per-request overhead of disaggregation |
-| `decompose` | Breakdown: sidecar routing vs NIXL transfer |
+| `decompose` | Breakdown: routing sidecar vs NIXL (KV cache transfer) overhead |
 | `throughput` | Scaling under concurrent load |
-| `isolation` | Whether P/D protects light requests from heavy prefills |
+| `isolation` | Whether prefill/decode separation protects light requests from heavy prefills |
 | `seqlen` | Transfer cost vs prompt length |
 | `saturation` | QPS at which each topology collapses |
 | `mixed` | Realistic mixed-length workload comparison |
@@ -83,8 +83,8 @@ The analyzer produces:
 - Outlier detection and data quality flags
 - Overhead attribution (sidecar, transfer, decode)
 
-See [clusters/rdu3-t4x3/](clusters/rdu3-t4x3/) for an example of what
-a complete assessment looks like.
+Run `characterize` and `analyze` against your cluster to produce a
+complete assessment.
 
 ## Simulation Mode
 

@@ -18,6 +18,10 @@
 #     mixed         Mixed workload (realistic traffic)
 #     prefix-cache  KV cache hit rates across requests and pods
 #     kv-eviction   KV cache persistence under delay and pressure
+#     tput-seqlen   Throughput vs prompt length
+#     tput-outlen   Throughput vs output length
+#     tput-sat      Saturation ceiling (high concurrency)
+#     overhead-load Overhead decomposition under concurrent load
 #     fault         Fault tolerance (kills pods — destructive)
 #     model-load    Cold start time (kills pods — destructive)
 #
@@ -26,6 +30,12 @@
 #     health        Continuous health monitoring + trend detection
 #     plan          GPU capacity planning + cost model
 #     rebalance     P/D ratio recommendation + watch mode
+#
+#   Infrastructure:
+#     deploy        Deploy P/D topology from env.sh
+#     undeploy      Tear down deployment (--keep-pvc to keep model cache)
+#     sweep         Run experiments across multiple models (JSON config)
+#                   Usage: ./toolkit/run.sh sweeps/kv-ratio.json sweep
 #
 #   Utilities:
 #     analyze       Statistical analysis of collected data (local)
@@ -37,11 +47,11 @@
 #   2. Cluster env is at <cluster-dir>/env.sh
 #
 # Examples:
-#   ./toolkit/run.sh clusters/rdu3-t4x3 characterize
-#   ./toolkit/run.sh clusters/rdu3-t4x3 latency
-#   ./toolkit/run.sh clusters/rdu3-t4x3 fault-test
-#   ./toolkit/run.sh clusters/rdu3-t4x3 fault 4a 4h --skip-control
-#   ./toolkit/run.sh clusters/rdu3-t4x3 analyze
+#   ./toolkit/run.sh clusters/my-cluster characterize
+#   ./toolkit/run.sh clusters/my-cluster latency
+#   ./toolkit/run.sh clusters/my-cluster fault-test
+#   ./toolkit/run.sh clusters/my-cluster fault 4a 4h --skip-control
+#   ./toolkit/run.sh clusters/my-cluster analyze
 
 set -euo pipefail
 
@@ -49,6 +59,12 @@ CLUSTER_DIR="${1:?Usage: $0 <cluster-dir> <command>}"
 COMMAND="${2:-characterize}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Sweep takes a JSON config as first arg, not a cluster dir
+if [ "$COMMAND" = "sweep" ]; then
+    python3 "$REPO_ROOT/toolkit/sweep.py" "$CLUSTER_DIR" "${@:3}"
+    exit 0
+fi
 
 if [ ! -f "$CLUSTER_DIR/env.sh" ]; then
     echo "ERROR: $CLUSTER_DIR/env.sh not found"
@@ -122,8 +138,20 @@ print(f'{r.status}|{r.completion_tokens}|{r.error}')
 }
 
 # ── Run remote experiment ──────────────────────────────────────────────────
+# Discover pod IPs from host (where oc works) and pass as env vars.
+# This provides pod discovery without requiring RBAC inside test-client.
+PREFILL_IPS=$(oc get pods -l app=vllm-prefill -n "$NS" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{":"}{.status.podIP}{","}{end}' \
+    2>/dev/null | sed 's/,$//')
+DECODE_IPS=$(oc get pods -l app=vllm-decode -n "$NS" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{":"}{.status.podIP}{","}{end}' \
+    2>/dev/null | sed 's/,$//')
+
 REMOTE_ENV="MODEL=$MODEL NS=$NS DATA_DIR=$REMOTE_DIR/data PREFILL_HOST=$PREFILL_HOST"
+[ -n "$PREFILL_IPS" ] && REMOTE_ENV="$REMOTE_ENV PODS_VLLM_PREFILL=$PREFILL_IPS"
+[ -n "$DECODE_IPS" ] && REMOTE_ENV="$REMOTE_ENV PODS_VLLM_DECODE=$DECODE_IPS"
 [ -n "${SIM:-}" ] && REMOTE_ENV="$REMOTE_ENV SIM=$SIM"
+[ -n "${CONFIGS:-}" ] && REMOTE_ENV="$REMOTE_ENV CONFIGS=$CONFIGS"
 
 run_remote() {
     local label="$1"
@@ -204,6 +232,10 @@ run_experiment() {
             return 1
             ;;
         kv-eviction|exp10) run_single "KV Cache Eviction" exp10_kv_eviction.py ;;
+        tput-seqlen|exp11) run_single "Throughput vs Prompt Length" exp11_tput_seqlen.py ;;
+        tput-outlen|exp12) run_single "Throughput vs Output Length" exp12_tput_outlen.py ;;
+        tput-sat|exp13) run_single "Saturation Ceiling" exp13_tput_sat.py ;;
+        overhead-load|exp14) run_single "Overhead Under Load" exp14_overhead_load.py ;;
         *)
             echo "Unknown experiment: $1"
             return 1
@@ -249,7 +281,7 @@ case "$COMMAND" in
         echo ""
 
         # Forward remaining args for sub-experiment selection:
-        #   ./run.sh clusters/rdu3 fault 4a 4h --skip-control
+        #   ./run.sh clusters/my-cluster fault 4a 4h --skip-control
         shift 2  # remove cluster-dir and command
         python3 "$SCRIPT_DIR/exp4_fault.py" "$@"
 
@@ -281,7 +313,8 @@ case "$COMMAND" in
     # Individual experiments (old or new names)
     latency|exp1|decompose|exp1b|throughput|exp2|isolation|exp3|\
     seqlen|exp5|saturation|exp6|mixed|exp7|\
-    prefix-cache|exp8|kv-eviction|exp10)
+    prefix-cache|exp8|kv-eviction|exp10|\
+    tput-seqlen|exp11|tput-outlen|exp12|tput-sat|exp13|overhead-load|exp14)
         run_experiment "$COMMAND"
         ;;
 
@@ -304,6 +337,16 @@ case "$COMMAND" in
         exec "$0" "$CLUSTER_DIR" characterize
         ;;
 
+    # ── Infrastructure ────────────────────────────────────────────────────
+    deploy)
+        "$REPO_ROOT/scripts/deploy.sh" "$CLUSTER_DIR"
+        ;;
+
+    undeploy)
+        shift 2
+        "$REPO_ROOT/scripts/undeploy.sh" "$CLUSTER_DIR" "$@"
+        ;;
+
     # ── Advisory layer commands ────────────────────────────────────────────
     diagnose)
         shift 2  # remove cluster-dir and command
@@ -317,12 +360,18 @@ case "$COMMAND" in
 
     plan)
         shift 2
-        python3 "$REPO_ROOT/advisor/plan.py" "$@"
+        python3 "$REPO_ROOT/advisor/plan.py" --model "$MODEL" \
+            --gpu-type "${GPU_TYPE:-t4}" --data-dir "$DATA_DIR" "$@"
         ;;
 
     rebalance)
         shift 2
         python3 "$REPO_ROOT/advisor/rebalance.py" --namespace "$NS" "$@"
+        ;;
+
+    validate)
+        shift 2
+        python3 "$REPO_ROOT/advisor/validate.py" "$DATA_DIR" "$@"
         ;;
 
     *)
@@ -341,13 +390,22 @@ case "$COMMAND" in
         echo "  mixed           Mixed workload"
         echo "  prefix-cache    KV cache hit rates"
         echo "  kv-eviction     KV cache persistence under pressure"
+        echo "  tput-seqlen     Throughput vs prompt length"
+        echo "  tput-outlen     Throughput vs output length"
+        echo "  tput-sat        Saturation ceiling (high concurrency)"
+        echo "  overhead-load   Overhead decomposition under load"
         echo "  fault           Fault tolerance (destructive)"
         echo "  model-load      Cold start time (destructive)"
+        echo ""
+        echo "  deploy          Deploy P/D topology from env.sh"
+        echo "  undeploy        Tear down deployment (--keep-pvc to keep model cache)"
+        echo "  sweep           Multi-model sweep (./toolkit/run.sh config.json sweep)"
         echo ""
         echo "  diagnose        Root-cause diagnosis with fix commands"
         echo "  health          Continuous health monitoring"
         echo "  plan            GPU capacity planning"
         echo "  rebalance       P/D ratio recommendation"
+        echo "  validate        Validate advisor predictions against data"
         echo ""
         echo "  analyze         Run analysis on collected data"
         echo "  preflight       Verify cluster is ready"

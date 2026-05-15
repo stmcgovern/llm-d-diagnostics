@@ -9,13 +9,11 @@ All computation uses stdlib only (no numpy/scipy).
 
 Usage:
     python3 toolkit/scaling_model.py \\
-        clusters/rdu3-t4x3/data \\
-        clusters/rdu3-t4x3-phi3/data \\
-        clusters/rdu3-t4x5-phi3/data-v3/
+        clusters/my-cluster/data \\
+        clusters/my-cluster-v2/data
 
     python3 toolkit/scaling_model.py \\
-        clusters/rdu3-t4x3/data \\
-        clusters/rdu3-t4x3-phi3/data \\
+        clusters/my-cluster/data \\
         --predict llama-31b --gpu-decode H200 --gpu-prefill L40S
 """
 
@@ -28,7 +26,6 @@ import sys
 # ── Import shared stats from analyze.py ──────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
 from analyze import _t95, pearson_r, safe_float, safe_int, stats
-
 
 # ── Model architecture database ─────────────────────────────────
 
@@ -207,7 +204,7 @@ def load_exp5_paired(data_dir):
     transfer_by_len = {}  # seq_len → [D_i - C_i]
     prefill_by_len = {}   # seq_len → [A_i]
 
-    for (seq_len, run), configs in sorted(by_run.items()):
+    for (seq_len, _run), configs in sorted(by_run.items()):
         a = configs.get("A-prefill-direct")
         c = configs.get("C-sidecar-only")
         d = configs.get("D-disaggregated")
@@ -383,7 +380,7 @@ class ClusterRegression:
                 # effective_bandwidth = kv_bytes / slope_ms * 1000 (bytes/s)
                 eff_bw_gbs = (kv / (effective_bw / 1000)) / 1e9
                 print(f"    Effective transfer bandwidth: {eff_bw_gbs:.2f} GB/s")
-                print(f"      (includes protocol/serialization overhead)")
+                print("      (includes protocol/serialization overhead)")
 
 
 def extract_physical_coefficients(regressions):
@@ -449,7 +446,7 @@ def predict_for_model(coefficients, target_model_key, gpu_decode="T4",
     measured_gpu = GPUS["T4"]
 
     if not gpu_d or not gpu_p:
-        print(f"  ERROR: Unknown GPU")
+        print("  ERROR: Unknown GPU")
         return None
 
     target_kv = kv_bytes_per_token(target)
@@ -546,7 +543,7 @@ def cross_cluster_comparison(regressions):
     # Cross-model comparison (different models, same hardware)
     models = list(by_model.keys())
     if len(models) >= 2:
-        print(f"\n  Cross-model scaling:")
+        print("\n  Cross-model scaling:")
         print()
 
         # Use first regression per model for comparison
@@ -613,8 +610,8 @@ def cross_cluster_comparison(regressions):
             else:
                 print(f"    Transfer: INCONSISTENT — slope ratio ({tr_ratio:.2f}x) "
                       f"vs KV ratio ({kv_ratio:.2f}x), off by {tr_match:.0%}")
-                print(f"      Possible causes: protocol overhead variation, "
-                      f"memory bandwidth saturation, NIXL batching effects")
+                print("      Possible causes: protocol overhead variation, "
+                      "memory bandwidth saturation, NIXL batching effects")
 
             if pf_match < 0.3:
                 print(f"    Prefill:  CONSISTENT — slope ratio ({pf_ratio:.2f}x) "
@@ -622,8 +619,8 @@ def cross_cluster_comparison(regressions):
             else:
                 print(f"    Prefill:  INCONSISTENT — slope ratio ({pf_ratio:.2f}x) "
                       f"vs param ratio ({param_ratio:.2f}x), off by {pf_match:.0%}")
-                print(f"      Possible causes: different MFU, attention overhead, "
-                      f"memory bandwidth effects")
+                print("      Possible causes: different MFU, attention overhead, "
+                      "memory bandwidth effects")
 
 
 def print_predictions(predictions, target_model_key):
@@ -651,7 +648,7 @@ def print_predictions(predictions, target_model_key):
                   f"{pt['t_prefill_ms']:>9.1f}ms | {ratio:>10.1f}x | {marker}")
 
         if not crossover_found:
-            print(f"    → Prefill always dominates (disagg favorable)")
+            print("    → Prefill always dominates (disagg favorable)")
         print()
 
 

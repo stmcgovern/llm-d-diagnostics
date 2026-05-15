@@ -6,7 +6,7 @@ derived from exp6 empirical thresholds.  All cluster interaction
 """
 
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from rebalance import (
     DECODE_KV_CRITICAL,
@@ -19,7 +19,6 @@ from rebalance import (
     print_rebalance,
     rebalance,
 )
-
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
 

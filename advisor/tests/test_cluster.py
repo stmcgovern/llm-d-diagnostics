@@ -1,11 +1,10 @@
 """Tests for advisor/_cluster.py — oc wrapper (from toolkit) + pod discovery + metrics scraping."""
 
 import json
-import subprocess
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-from _cluster import oc, oc_safe, get_pods_full, scrape_pod_metrics
+from _cluster import get_pods_full, oc, oc_safe, scrape_pod_metrics
 
 
 class TestOc(unittest.TestCase):
@@ -47,7 +46,7 @@ class TestOcSafe(unittest.TestCase):
     @patch("subprocess.run")
     def test_does_not_raise_on_failure(self, mock_run):
         mock_run.return_value = MagicMock(returncode=127, stdout="", stderr="not found")
-        stdout, stderr = oc_safe("nonexistent")
+        _stdout, stderr = oc_safe("nonexistent")
         self.assertEqual(stderr, "not found")
 
 

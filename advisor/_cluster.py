@@ -6,7 +6,6 @@ reach the toolkit package, keeping the rest of the advisor code clean.
 
 Provides:
     oc, oc_safe        — re-exported from toolkit/client.py
-    send_streaming     — re-exported from toolkit/client.py
     SCALING_GPUS       — re-exported from toolkit/scaling_model.py
     get_pods_full      — advisor-specific full-metadata pod discovery
     scrape_pod_metrics — shared Prometheus scraping (HTTP + oc exec fallback)
@@ -22,9 +21,10 @@ _toolkit_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "t
 if _toolkit_dir not in sys.path:
     sys.path.insert(0, _toolkit_dir)
 
-from client import oc, oc_safe, send_streaming  # noqa: E402
-from scaling_model import GPUS as SCALING_GPUS  # noqa: E402
 
+from scaling_model import GPUS as SCALING_GPUS  # noqa: E402, F401
+
+from client import oc, oc_safe  # noqa: E402
 
 # ── Pod discovery ────────────────────────────────────────────────────────
 
