@@ -28,9 +28,10 @@ from analyze import get_status, load_csv, safe_float, safe_int, stats  # noqa: E
 
 from plan import (  # noqa: E402
     MEASURED_BASELINES,
-    SCALING_SIDECAR_MS,
     _estimate_kv_bytes,
     _estimate_nixl_ms,
+    _predict_contention_ratio,
+    _predict_delta_gamma,
     fetch_model_profile,
     plan_capacity,
 )
@@ -105,12 +106,14 @@ def get_predictions(model: str, gpu_type: str, seq_lens: list) -> dict:
         kv_bytes = _estimate_kv_bytes(profile)
         nixl_ms = _estimate_nixl_ms(kv_bytes, sl, gpu_type, profile.is_moe)
 
+        overhead_asym = (plan.overhead_asymptote if plan.overhead_asymptote > 0
+                         else 1 + nixl_ms / max(plan.mono_est_ttft_ms, 1))
         preds[sl] = {
             "mono_ttft_ms": plan.mono_est_ttft_ms,
             "disagg_ttft_ms": plan.disagg_est_ttft_ms,
             "confidence": plan.confidence,
             "nixl_ms": nixl_ms,
-            "sidecar_ms": SCALING_SIDECAR_MS,
+            "predicted_delta_gamma": _predict_delta_gamma(sl, overhead_asym),
         }
     return preds
 
@@ -145,19 +148,8 @@ def compare(predictions: dict, measurements: dict) -> list:
                     f"disagg_ttft({disagg_cfg})", sl, 1,
                     predicted, measured, err, _grade(err)))
 
-        cfg_b = next((k for k in exp14 if k[0].startswith("B-") and k[1] == sl), None)
         cfg_c = next((k for k in exp14 if k[0].startswith("C-") and k[1] == sl), None)
         cfg_d = next((k for k in exp14 if k[0].startswith("D-") and k[1] == sl), None)
-
-        if cfg_c and cfg_b:
-            measured_sidecar = exp14[cfg_c]["median"] - exp14[cfg_b]["median"]
-            predicted_sidecar = pred["sidecar_ms"]
-            err = ((predicted_sidecar - measured_sidecar) / max(abs(measured_sidecar), 1)
-                   * 100)
-            conc = 8
-            results.append(ValidationResult(
-                "sidecar_ms", sl, conc, predicted_sidecar,
-                measured_sidecar, err, _grade(err)))
 
         if cfg_d and cfg_c:
             measured_nixl = exp14[cfg_d]["median"] - exp14[cfg_c]["median"]
@@ -168,6 +160,28 @@ def compare(predictions: dict, measurements: dict) -> list:
             results.append(ValidationResult(
                 "nixl_ms", sl, conc, predicted_nixl,
                 measured_nixl, err, _grade(err)))
+
+        for disagg_cfg in ["DISAGG-1D", "DISAGG-2D"]:
+            for conc in sorted(set(k[1] for k in exp11 if k[1] > 1)):
+                bl_c1 = exp11.get(("BASELINE", 1, sl))
+                dg_c1 = exp11.get((disagg_cfg, 1, sl))
+                bl_cn = exp11.get(("BASELINE", conc, sl))
+                dg_cn = exp11.get((disagg_cfg, conc, sl))
+                if not all([bl_c1, dg_c1, bl_cn, dg_cn]):
+                    continue
+                if bl_c1["median"] <= 0 or dg_c1["median"] <= 0:
+                    continue
+                alpha_mono = bl_cn["median"] / bl_c1["median"]
+                alpha_disagg = dg_cn["median"] / dg_c1["median"]
+                if alpha_disagg <= 0:
+                    continue
+                measured_r = alpha_mono / alpha_disagg
+                predicted_r = _predict_contention_ratio(
+                    pred["predicted_delta_gamma"], conc)
+                err = (predicted_r - measured_r) / measured_r * 100
+                results.append(ValidationResult(
+                    f"R(c={conc},{disagg_cfg})", sl, conc,
+                    predicted_r, measured_r, err, _grade(err)))
 
     return results
 

@@ -2,6 +2,7 @@
 
 import csv
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -9,6 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from plan import (
+    CONTENTION_SCALE_A,
+    CONTENTION_SCALE_B,
     KV_BYTES_PER_TOKEN,
     MEASURED_BASELINES,
     MOE_NIXL_CORRECTION,
@@ -21,7 +24,12 @@ from plan import (
     _estimate_nixl_ms,
     _estimate_overhead_asymptote,
     _find_nearest_baselines,
+    _fit_measured_delta_gamma,
     _generate_recommendation,
+    _predict_contention_ratio,
+    _predict_crossover_c,
+    _predict_delta_gamma,
+    _predict_s_cross,
     _validate_profile,
     plan_capacity,
     save_plan,
@@ -380,7 +388,7 @@ class TestGenerateRecommendationBranches(unittest.TestCase):
         )
         _generate_recommendation(plan)
         reasoning = " ".join(plan.reasoning)
-        self.assertIn("run experiments", reasoning.lower())
+        self.assertIn("to measure", reasoning.lower())
 
     def test_experiment_no_crossover(self):
         """With experiment data but no crossover → MONOLITHIC."""
@@ -940,16 +948,16 @@ class TestPreExperimentHonesty(unittest.TestCase):
             gpu_type="t4", seq_len=500,
         )
         reasoning = " ".join(plan.reasoning)
-        self.assertIn("run experiments", reasoning.lower())
+        self.assertIn("to measure", reasoning.lower())
 
-    def test_no_data_dir_reports_contention_threshold(self):
+    def test_no_data_dir_reports_overhead(self):
         plan = plan_capacity(
             "microsoft/Phi-3-mini-4k-instruct",
             target_throughput=1.0, target_ttft_ms=99999,
             gpu_type="t4", seq_len=500,
         )
         reasoning = " ".join(plan.reasoning)
-        self.assertIn("contention advantage", reasoning.lower())
+        self.assertIn("overhead", reasoning.lower())
 
     def test_never_recommends_disagg_without_data(self):
         plan = plan_capacity(
@@ -1562,6 +1570,165 @@ class TestCriticalConcurrency(unittest.TestCase):
         self.assertTrue(len(p90_crosses) > 0)
         self.assertTrue(any(c["concurrency"] <= 4 for c in p90_crosses))
         self.assertIn("DISAGGREGATE", plan.recommendation)
+
+
+# ── R(c,s) = c^Δγ(s) power-law contention model ─────────────────────
+
+
+class TestPredictDeltaGamma(unittest.TestCase):
+
+    def test_long_sequence_positive(self):
+        # T(∞)=1.86, s=1000: -0.889*(1.86-1) + 0.144*ln(1000) ≈ -0.765 + 0.994 = 0.229
+        dg = _predict_delta_gamma(1000, 1.86)
+        self.assertGreater(dg, 0)
+        self.assertAlmostEqual(dg, 0.229, places=2)
+
+    def test_short_sequence_negative(self):
+        # T(∞)=1.86, s=50: -0.889*0.86 + 0.144*ln(50) ≈ -0.765 + 0.563 = -0.202
+        dg = _predict_delta_gamma(50, 1.86)
+        self.assertLess(dg, 0)
+
+    def test_low_overhead_more_positive(self):
+        dg_low = _predict_delta_gamma(500, 1.2)
+        dg_high = _predict_delta_gamma(500, 2.5)
+        self.assertGreater(dg_low, dg_high)
+
+    def test_unit_overhead(self):
+        # T(∞)=1.0 → A term is zero, only B·ln(s)
+        dg = _predict_delta_gamma(100, 1.0)
+        self.assertAlmostEqual(dg, CONTENTION_SCALE_B * math.log(100), places=3)
+
+
+class TestPredictContentionRatio(unittest.TestCase):
+
+    def test_c1_identity(self):
+        self.assertEqual(_predict_contention_ratio(0.3, 1), 1.0)
+
+    def test_positive_dg_grows(self):
+        # Δγ > 0 → R grows with c (disagg scales better)
+        r2 = _predict_contention_ratio(0.3, 2)
+        r8 = _predict_contention_ratio(0.3, 8)
+        self.assertGreater(r8, r2)
+        self.assertGreater(r2, 1.0)
+
+    def test_negative_dg_shrinks(self):
+        # Δγ < 0 → R shrinks with c (mono scales better)
+        r8 = _predict_contention_ratio(-0.2, 8)
+        self.assertLess(r8, 1.0)
+
+    def test_power_law(self):
+        # R(c) = c^Δγ
+        self.assertAlmostEqual(
+            _predict_contention_ratio(0.5, 4), 4 ** 0.5, places=5)
+
+
+class TestPredictCrossoverC(unittest.TestCase):
+
+    def test_basic(self):
+        # T=2.0, Δγ=0.5 → c = 2^(1/0.5) = 4
+        c = _predict_crossover_c(2.0, 0.5)
+        self.assertAlmostEqual(c, 4.0, places=1)
+
+    def test_negative_dg(self):
+        self.assertEqual(_predict_crossover_c(1.5, -0.1), float('inf'))
+
+    def test_zero_dg(self):
+        self.assertEqual(_predict_crossover_c(1.5, 0), float('inf'))
+
+    def test_threshold_one(self):
+        self.assertAlmostEqual(_predict_crossover_c(1.0, 0.5), 1.0)
+
+
+class TestPredictSCross(unittest.TestCase):
+
+    def test_basic(self):
+        # T(∞)=1.86 → s_cross = exp(C_A*(1.86-1)/C_B) = exp(0.889*0.86/0.144)
+        s = _predict_s_cross(1.86)
+        expected = math.exp(CONTENTION_SCALE_A * 0.86 / CONTENTION_SCALE_B)
+        self.assertAlmostEqual(s, expected, places=0)
+
+    def test_unit_overhead(self):
+        # T(∞)=1.0 → s_cross = exp(0) = 1
+        self.assertAlmostEqual(_predict_s_cross(1.0), 1.0, places=1)
+
+    def test_higher_overhead_higher_scross(self):
+        s_low = _predict_s_cross(1.5)
+        s_high = _predict_s_cross(2.5)
+        self.assertGreater(s_high, s_low)
+
+
+class TestFitMeasuredDeltaGamma(unittest.TestCase):
+
+    def test_perfect_power_law(self):
+        # R(c,s) = c^Δγ(s) with Δγ = -0.5 + 0.15·ln(s)
+        # At s=100: Δγ = -0.5 + 0.15*4.605 = 0.191
+        # At s=500: Δγ = -0.5 + 0.15*6.215 = 0.432
+        table = []
+        for s in [100, 500]:
+            dg = -0.5 + 0.15 * math.log(s)
+            for c in [2, 4, 8]:
+                r = c ** dg
+                table.append({"concurrency": c, "seq_len": s,
+                              "contention_ratio": r})
+        a, b, r2, dg_by_s = _fit_measured_delta_gamma(table)
+        self.assertAlmostEqual(a, -0.5, places=1)
+        self.assertAlmostEqual(b, 0.15, places=2)
+        self.assertGreater(r2, 0.95)
+
+    def test_insufficient_seq_lens(self):
+        # Only one seq_len → can't regress Δγ(s)
+        table = [
+            {"concurrency": 2, "seq_len": 100, "contention_ratio": 1.2},
+            {"concurrency": 4, "seq_len": 100, "contention_ratio": 1.4},
+            {"concurrency": 8, "seq_len": 100, "contention_ratio": 1.6},
+        ]
+        a, b, r2, _ = _fit_measured_delta_gamma(table)
+        self.assertEqual(b, 0.0)
+
+    def test_c1_entries_filtered(self):
+        table = []
+        for s in [100, 500]:
+            dg = 0.3
+            table.append({"concurrency": 1, "seq_len": s, "contention_ratio": 1.0})
+            for c in [2, 4, 8]:
+                table.append({"concurrency": c, "seq_len": s,
+                              "contention_ratio": c ** dg})
+        a, b, r2, _ = _fit_measured_delta_gamma(table)
+        # Δγ is constant at 0.3, so b should be ~0
+        self.assertAlmostEqual(b, 0.0, places=1)
+
+
+class TestExperimentCrossoverC(TestPlanFromExperiments):
+
+    def test_crossover_c_from_experiment(self):
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 100, [100] * 10)
+            + _make_exp11_rows("DISAGG-1D", 1, 100, [200] * 10)
+            + _make_exp11_rows("BASELINE", 2, 100, [250] * 10)
+            + _make_exp11_rows("DISAGG-1D", 2, 100, [450] * 10)
+            + _make_exp11_rows("BASELINE", 4, 100, [500] * 10)
+            + _make_exp11_rows("DISAGG-1D", 4, 100, [900] * 10)
+            + _make_exp11_rows("BASELINE", 1, 500, [500] * 10)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [800] * 10)
+            + _make_exp11_rows("BASELINE", 2, 500, [1200] * 10)
+            + _make_exp11_rows("DISAGG-1D", 2, 500, [1000] * 10)
+            + _make_exp11_rows("BASELINE", 4, 500, [2000] * 10)
+            + _make_exp11_rows("DISAGG-1D", 4, 500, [1500] * 10)
+            + _make_exp11_rows("BASELINE", 8, 500, [3000] * 10)
+            + _make_exp11_rows("DISAGG-1D", 8, 500, [2000] * 10)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct", target_throughput=1.0,
+            target_ttft_ms=99999, gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        self.assertEqual(plan.confidence, "experiment")
+        self.assertGreater(plan.predicted_delta_gamma, 0)
+        self.assertGreater(plan.measured_fit_r2, 0)
+        if plan.overhead_thresholds:
+            has_cross_c = any("predicted_crossover_c" in t
+                             for t in plan.overhead_thresholds)
+            self.assertTrue(has_cross_c)
 
 
 if __name__ == "__main__":

@@ -93,7 +93,7 @@ MEASURED_BASELINES = {
         "mono_ttft_ms": 73, "disagg_ttft_ms": 109,
         "mono_throughput": 0.21, "disagg_throughput": 0.21,
         "overhead_ms": 36, "overhead_pct": 49.3,
-        "sidecar_ms": 2, "nixl_ms": 17,
+        "nixl_ms": 17,
     },
     ("Qwen/Qwen2.5-1.5B-Instruct", "t4"): {
         "params_b": 1.5, "is_moe": False,
@@ -118,7 +118,7 @@ MEASURED_BASELINES = {
         "mono_ttft_ms": 177, "disagg_ttft_ms": 239,
         "mono_throughput": 0.21, "disagg_throughput": 0.18,
         "overhead_ms": 62, "overhead_pct": 35.0,
-        "sidecar_ms": 21, "nixl_ms": 25,
+        "nixl_ms": 25,
     },
     ("microsoft/Phi-3.5-mini-instruct", "t4"): {
         "params_b": 3.8, "is_moe": False,
@@ -131,7 +131,7 @@ MEASURED_BASELINES = {
         "mono_ttft_ms": 2999, "disagg_ttft_ms": 3278,
         "mono_throughput": 0.12, "disagg_throughput": 0.20,
         "overhead_ms": 279, "overhead_pct": 9.3,
-        "sidecar_ms": 25, "nixl_ms": 267,
+        "nixl_ms": 267,
     },
     ("microsoft/Phi-3-mini-4k-instruct", "t4"): {
         "params_b": 3.8, "is_moe": False,
@@ -141,7 +141,7 @@ MEASURED_BASELINES = {
         "ref_seq_len": 100,
         "mono_throughput": 1.30, "disagg_throughput": 0.98,
         "overhead_ms": 252, "overhead_pct": 32.7,
-        "sidecar_ms": 0, "nixl_ms": 252,
+        "nixl_ms": 252,
     },
 }
 
@@ -158,9 +158,6 @@ KV_BYTES_PER_TOKEN = {
     "microsoft/Phi-3-mini-4k-instruct": 2 * 32 * 32 * 96 * 2,
 }
 
-# Scaling constants from exp5 regression (Pearson r=0.987)
-SCALING_SIDECAR_MS = 12
-
 # NIXL transfer model: T_transfer = protocol_ms + (kv_bytes * seq_len) / eff_bw
 # Measured via exp5b direct NIXL prometheus scraping on T4 cluster (R²=0.999).
 # protocol_ms is fixed overhead (NIXL handshake, buffer setup) — model-independent.
@@ -169,6 +166,15 @@ NIXL_PROTOCOL_MS = 4.3         # regression intercept (exp5b, 180 points, Phi-3 
 NIXL_EFF_BW_GBS = 0.299        # regression slope -> effective bandwidth (10 Gbps OVN/TCP)
 MOE_NIXL_CORRECTION = 1.0      # MoE uses dense attention → KV transfer is identical to dense
 
+# Contention model: R(c,s) = c^Δγ(s), Δγ(s) = -C_A·(T(∞)-1) + C_B·ln(s)
+# Power-law scaling: α_mono ~ c^γ_mono(s), α_disagg ~ c^γ_disagg (constant).
+# Δγ = γ_mono - γ_disagg captures two competing effects:
+#   C_A: NIXL serialization (hurts disagg at short s, per unit T(∞) overhead)
+#   C_B: decode interference (helps disagg at long s, O(s) attention)
+# Calibrated from Phi-3/T4/TCP (N=1). Valid for c ≤ ~32.
+CONTENTION_SCALE_A = 0.889   # NIXL serialization rate (Phi-3/T4/TCP, N=1)
+CONTENTION_SCALE_B = 0.144   # decode interference rate per ln(s)
+
 
 @dataclass
 class CapacityPlan:
@@ -176,6 +182,7 @@ class CapacityPlan:
     gpu_type: str
     target_throughput: float
     target_ttft_ms: float
+    seq_len: int = 128
 
     mono_gpus_per_instance: int = 1
     mono_instances: int = 1
@@ -201,6 +208,13 @@ class CapacityPlan:
     overhead_thresholds: list = field(default_factory=list)
     critical_concurrency: int = 0
     mono_cv_by_concurrency: list = field(default_factory=list)
+    predicted_delta_gamma: float = 0.0
+    predicted_crossover_c: float = 0.0
+    predicted_s_cross: float = 0.0
+    measured_delta_gamma: float = 0.0
+    measured_fit_a: float = 0.0
+    measured_fit_b: float = 0.0
+    measured_fit_r2: float = 0.0
 
 
 def plan_capacity(
@@ -229,6 +243,7 @@ def plan_capacity(
         model=model_id, gpu_type=gpu_type,
         target_throughput=target_throughput,
         target_ttft_ms=target_ttft_ms,
+        seq_len=seq_len,
     )
 
     plan.reasoning.extend(_validate_profile(profile))
@@ -264,10 +279,10 @@ def plan_capacity(
     else:
         _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp, seq_len)
 
-    if plan.overhead_thresholds and len(plan.overhead_thresholds) >= 2:
+    if plan.overhead_asymptote == 0 and plan.overhead_thresholds and len(plan.overhead_thresholds) >= 2:
         ts = sorted(plan.overhead_thresholds, key=lambda t: t["seq_len"])
         plan.overhead_asymptote = round(ts[-1]["threshold"], 2)
-    else:
+    elif plan.overhead_asymptote == 0:
         measured = MEASURED_BASELINES.get((model_id, gpu_type), {})
         prefill_rate = measured.get("mono_ttft_rate", 0)
         if prefill_rate > 0:
@@ -275,6 +290,22 @@ def plan_capacity(
             plan.overhead_asymptote = round(
                 _estimate_overhead_asymptote(kv_bytes, prefill_rate, gpu_type,
                                             profile.is_moe), 2)
+
+    if plan.overhead_asymptote > 0:
+        plan.predicted_delta_gamma = round(
+            _predict_delta_gamma(seq_len, plan.overhead_asymptote), 3)
+        plan.predicted_s_cross = round(
+            _predict_s_cross(plan.overhead_asymptote), 0)
+        for t in plan.overhead_thresholds:
+            dg = _predict_delta_gamma(t["seq_len"], plan.overhead_asymptote)
+            if "predicted_crossover_c" not in t:
+                c_cross = _predict_crossover_c(t["threshold"], dg)
+                t["predicted_crossover_c"] = round(c_cross, 1)
+        if plan.overhead_thresholds and plan.predicted_crossover_c == 0:
+            t0 = plan.overhead_thresholds[0]
+            dg0 = _predict_delta_gamma(t0["seq_len"], plan.overhead_asymptote)
+            plan.predicted_crossover_c = round(
+                _predict_crossover_c(t0["threshold"], dg0), 1)
 
     _generate_recommendation(plan)
 
@@ -342,6 +373,23 @@ def _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price):
                 "threshold": round(t, 2),
                 "overhead_pct": round((t - 1) * 100),
             })
+
+    if len(plan.overhead_thresholds) >= 3:
+        mono_pts = [(s, exp11[("BASELINE", 1, s)]["median"])
+                    for s in measured_seqs if ("BASELINE", 1, s) in exp11]
+        overhead_pts = []
+        for s in measured_seqs:
+            dg = exp11.get(("DISAGG-1D", 1, s)) or exp11.get(("DISAGG-2D", 1, s))
+            bl = exp11.get(("BASELINE", 1, s))
+            if dg and bl:
+                overhead_pts.append((s, dg["median"] - bl["median"]))
+        seq_range = [p[0] for p in mono_pts]
+        wide_enough = max(seq_range) / max(min(seq_range), 1) >= 3 if seq_range else False
+        if wide_enough and len(mono_pts) >= 3 and len(overhead_pts) >= 3:
+            _, prefill_rate = _linreg(mono_pts)
+            _, overhead_rate = _linreg(overhead_pts)
+            if prefill_rate > 0 and overhead_rate > 0:
+                plan.overhead_asymptote = round(1 + overhead_rate / prefill_rate, 2)
 
     for (cfg, conc, pt), dg_stats in exp11.items():
         if not cfg.startswith("DISAGG"):
@@ -425,6 +473,14 @@ def _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price):
             plan.critical_concurrency = prev_c
             break
         prev_c, prev_cv = c, cv
+
+    fit_a, fit_b, fit_r2, _dg_by_s = _fit_measured_delta_gamma(plan.contention_table)
+    plan.measured_fit_a = round(fit_a, 3)
+    plan.measured_fit_b = round(fit_b, 3)
+    plan.measured_fit_r2 = round(fit_r2, 2)
+    if fit_b != 0 or fit_a != 0:
+        plan.measured_delta_gamma = round(
+            fit_a + fit_b * math.log(max(seq_len, 1)), 3)
 
     gpus_per = plan.mono_gpus_per_instance
     mono_rps = 1000 / max(plan.mono_est_ttft_ms, 1)
@@ -551,6 +607,77 @@ def _estimate_overhead_asymptote(kv_bytes_per_token: int, prefill_rate: float,
     return 1 + nixl_rate_ms / prefill_rate
 
 
+def _linreg(points):
+    n = len(points)
+    sx = sum(x for x, _ in points)
+    sy = sum(y for _, y in points)
+    sxx = sum(x * x for x, _ in points)
+    sxy = sum(x * y for x, y in points)
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return sy / n, 0.0
+    slope = (n * sxy - sx * sy) / denom
+    intercept = (sy - slope * sx) / n
+    return intercept, slope
+
+
+def _predict_delta_gamma(seq_len: int, overhead_asymptote: float) -> float:
+    t_inf = max(overhead_asymptote, 1.0)
+    return -CONTENTION_SCALE_A * (t_inf - 1) + CONTENTION_SCALE_B * math.log(max(seq_len, 1))
+
+
+def _predict_contention_ratio(delta_gamma: float, concurrency: int) -> float:
+    if concurrency <= 1:
+        return 1.0
+    return concurrency ** delta_gamma
+
+
+def _predict_crossover_c(threshold: float, delta_gamma: float) -> float:
+    if delta_gamma <= 0:
+        return float('inf')
+    if threshold <= 1:
+        return 1.0
+    return threshold ** (1.0 / delta_gamma)
+
+
+def _predict_s_cross(overhead_asymptote: float) -> float:
+    t_inf = max(overhead_asymptote, 1.0)
+    if CONTENTION_SCALE_B <= 0:
+        return float('inf')
+    return math.exp(CONTENTION_SCALE_A * (t_inf - 1) / CONTENTION_SCALE_B)
+
+
+def _fit_measured_delta_gamma(contention_table: list) -> tuple:
+    by_s = {}
+    for e in contention_table:
+        c, sl = e["concurrency"], e["seq_len"]
+        if c <= 1:
+            continue
+        r = e["contention_ratio"]
+        if r <= 0:
+            continue
+        by_s.setdefault(sl, []).append((math.log(c), math.log(r)))
+
+    dg_points = []
+    dg_by_s = {}
+    for sl, pts in sorted(by_s.items()):
+        if len(pts) < 2:
+            continue
+        _, gamma = _linreg(pts)
+        dg_by_s[sl] = round(gamma, 3)
+        dg_points.append((math.log(sl), gamma))
+
+    if len(dg_points) < 2:
+        return 0.0, 0.0, 0.0, dg_by_s
+
+    intercept, slope = _linreg(dg_points)
+    y_mean = sum(y for _, y in dg_points) / len(dg_points)
+    ss_tot = sum((y - y_mean) ** 2 for _, y in dg_points)
+    ss_res = sum((y - (intercept + slope * x)) ** 2 for x, y in dg_points)
+    r_sq = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    return intercept, slope, max(r_sq, 0.0), dg_by_s
+
+
 def _validate_profile(profile):
     """Flag plans built on missing or implausible profile data."""
     issues = []
@@ -657,7 +784,7 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
 
         kv_bytes = _estimate_kv_bytes(profile)
         nixl_ms = _estimate_nixl_ms(kv_bytes, seq_len, gpu_type, is_moe)
-        disagg_ttft = mono_ttft + SCALING_SIDECAR_MS + nixl_ms
+        disagg_ttft = mono_ttft + nixl_ms
 
         plan.mono_est_ttft_ms = round(max(mono_ttft, 10))
         plan.mono_est_throughput = round(max(mono_rps * bw_speedup * tp * tp_eff, 0.01), 2)
@@ -667,8 +794,7 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
         data_ms = nixl_ms - NIXL_PROTOCOL_MS
         plan.reasoning.append(
             f"KV cache: {kv_kb:.0f} KB/token ({profile.num_kv_heads} KV heads) x {seq_len} tokens, "
-            f"NIXL: {NIXL_PROTOCOL_MS:.0f}ms protocol + {data_ms:.0f}ms data + "
-            f"sidecar: {SCALING_SIDECAR_MS}ms")
+            f"NIXL: {NIXL_PROTOCOL_MS:.0f}ms protocol + {data_ms:.0f}ms data")
         if gpu_type != "t4":
             plan.reasoning.append(
                 f"NIC scaling: {nic_speedup:.0f}x ({t4_nic} -> {target_nic} Gbps)")
@@ -775,12 +901,30 @@ def _generate_recommendation(plan):
             (plan.disagg_est_ttft_ms - plan.mono_est_ttft_ms)
             / max(plan.mono_est_ttft_ms, 1) * 100)
         plan.recommendation = "MONOLITHIC (c=1 estimate)"
-        plan.reasoning.append(
-            f"At c=1, mono always faster "
-            f"(disagg adds {overhead_pct}% overhead)")
-        plan.reasoning.append(
-            f"Disagg needs >{overhead_pct}% contention advantage under load — "
-            f"run experiments to measure")
+        dg = plan.predicted_delta_gamma
+        if dg <= 0:
+            plan.reasoning.append(
+                f"At c=1, disagg adds {overhead_pct}% overhead")
+            plan.reasoning.append(
+                f"Δγ={dg:.2f} ≤ 0 — disagg scales worse than mono at this s")
+            if plan.predicted_s_cross < 1e6:
+                plan.reasoning.append(
+                    f"Need s > {plan.predicted_s_cross:.0f} tokens for disagg to scale better")
+        elif plan.predicted_crossover_c > 32:
+            plan.reasoning.append(
+                f"At c=1, disagg adds {overhead_pct}% overhead")
+            plan.reasoning.append(
+                f"Predicted crossover at c≈{plan.predicted_crossover_c:.0f} — "
+                f"unlikely to reach in practice (Δγ={dg:.2f})")
+        elif plan.predicted_crossover_c > 1:
+            plan.reasoning.append(
+                f"At c=1, disagg adds {overhead_pct}% overhead")
+            plan.reasoning.append(
+                f"Predicted crossover at c≈{plan.predicted_crossover_c:.0f} — "
+                f"may win under load (Δγ={dg:.2f})")
+        else:
+            plan.reasoning.append(
+                f"At c=1, disagg adds {overhead_pct}% overhead")
         plan.reasoning.append(
             "To measure: ./toolkit/run.sh <cluster> tput-seqlen")
 
@@ -847,6 +991,28 @@ def print_plan(plan: CapacityPlan):
             print(f"    T(s):  {',  '.join(parts)}")
         print()
 
+        if plan.measured_fit_r2 > 0 and plan.predicted_delta_gamma != 0:
+            pred_dg = plan.predicted_delta_gamma
+            meas_dg = plan.measured_delta_gamma
+            err = ((pred_dg - meas_dg) / abs(meas_dg) * 100) if meas_dg != 0 else 0
+            print("  CONTENTION MODEL: R(c,s) = c^Δγ(s)")
+            print(f"    Δγ(s) = {plan.measured_fit_a:.3f} + "
+                  f"{plan.measured_fit_b:.3f}·ln(s)")
+            print(f"    Fit R² = {plan.measured_fit_r2:.2f}")
+            print(f"    At s={plan.seq_len}: predicted Δγ={pred_dg:.3f}  "
+                  f"measured Δγ={meas_dg:.3f}  (error: {err:+.0f}%)")
+            max_c = max((e["concurrency"] for e in plan.contention_table), default=16)
+            for c in [2, 4, 8, 16]:
+                if c > max_c * 2:
+                    break
+                r_pred = _predict_contention_ratio(pred_dg, c)
+                r_meas = _predict_contention_ratio(meas_dg, c)
+                print(f"      c={c:>2}: predicted R={r_pred:.2f}  measured R={r_meas:.2f}")
+            if plan.predicted_s_cross < 1e6:
+                print(f"    s_cross ≈ {plan.predicted_s_cross:.0f} tokens "
+                      f"(below this, disagg scales worse)")
+            print()
+
         crosses = sorted(
             [c for c in plan.contention_table if c["p50_cross"] or c["p90_cross"]],
             key=lambda x: (x["concurrency"], x["seq_len"]))
@@ -872,6 +1038,9 @@ def print_plan(plan: CapacityPlan):
                 print(f"    c={c['concurrency']}, s={c['seq_len']} ({c['config']}){above_cstar}:")
                 print(f"      R={c['contention_ratio']:.2f} vs T={c['threshold']:.2f}{sig_str}  "
                       f"p50: {p50_w}  p90: {p90_w}{cv_str}")
+            if crosses and all(not c["p90_cross"] for c in crosses):
+                print("    All crossovers are p50-only — disagg tail latency")
+                print("    is higher under concurrent load")
             if n_no > 0:
                 print(f"    No crossover: {n_no}/{n_total} conditions")
         else:
@@ -887,10 +1056,38 @@ def print_plan(plan: CapacityPlan):
             print(f"  Overhead:    {overhead:.0f}ms ({overhead_pct:+.0f}%)")
             if plan.overhead_asymptote > 0:
                 asym_pct = round((plan.overhead_asymptote - 1) * 100)
-                print(f"  T(∞):        {plan.overhead_asymptote:.2f} — "
-                      f"long-prompt floor is {asym_pct}% overhead")
-            print(f"  Threshold:   disagg needs >{overhead_pct:.0f}% contention "
-                  f"advantage to justify overhead")
+                if plan.overhead_asymptote > 2.0:
+                    print(f"  T(∞) = {plan.overhead_asymptote:.2f} — disagg overhead "
+                          f"stays >{asym_pct}% even at infinite prompt length")
+                    print("  Disagg is unlikely to help on this hardware/network")
+                elif plan.overhead_asymptote < 1.15:
+                    print(f"  T(∞) = {plan.overhead_asymptote:.2f} — overhead drops "
+                          f"to {asym_pct}% at long prompts")
+                    print("  Disagg likely wins under moderate concurrent load")
+                else:
+                    print(f"  T(∞) = {plan.overhead_asymptote:.2f} — long-prompt "
+                          f"floor is {asym_pct}% overhead")
+                    print(f"  Disagg needs >{asym_pct}% contention advantage to win")
+        if plan.predicted_delta_gamma != 0:
+            dg = plan.predicted_delta_gamma
+            print(f"  Contention model: R(c,s) = c^Δγ(s)")
+            print(f"    Δγ(s) = -{CONTENTION_SCALE_A:.3f}·(T(∞)-1) + "
+                  f"{CONTENTION_SCALE_B:.3f}·ln(s)")
+            print(f"    At s={plan.seq_len}: Δγ = {dg:.3f}")
+            if dg > 0:
+                for c in [2, 4, 8, 16]:
+                    r = _predict_contention_ratio(dg, c)
+                    print(f"      c={c:>2}: predicted R = {r:.2f}")
+                if 1 < plan.predicted_crossover_c <= 64:
+                    print(f"    Predicted crossover: c ≈ {plan.predicted_crossover_c:.0f}")
+                elif plan.predicted_crossover_c > 64:
+                    print(f"    Predicted crossover: c > 64 (disagg unlikely to help)")
+            else:
+                print(f"    Δγ ≤ 0 — disagg scales worse than mono at this s")
+            if plan.predicted_s_cross < 1e6:
+                print(f"    s_cross ≈ {plan.predicted_s_cross:.0f} tokens "
+                      f"(need s > s_cross for disagg advantage)")
+            print("    (N=1 calibration — valid for c ≤ ~32)")
         print()
 
     print(f"  GPU: {plan.mono_total_gpus} mono vs "
@@ -923,6 +1120,14 @@ def save_plan(plan: CapacityPlan, path: Path):
         "measured_conditions": plan.measured_conditions,
         "critical_concurrency": plan.critical_concurrency,
         "mono_cv_by_concurrency": plan.mono_cv_by_concurrency,
+        "seq_len": plan.seq_len,
+        "predicted_delta_gamma": plan.predicted_delta_gamma,
+        "predicted_crossover_c": plan.predicted_crossover_c,
+        "predicted_s_cross": plan.predicted_s_cross,
+        "measured_delta_gamma": plan.measured_delta_gamma,
+        "measured_fit_a": plan.measured_fit_a,
+        "measured_fit_b": plan.measured_fit_b,
+        "measured_fit_r2": plan.measured_fit_r2,
     }, indent=2))
 
 
