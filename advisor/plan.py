@@ -286,6 +286,8 @@ def plan_capacity(
     elif plan.overhead_asymptote == 0:
         measured = MEASURED_BASELINES.get((model_id, gpu_type), {})
         prefill_rate = measured.get("mono_ttft_rate", 0)
+        if prefill_rate <= 0:
+            prefill_rate = _estimate_prefill_rate(profile, gpu_type)
         if prefill_rate > 0:
             kv_bytes = _estimate_kv_bytes(profile)
             plan.overhead_asymptote = round(
@@ -612,6 +614,22 @@ def _estimate_overhead_asymptote(kv_bytes_per_token: int, prefill_rate: float,
     if is_moe:
         nixl_rate_ms *= MOE_NIXL_CORRECTION
     return 1 + nixl_rate_ms / prefill_rate
+
+
+PREFILL_RATE_CONSTANT = 143.2  # ms/token × GB/s / B_params, from Phi-3/T4 (N=1)
+
+
+def _estimate_prefill_rate(profile, gpu_type: str = "t4") -> float:
+    """Estimate marginal prefill cost (ms/token) from model size and GPU bandwidth.
+
+    Calibrated from Phi-3/T4: 1.70 ms/token at 3.8B params, 320 GB/s HBM.
+    Scales linearly with model size, inversely with memory bandwidth.
+    """
+    _gpu_key = gpu_type.upper().replace("_", "-")
+    _hw = SCALING_GPUS.get(_gpu_key, {})
+    mem_bw = _hw.get("hbm_bw_gbs", GPU_MEM_BW_GBS.get(gpu_type, 320))
+    params_b = profile.num_params / 1e9 if profile.num_params else 3.8
+    return PREFILL_RATE_CONSTANT * params_b / mem_bw
 
 
 def _linreg(points):
@@ -1047,7 +1065,7 @@ def print_plan(plan: CapacityPlan):
 
                 if per_cfg:
                     max_spread = 0.0
-                    for sl, cfgs in per_cfg.items():
+                    for _sl, cfgs in per_cfg.items():
                         if len(cfgs) > 1:
                             vals = list(cfgs.values())
                             max_spread = max(max_spread,
@@ -1125,7 +1143,7 @@ def print_plan(plan: CapacityPlan):
                     print(f"  Disagg needs >{asym_pct}% contention advantage to win")
         if plan.predicted_delta_gamma != 0:
             dg = plan.predicted_delta_gamma
-            print(f"  Contention model: R(c,s) = c^Δγ(s)")
+            print("  Contention model: R(c,s) = c^Δγ(s)")
             print(f"    Δγ(s) = -{CONTENTION_SCALE_A:.3f}·(T(∞)-1) + "
                   f"{CONTENTION_SCALE_B:.3f}·ln(s)")
             print(f"    At s={plan.seq_len}: Δγ = {dg:.3f}")
@@ -1136,9 +1154,9 @@ def print_plan(plan: CapacityPlan):
                 if 1 < plan.predicted_crossover_c <= 64:
                     print(f"    Predicted crossover: c ≈ {plan.predicted_crossover_c:.0f}")
                 elif plan.predicted_crossover_c > 64:
-                    print(f"    Predicted crossover: c > 64 (disagg unlikely to help)")
+                    print("    Predicted crossover: c > 64 (disagg unlikely to help)")
             else:
-                print(f"    Δγ ≤ 0 — disagg scales worse than mono at this s")
+                print("    Δγ ≤ 0 — disagg scales worse than mono at this s")
             if plan.predicted_s_cross < 1e6:
                 print(f"    s_cross ≈ {plan.predicted_s_cross:.0f} tokens "
                       f"(need s > s_cross for disagg advantage)")
@@ -1156,6 +1174,281 @@ def print_plan(plan: CapacityPlan):
     for r in plan.reasoning:
         print(f"    - {r}")
     print(f"{'='*60}\n")
+
+
+def sweep_seq_lens(
+    model_id: str,
+    gpu_type: str = "t4",
+    provider: str = "aws",
+    data_dir: str = "",
+    seq_lens: list | None = None,
+) -> dict:
+    """Run plan_capacity across multiple seq_lens to map the phase boundary."""
+    ref_plan = plan_capacity(
+        model_id, target_throughput=1.0, gpu_type=gpu_type,
+        provider=provider, seq_len=128, data_dir=data_dir)
+
+    if seq_lens is None:
+        seq_lens = [50, 100, 200, 500, 1000, 2000, 4000]
+
+    t_inf = ref_plan.overhead_asymptote
+    s_cross = _predict_s_cross(t_inf) if t_inf > 0 else float('inf')
+
+    results = []
+    for s in seq_lens:
+        plan = plan_capacity(
+            model_id, target_throughput=1.0, gpu_type=gpu_type,
+            provider=provider, seq_len=s, data_dir=data_dir)
+        mono = plan.mono_est_ttft_ms
+        disagg = plan.disagg_est_ttft_ms
+        t_s = disagg / mono if mono > 0 else 0
+        dg = _predict_delta_gamma(s, t_inf) if t_inf > 0 else 0
+        c_cross = _predict_crossover_c(t_s, dg) if dg != 0 else float('inf')
+        results.append({
+            "seq_len": s,
+            "mono_ttft_ms": round(mono),
+            "disagg_ttft_ms": round(disagg),
+            "T_s": round(t_s, 2),
+            "delta_gamma": round(dg, 3),
+            "c_cross": round(c_cross, 1) if c_cross < 1e6 else float('inf'),
+            "confidence": plan.confidence,
+        })
+
+    return {"model": model_id, "gpu_type": gpu_type,
+            "t_inf": t_inf, "s_cross": round(s_cross),
+            "entries": results}
+
+
+def print_sweep(sweep: dict):
+    """Print the sequence length sweep table."""
+    print(f"\n{'='*72}")
+    print(f"  SEQUENCE LENGTH SWEEP: {sweep['model']} on {sweep['gpu_type'].upper()}")
+    print(f"{'='*72}")
+    t_inf = sweep["t_inf"]
+    s_cross = sweep["s_cross"]
+    if t_inf > 0:
+        print(f"  T(∞) = {t_inf:.2f}    s_cross ≈ {s_cross} tokens")
+    print()
+
+    print(f"  {'Seq_len':>7} | {'Mono TTFT':>9} | {'Disagg TTFT':>11} | "
+          f"{'T(s)':>5} | {'Δγ(s)':>6} | {'c_cross':>7} | Winner")
+    print(f"  {'-'*7}-+-{'-'*9}-+-{'-'*11}-+-{'-'*5}-+-"
+          f"{'-'*6}-+-{'-'*7}-+-{'-'*20}")
+
+    for e in sweep["entries"]:
+        c_cross_str = f"{e['c_cross']:.0f}" if e['c_cross'] < 1000 else "inf"
+        if e["delta_gamma"] <= 0:
+            winner = "MONO"
+        elif e["c_cross"] <= 1:
+            winner = "DISAGG"
+        elif e["c_cross"] <= 32:
+            winner = f"c > {e['c_cross']:.0f} → DISAGG"
+        elif e["c_cross"] < 1000:
+            winner = f"c > {e['c_cross']:.0f} (unlikely)"
+        else:
+            winner = "MONO"
+        conf = "" if e["confidence"] in ("measured", "experiment") else " *"
+        print(f"  {e['seq_len']:>7} | {e['mono_ttft_ms']:>7}ms | "
+              f"{e['disagg_ttft_ms']:>9}ms | {e['T_s']:>5.2f} | "
+              f"{e['delta_gamma']:>+6.3f} | {c_cross_str:>7} | {winner}{conf}")
+
+    print()
+    if s_cross < 1e6:
+        print(f"  Phase boundary: disagg scaling advantage begins at s ≈ {s_cross} tokens")
+        short = [e for e in sweep["entries"] if e["seq_len"] < s_cross]
+        long_win = [e for e in sweep["entries"]
+                    if e["delta_gamma"] > 0 and e["c_cross"] <= 32]
+        if short:
+            print(f"  Short prompts (s < {s_cross}): mono always wins regardless of load")
+        if long_win:
+            c_range = sorted(set(int(e["c_cross"]) for e in long_win))
+            s_range = sorted(e["seq_len"] for e in long_win)
+            print(f"  Long prompts (s ≥ {min(s_range)}): disagg wins above "
+                  f"c ≈ {min(c_range)}-{max(c_range)}")
+    else:
+        print("  Disagg scaling advantage does not emerge at any tested seq_len")
+    print(f"{'='*72}\n")
+
+
+WORKLOAD_PROFILES = {
+    "chat": [(50, 0.20), (100, 0.35), (200, 0.25), (500, 0.15), (1000, 0.05)],
+    "summarization": [(500, 0.10), (1000, 0.30), (2000, 0.35), (4000, 0.25)],
+    "rag": [(200, 0.15), (500, 0.35), (1000, 0.35), (2000, 0.15)],
+    "code": [(100, 0.20), (200, 0.30), (500, 0.30), (1000, 0.15), (2000, 0.05)],
+}
+
+
+def parse_workload(spec: str) -> tuple:
+    """Parse workload spec: either a profile name or 'tokens:weight,...'."""
+    if spec in WORKLOAD_PROFILES:
+        return spec, WORKLOAD_PROFILES[spec]
+    pairs = []
+    for part in spec.split(","):
+        tokens_s, weight_s = part.strip().split(":")
+        pairs.append((int(tokens_s), float(weight_s)))
+    total = sum(w for _, w in pairs)
+    if total > 0:
+        pairs = [(s, w / total) for s, w in pairs]
+    return "custom", pairs
+
+
+@dataclass
+class WorkloadResult:
+    model: str
+    gpu_type: str
+    workload_name: str
+    workload_dist: list
+    buckets: list
+    weighted_mono_ttft: float
+    weighted_disagg_ttft: float
+    weighted_overhead_pct: float
+    s_cross: float
+    frac_above_scross: float
+    concurrency_analysis: list
+    recommendation: str
+    reasoning: list = field(default_factory=list)
+
+
+def analyze_workload(
+    model_id: str,
+    workload_dist: list,
+    workload_name: str = "custom",
+    gpu_type: str = "t4",
+    provider: str = "aws",
+    data_dir: str = "",
+) -> WorkloadResult:
+    """Analyze a workload distribution across sequence lengths."""
+    ref_plan = plan_capacity(
+        model_id, target_throughput=1.0, gpu_type=gpu_type,
+        provider=provider, seq_len=128, data_dir=data_dir)
+    t_inf = ref_plan.overhead_asymptote
+    s_cross = _predict_s_cross(t_inf) if t_inf > 0 else float('inf')
+
+    buckets = []
+    w_mono = 0.0
+    w_disagg = 0.0
+    frac_above = 0.0
+
+    for s, weight in workload_dist:
+        plan = plan_capacity(
+            model_id, target_throughput=1.0, gpu_type=gpu_type,
+            provider=provider, seq_len=s, data_dir=data_dir)
+        mono = plan.mono_est_ttft_ms
+        disagg = plan.disagg_est_ttft_ms
+        t_s = disagg / mono if mono > 0 else 0
+        dg = _predict_delta_gamma(s, t_inf) if t_inf > 0 else 0
+        c_cross = _predict_crossover_c(t_s, dg) if dg > 0 else float('inf')
+        buckets.append({
+            "seq_len": s, "weight": weight,
+            "mono_ttft_ms": round(mono), "disagg_ttft_ms": round(disagg),
+            "T_s": round(t_s, 2), "delta_gamma": round(dg, 3),
+            "c_cross": round(c_cross, 1) if c_cross < 1e6 else float('inf'),
+            "confidence": plan.confidence,
+        })
+        w_mono += weight * mono
+        w_disagg += weight * disagg
+        if s > s_cross:
+            frac_above += weight
+
+    w_overhead_pct = (w_disagg - w_mono) / w_mono * 100 if w_mono > 0 else 0
+
+    conc_analysis = []
+    for c in [2, 4, 8, 16, 32]:
+        mono_at_c = 0.0
+        frac_wins = 0.0
+        for b in buckets:
+            r = _predict_contention_ratio(b["delta_gamma"], c)
+            mono_at_c += b["weight"] * b["mono_ttft_ms"] * r
+            if r > b["T_s"]:
+                frac_wins += b["weight"]
+        advantage_pct = (mono_at_c - w_disagg) / w_disagg * 100 if w_disagg > 0 else 0
+        verdict = "DISAGG" if mono_at_c > w_disagg else "MONO"
+        conc_analysis.append({
+            "concurrency": c,
+            "mono_ttft_at_c": round(mono_at_c),
+            "disagg_ttft": round(w_disagg),
+            "advantage_pct": round(advantage_pct),
+            "frac_disagg_wins": round(frac_wins, 2),
+            "verdict": verdict,
+        })
+
+    first_disagg = next((ca for ca in conc_analysis if ca["verdict"] == "DISAGG"), None)
+    if first_disagg:
+        recommendation = (f"DISAGGREGATE at c ≥ {first_disagg['concurrency']} "
+                          f"for {workload_name} workloads")
+    else:
+        recommendation = f"MONOLITHIC for {workload_name} workloads"
+
+    result = WorkloadResult(
+        model=model_id, gpu_type=gpu_type,
+        workload_name=workload_name, workload_dist=workload_dist,
+        buckets=buckets,
+        weighted_mono_ttft=round(w_mono),
+        weighted_disagg_ttft=round(w_disagg),
+        weighted_overhead_pct=round(w_overhead_pct),
+        s_cross=round(s_cross) if s_cross < 1e6 else float('inf'),
+        frac_above_scross=round(frac_above, 2),
+        concurrency_analysis=conc_analysis,
+        recommendation=recommendation,
+    )
+
+    result.reasoning.append(
+        f"{round(frac_above * 100)}% of requests (s > {round(s_cross)}) "
+        f"benefit from disagg scaling" if s_cross < 1e6
+        else "No requests benefit from disagg scaling at any s")
+    if first_disagg:
+        result.reasoning.append(
+            f"At c={first_disagg['concurrency']}, mono contention exceeds "
+            f"disagg overhead ({first_disagg['advantage_pct']:+d}% differential)")
+    else:
+        worst = conc_analysis[-1]
+        result.reasoning.append(
+            f"Even at c={worst['concurrency']}, mono contention does not "
+            f"overcome disagg overhead ({worst['advantage_pct']:+d}%)")
+
+    return result
+
+
+def print_workload(result: WorkloadResult):
+    """Print workload analysis results."""
+    dist_str = ", ".join(f"{s}:{w:.0%}" for s, w in result.workload_dist)
+    print(f"\n{'='*72}")
+    print(f"  WORKLOAD ANALYSIS: {result.model} on {result.gpu_type.upper()}")
+    print(f"{'='*72}")
+    print(f"  Workload: {result.workload_name} ({dist_str})")
+    if result.s_cross < 1e6:
+        print(f"  s_cross ≈ {result.s_cross:.0f} tokens    "
+              f"{result.frac_above_scross:.0%} of traffic above s_cross")
+    print()
+
+    print("  Per-bucket breakdown:")
+    for b in result.buckets:
+        c_str = (f"c>{b['c_cross']:.0f}" if 1 < b["c_cross"] < 1000
+                 else "DISAGG" if b["c_cross"] <= 1
+                 else "MONO")
+        print(f"    s={b['seq_len']:>5} ({b['weight']:>4.0%}): "
+              f"mono {b['mono_ttft_ms']:>5}ms  disagg {b['disagg_ttft_ms']:>5}ms  "
+              f"T={b['T_s']:.2f}  Δγ={b['delta_gamma']:+.2f}  → {c_str}")
+    print()
+
+    print("  Workload aggregate (c=1):")
+    print(f"    Weighted mono TTFT:   {result.weighted_mono_ttft:>5}ms")
+    print(f"    Weighted disagg TTFT: {result.weighted_disagg_ttft:>5}ms")
+    print(f"    Weighted overhead:    {result.weighted_overhead_pct:+.0f}%")
+    print()
+
+    print("  Concurrency scaling (mono contention vs disagg baseline):")
+    for ca in result.concurrency_analysis:
+        c = ca["concurrency"]
+        print(f"    c={c:>2}: {ca['advantage_pct']:+d}% differential contention  "
+              f"({ca['frac_disagg_wins']:.0%} of traffic benefits)  "
+              f"→ {ca['verdict']}")
+    print()
+
+    print(f"  RECOMMENDATION: {result.recommendation}")
+    for r in result.reasoning:
+        print(f"    - {r}")
+    print(f"{'='*72}\n")
 
 
 def save_plan(plan: CapacityPlan, path: Path):
@@ -1201,19 +1494,39 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", default="",
                         help="Path to experiment data dir (enables data-backed recommendations)")
     parser.add_argument("--save", default="", help="Path to save plan JSON")
+    parser.add_argument("--sweep", action="store_true",
+                        help="Sweep across sequence lengths to show phase boundary")
+    parser.add_argument("--workload",
+                        help="Workload profile: chat|summarization|rag|code or 'tokens:weight,...'")
     args = parser.parse_args()
 
-    plan = plan_capacity(
-        args.model,
-        target_throughput=args.throughput,
-        target_ttft_ms=args.ttft_slo,
-        gpu_type=args.gpu_type,
-        provider=args.provider,
-        seq_len=args.seq_len,
-        data_dir=args.data_dir,
-    )
-    print_plan(plan)
+    if args.sweep and args.workload:
+        parser.error("--sweep and --workload are mutually exclusive")
 
-    if args.save:
-        save_plan(plan, Path(args.save))
-        print(f"  Plan saved to {args.save}")
+    if args.sweep:
+        sweep = sweep_seq_lens(
+            args.model, gpu_type=args.gpu_type,
+            provider=args.provider, data_dir=args.data_dir)
+        print_sweep(sweep)
+    elif args.workload:
+        name, dist = parse_workload(args.workload)
+        result = analyze_workload(
+            args.model, workload_dist=dist, workload_name=name,
+            gpu_type=args.gpu_type, provider=args.provider,
+            data_dir=args.data_dir)
+        print_workload(result)
+    else:
+        plan = plan_capacity(
+            args.model,
+            target_throughput=args.throughput,
+            target_ttft_ms=args.ttft_slo,
+            gpu_type=args.gpu_type,
+            provider=args.provider,
+            seq_len=args.seq_len,
+            data_dir=args.data_dir,
+        )
+        print_plan(plan)
+
+        if args.save:
+            save_plan(plan, Path(args.save))
+            print(f"  Plan saved to {args.save}")

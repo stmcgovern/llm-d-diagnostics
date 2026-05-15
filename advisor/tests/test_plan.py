@@ -16,6 +16,7 @@ from plan import (
     MEASURED_BASELINES,
     MOE_NIXL_CORRECTION,
     NIXL_PROTOCOL_MS,
+    WORKLOAD_PROFILES,
     CapacityPlan,
     ModelProfile,
     _baseline_ttft,
@@ -23,6 +24,7 @@ from plan import (
     _estimate_kv_bytes,
     _estimate_nixl_ms,
     _estimate_overhead_asymptote,
+    _estimate_prefill_rate,
     _find_nearest_baselines,
     _fit_measured_delta_gamma,
     _generate_recommendation,
@@ -31,8 +33,11 @@ from plan import (
     _predict_delta_gamma,
     _predict_s_cross,
     _validate_profile,
+    analyze_workload,
+    parse_workload,
     plan_capacity,
     save_plan,
+    sweep_seq_lens,
 )
 
 
@@ -1244,15 +1249,15 @@ class TestAsymptoteGuard(unittest.TestCase):
         )
         self.assertGreater(plan.overhead_asymptote, 1.0)
 
-    def test_model_without_rate_no_asymptote(self):
-        """TinyLlama has no mono_ttft_rate → T(∞) stays 0."""
+    def test_model_without_rate_gets_estimated_asymptote(self):
+        """TinyLlama has no mono_ttft_rate → T(∞) estimated from model physics."""
         plan = plan_capacity(
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             target_throughput=1.0, target_ttft_ms=99999,
             gpu_type="t4", seq_len=128,
         )
-        self.assertEqual(plan.overhead_asymptote, 0.0,
-                         "Model without mono_ttft_rate should NOT get T(∞)")
+        self.assertGreater(plan.overhead_asymptote, 1.0,
+                           "Estimated T(∞) should be > 1")
 
     def test_experiment_data_overrides_guard(self):
         """With ≥2 experiment overhead thresholds, T(∞) comes from data."""
@@ -1422,8 +1427,8 @@ class TestSignificance(unittest.TestCase):
         )
         self.assertEqual(plan.confidence, "experiment")
         self.assertEqual(len(plan.overhead_thresholds), 1)
-        self.assertEqual(plan.overhead_asymptote, 0.0,
-                         "1 threshold + no rate → T(∞) should stay 0")
+        self.assertGreater(plan.overhead_asymptote, 1.0,
+                           "1 threshold → T(∞) estimated from model physics")
 
 
 class TestCriticalConcurrency(unittest.TestCase):
@@ -1729,6 +1734,199 @@ class TestExperimentCrossoverC(TestPlanFromExperiments):
             has_cross_c = any("predicted_crossover_c" in t
                              for t in plan.overhead_thresholds)
             self.assertTrue(has_cross_c)
+
+
+class TestSweepSeqLens(unittest.TestCase):
+
+    def test_returns_entries_for_each_seq_len(self):
+        seq_lens = [100, 500, 1000]
+        result = sweep_seq_lens(
+            "microsoft/Phi-3-mini-4k-instruct", gpu_type="t4",
+            seq_lens=seq_lens)
+        self.assertEqual(len(result["entries"]), 3)
+        self.assertEqual([e["seq_len"] for e in result["entries"]], seq_lens)
+
+    def test_delta_gamma_increases_with_s(self):
+        result = sweep_seq_lens(
+            "microsoft/Phi-3-mini-4k-instruct", gpu_type="t4",
+            seq_lens=[50, 200, 1000])
+        dgs = [e["delta_gamma"] for e in result["entries"]]
+        self.assertLess(dgs[0], dgs[1])
+        self.assertLess(dgs[1], dgs[2])
+
+    def test_c_cross_decreases_with_s(self):
+        result = sweep_seq_lens(
+            "microsoft/Phi-3-mini-4k-instruct", gpu_type="t4",
+            seq_lens=[500, 1000, 2000])
+        entries = [e for e in result["entries"] if e["c_cross"] < 1e6]
+        self.assertGreater(len(entries), 1)
+        for i in range(len(entries) - 1):
+            self.assertGreater(entries[i]["c_cross"], entries[i + 1]["c_cross"])
+
+    def test_s_cross_reported(self):
+        result = sweep_seq_lens(
+            "microsoft/Phi-3-mini-4k-instruct", gpu_type="t4",
+            seq_lens=[50, 500])
+        self.assertGreater(result["s_cross"], 0)
+        self.assertLess(result["s_cross"], 1e6)
+
+    def test_model_and_gpu_in_result(self):
+        result = sweep_seq_lens(
+            "microsoft/Phi-3-mini-4k-instruct", gpu_type="t4",
+            seq_lens=[100])
+        self.assertEqual(result["model"], "microsoft/Phi-3-mini-4k-instruct")
+        self.assertEqual(result["gpu_type"], "t4")
+
+
+class TestWorkloadProfiles(unittest.TestCase):
+
+    def test_predefined_profiles_sum_to_one(self):
+        for name, dist in WORKLOAD_PROFILES.items():
+            total = sum(w for _, w in dist)
+            self.assertAlmostEqual(total, 1.0, places=2,
+                                   msg=f"Profile '{name}' sums to {total}")
+
+    def test_parse_named_profile(self):
+        name, dist = parse_workload("chat")
+        self.assertEqual(name, "chat")
+        self.assertEqual(dist, WORKLOAD_PROFILES["chat"])
+
+    def test_parse_custom_workload(self):
+        name, dist = parse_workload("50:0.3,200:0.5,1000:0.2")
+        self.assertEqual(name, "custom")
+        self.assertEqual(len(dist), 3)
+        self.assertEqual(dist[0][0], 50)
+        self.assertAlmostEqual(sum(w for _, w in dist), 1.0)
+
+    def test_custom_workload_normalizes(self):
+        name, dist = parse_workload("100:1,200:1,300:1")
+        self.assertEqual(name, "custom")
+        for _, w in dist:
+            self.assertAlmostEqual(w, 1 / 3, places=5)
+
+
+class TestEstimatePrefillRate(unittest.TestCase):
+
+    def test_phi3_matches_calibration(self):
+        profile = ModelProfile(model_id="test", num_params=int(3.8e9))
+        rate = _estimate_prefill_rate(profile, "t4")
+        self.assertAlmostEqual(rate, 1.70, places=0)
+
+    def test_scales_with_model_size(self):
+        small = ModelProfile(model_id="s", num_params=int(0.5e9))
+        large = ModelProfile(model_id="l", num_params=int(3.0e9))
+        self.assertGreater(
+            _estimate_prefill_rate(large, "t4"),
+            _estimate_prefill_rate(small, "t4"))
+
+    def test_faster_gpu_lower_rate(self):
+        profile = ModelProfile(model_id="test", num_params=int(3e9))
+        t4_rate = _estimate_prefill_rate(profile, "t4")
+        a100_rate = _estimate_prefill_rate(profile, "a100_80")
+        self.assertGreater(t4_rate, a100_rate)
+
+    def test_fallback_when_no_params(self):
+        profile = ModelProfile(model_id="test", num_params=0)
+        rate = _estimate_prefill_rate(profile, "t4")
+        self.assertGreater(rate, 0)
+
+
+class TestOverheadAsymptoteFallback(unittest.TestCase):
+
+    def test_phi3_uses_measured_rate(self):
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4")
+        self.assertAlmostEqual(plan.overhead_asymptote, 1.77, places=1)
+
+    def test_qwen3b_gets_nonzero_tinf(self):
+        plan = plan_capacity(
+            "Qwen/Qwen2.5-3B-Instruct",
+            target_throughput=1.0, gpu_type="t4")
+        self.assertGreater(plan.overhead_asymptote, 1.0)
+        self.assertGreater(plan.predicted_delta_gamma, 0)
+
+    def test_gqa_lower_tinf_than_mha(self):
+        """GQA models (few KV heads) have less NIXL overhead → lower T(∞)."""
+        qwen = plan_capacity(
+            "Qwen/Qwen2.5-3B-Instruct",
+            target_throughput=1.0, gpu_type="t4")
+        phi3 = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4")
+        self.assertLess(qwen.overhead_asymptote, phi3.overhead_asymptote)
+
+    def test_sweep_works_for_non_phi3(self):
+        sweep = sweep_seq_lens("Qwen/Qwen2.5-3B-Instruct", gpu_type="t4",
+                               seq_lens=[100, 500, 1000])
+        self.assertGreater(sweep["t_inf"], 1.0)
+        for e in sweep["entries"]:
+            self.assertNotEqual(e["delta_gamma"], 0)
+
+
+class TestAnalyzeWorkload(unittest.TestCase):
+
+    def test_chat_workload_mono_at_low_c(self):
+        result = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=WORKLOAD_PROFILES["chat"],
+            workload_name="chat", gpu_type="t4")
+        ca_c4 = next(ca for ca in result.concurrency_analysis
+                     if ca["concurrency"] == 4)
+        self.assertEqual(ca_c4["verdict"], "MONO")
+
+    def test_summarization_differs_from_chat(self):
+        chat = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=WORKLOAD_PROFILES["chat"],
+            workload_name="chat", gpu_type="t4")
+        summ = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=WORKLOAD_PROFILES["summarization"],
+            workload_name="summarization", gpu_type="t4")
+        self.assertGreater(summ.frac_above_scross, chat.frac_above_scross)
+
+    def test_weighted_mono_less_than_disagg_at_c1(self):
+        result = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=[(100, 0.5), (1000, 0.5)],
+            gpu_type="t4")
+        self.assertLess(result.weighted_mono_ttft, result.weighted_disagg_ttft)
+
+    def test_all_long_prompts_eventually_disagg(self):
+        result = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=[(2000, 0.5), (4000, 0.5)],
+            workload_name="long", gpu_type="t4")
+        self.assertAlmostEqual(result.frac_above_scross, 1.0)
+        disagg_at_some_c = any(ca["verdict"] == "DISAGG"
+                               for ca in result.concurrency_analysis)
+        self.assertTrue(disagg_at_some_c)
+
+    def test_concurrency_analysis_has_entries(self):
+        result = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=[(100, 1.0)],
+            gpu_type="t4")
+        self.assertGreater(len(result.concurrency_analysis), 0)
+        for ca in result.concurrency_analysis:
+            self.assertIn("concurrency", ca)
+            self.assertIn("mono_ttft_at_c", ca)
+            self.assertIn("disagg_ttft", ca)
+            self.assertIn("verdict", ca)
+
+    def test_ttft_weighted_not_ratio_weighted(self):
+        """Long prompts should dominate the aggregate, not get equal weight."""
+        result = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=[(100, 0.8), (4000, 0.2)],
+            workload_name="mixed", gpu_type="t4")
+        ca_c32 = next(ca for ca in result.concurrency_analysis
+                      if ca["concurrency"] == 32)
+        mono_c1 = result.weighted_mono_ttft
+        mono_c32 = ca_c32["mono_ttft_at_c"]
+        self.assertGreater(mono_c32, mono_c1,
+                           "Contention should raise expected mono TTFT")
 
 
 if __name__ == "__main__":
