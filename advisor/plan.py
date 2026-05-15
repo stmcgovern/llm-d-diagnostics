@@ -212,6 +212,7 @@ class CapacityPlan:
     predicted_crossover_c: float = 0.0
     predicted_s_cross: float = 0.0
     measured_delta_gamma: float = 0.0
+    measured_delta_gamma_by_s: dict = field(default_factory=dict)
     measured_fit_a: float = 0.0
     measured_fit_b: float = 0.0
     measured_fit_r2: float = 0.0
@@ -301,11 +302,16 @@ def plan_capacity(
             if "predicted_crossover_c" not in t:
                 c_cross = _predict_crossover_c(t["threshold"], dg)
                 t["predicted_crossover_c"] = round(c_cross, 1)
-        if plan.overhead_thresholds and plan.predicted_crossover_c == 0:
-            t0 = plan.overhead_thresholds[0]
-            dg0 = _predict_delta_gamma(t0["seq_len"], plan.overhead_asymptote)
-            plan.predicted_crossover_c = round(
-                _predict_crossover_c(t0["threshold"], dg0), 1)
+        if plan.predicted_crossover_c == 0:
+            if plan.overhead_thresholds:
+                t0 = plan.overhead_thresholds[0]
+                dg0 = _predict_delta_gamma(t0["seq_len"], plan.overhead_asymptote)
+                plan.predicted_crossover_c = round(
+                    _predict_crossover_c(t0["threshold"], dg0), 1)
+            elif plan.mono_est_ttft_ms > 0 and plan.disagg_est_ttft_ms > 0:
+                t_s = plan.disagg_est_ttft_ms / plan.mono_est_ttft_ms
+                plan.predicted_crossover_c = round(
+                    _predict_crossover_c(t_s, plan.predicted_delta_gamma), 1)
 
     _generate_recommendation(plan)
 
@@ -474,10 +480,11 @@ def _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price):
             break
         prev_c, prev_cv = c, cv
 
-    fit_a, fit_b, fit_r2, _dg_by_s = _fit_measured_delta_gamma(plan.contention_table)
+    fit_a, fit_b, fit_r2, dg_by_s = _fit_measured_delta_gamma(plan.contention_table)
     plan.measured_fit_a = round(fit_a, 3)
     plan.measured_fit_b = round(fit_b, 3)
     plan.measured_fit_r2 = round(fit_r2, 2)
+    plan.measured_delta_gamma_by_s = dg_by_s
     if fit_b != 0 or fit_a != 0:
         plan.measured_delta_gamma = round(
             fit_a + fit_b * math.log(max(seq_len, 1)), 3)
@@ -649,14 +656,18 @@ def _predict_s_cross(overhead_asymptote: float) -> float:
 
 def _fit_measured_delta_gamma(contention_table: list) -> tuple:
     by_s = {}
+    by_cfg_s = {}
     for e in contention_table:
         c, sl = e["concurrency"], e["seq_len"]
+        cfg = e.get("config", "")
         if c <= 1:
             continue
         r = e["contention_ratio"]
         if r <= 0:
             continue
         by_s.setdefault(sl, []).append((math.log(c), math.log(r)))
+        by_cfg_s.setdefault(cfg, {}).setdefault(sl, []).append(
+            (math.log(c), math.log(r)))
 
     dg_points = []
     dg_by_s = {}
@@ -675,6 +686,14 @@ def _fit_measured_delta_gamma(contention_table: list) -> tuple:
     ss_tot = sum((y - y_mean) ** 2 for _, y in dg_points)
     ss_res = sum((y - (intercept + slope * x)) ** 2 for x, y in dg_points)
     r_sq = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    for cfg, cfg_data in by_cfg_s.items():
+        for sl, pts in sorted(cfg_data.items()):
+            if len(pts) < 2:
+                continue
+            _, gamma = _linreg(pts)
+            dg_by_s[(cfg, sl)] = round(gamma, 3)
+
     return intercept, slope, max(r_sq, 0.0), dg_by_s
 
 
@@ -923,8 +942,10 @@ def _generate_recommendation(plan):
                 f"Predicted crossover at c≈{plan.predicted_crossover_c:.0f} — "
                 f"may win under load (Δγ={dg:.2f})")
         else:
+            # Δγ > 0 and c_cross ≤ 1 implies T(s) ≤ 1 — disagg already wins at c=1
+            plan.recommendation = "DISAGGREGATE (c=1 estimate)"
             plan.reasoning.append(
-                f"At c=1, disagg adds {overhead_pct}% overhead")
+                f"Disagg already faster at c=1 by {-overhead_pct}% (Δγ={dg:.2f})")
         plan.reasoning.append(
             "To measure: ./toolkit/run.sh <cluster> tput-seqlen")
 
@@ -1001,6 +1022,40 @@ def print_plan(plan: CapacityPlan):
             print(f"    Fit R² = {plan.measured_fit_r2:.2f}")
             print(f"    At s={plan.seq_len}: predicted Δγ={pred_dg:.3f}  "
                   f"measured Δγ={meas_dg:.3f}  (error: {err:+.0f}%)")
+
+            pooled = {k: v for k, v in plan.measured_delta_gamma_by_s.items()
+                      if isinstance(k, int)}
+            per_cfg = {}
+            for k, v in plan.measured_delta_gamma_by_s.items():
+                if isinstance(k, tuple):
+                    cfg, sl = k
+                    per_cfg.setdefault(sl, {})[cfg] = v
+
+            if pooled:
+                print("    Per-seq_len Δγ (pooled fit → per-point residual):")
+                a, b = plan.measured_fit_a, plan.measured_fit_b
+                for sl in sorted(pooled):
+                    fitted = a + b * math.log(sl)
+                    resid = pooled[sl] - fitted
+                    cfg_parts = ""
+                    if sl in per_cfg and len(per_cfg[sl]) > 1:
+                        parts = [f"{c}={v:.3f}" for c, v in
+                                 sorted(per_cfg[sl].items())]
+                        cfg_parts = f"  [{', '.join(parts)}]"
+                    print(f"      s={sl:>5}: Δγ={pooled[sl]:+.3f}  "
+                          f"fit={fitted:+.3f}  resid={resid:+.3f}{cfg_parts}")
+
+                if per_cfg:
+                    max_spread = 0.0
+                    for sl, cfgs in per_cfg.items():
+                        if len(cfgs) > 1:
+                            vals = list(cfgs.values())
+                            max_spread = max(max_spread,
+                                             max(vals) - min(vals))
+                    if max_spread > 0.1:
+                        print(f"    WARNING: config spread {max_spread:.2f} — "
+                              f"1D and 2D may have different scaling")
+
             max_c = max((e["concurrency"] for e in plan.contention_table), default=16)
             for c in [2, 4, 8, 16]:
                 if c > max_c * 2:
@@ -1125,6 +1180,8 @@ def save_plan(plan: CapacityPlan, path: Path):
         "predicted_crossover_c": plan.predicted_crossover_c,
         "predicted_s_cross": plan.predicted_s_cross,
         "measured_delta_gamma": plan.measured_delta_gamma,
+        "measured_delta_gamma_by_s": {
+            str(k): v for k, v in plan.measured_delta_gamma_by_s.items()},
         "measured_fit_a": plan.measured_fit_a,
         "measured_fit_b": plan.measured_fit_b,
         "measured_fit_r2": plan.measured_fit_r2,
