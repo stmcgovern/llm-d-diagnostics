@@ -10,8 +10,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from plan import (
+    BytesPerToken,
     CONTENTION_SCALE_A,
-    CONTENTION_SCALE_B,
+    CONTENTION_SCALE_B_REF,
+    CONTENTION_KV_REF,
     KV_BYTES_PER_TOKEN,
     MEASURED_BASELINES,
     MOE_NIXL_CORRECTION,
@@ -21,6 +23,7 @@ from plan import (
     ModelProfile,
     _baseline_ttft,
     _check_vram_feasibility,
+    _contention_scale_b,
     _estimate_kv_bytes,
     _estimate_nixl_ms,
     _estimate_overhead_asymptote,
@@ -50,8 +53,10 @@ class TestPlanCapacityMeasured(unittest.TestCase):
             target_throughput=1.0, target_ttft_ms=500, gpu_type="t4",
         )
         self.assertEqual(plan.confidence, "measured")
-        self.assertEqual(plan.mono_est_ttft_ms, 73)
-        self.assertEqual(plan.disagg_est_ttft_ms, 109)
+        # TTFT scales with seq_len (default 128) via estimated prefill rate
+        self.assertGreater(plan.mono_est_ttft_ms, 73)
+        self.assertLess(plan.mono_est_ttft_ms, 120)
+        self.assertGreater(plan.disagg_est_ttft_ms, 109)
         self.assertGreater(plan.mono_total_gpus, 0)
         self.assertGreater(plan.disagg_total_gpus, 0)
 
@@ -61,7 +66,9 @@ class TestPlanCapacityMeasured(unittest.TestCase):
             target_throughput=0.5, target_ttft_ms=5000, gpu_type="t4",
         )
         self.assertEqual(plan.confidence, "measured")
-        self.assertEqual(plan.mono_est_ttft_ms, 2999)
+        # OLMoE at s=128 scales from measured 2999ms at ref ~100 tokens
+        self.assertGreater(plan.mono_est_ttft_ms, 2999)
+        self.assertLess(plan.mono_est_ttft_ms, 4000)
 
     def test_recommendation_is_set(self):
         plan = plan_capacity(
@@ -236,7 +243,8 @@ class TestSeqLenScaling(unittest.TestCase):
         self.assertLess(plan_short.disagg_est_ttft_ms, 900)
         self.assertGreater(plan_long.disagg_est_ttft_ms, 3000)
 
-    def test_constant_baseline_unchanged_by_seq_len(self):
+    def test_baseline_scales_with_seq_len(self):
+        """TTFT scales with seq_len via estimated prefill rate."""
         plan_50 = plan_capacity(
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             target_throughput=1.0, target_ttft_ms=500,
@@ -247,10 +255,8 @@ class TestSeqLenScaling(unittest.TestCase):
             target_throughput=1.0, target_ttft_ms=500,
             gpu_type="t4", seq_len=1000,
         )
-        self.assertEqual(plan_50.mono_est_ttft_ms, 73)
-        self.assertEqual(plan_1000.mono_est_ttft_ms, 73)
-        self.assertEqual(plan_50.disagg_est_ttft_ms, 109)
-        self.assertEqual(plan_1000.disagg_est_ttft_ms, 109)
+        self.assertGreater(plan_1000.mono_est_ttft_ms, plan_50.mono_est_ttft_ms)
+        self.assertGreater(plan_1000.disagg_est_ttft_ms, plan_50.disagg_est_ttft_ms)
 
     def test_seq_len_noted_in_reasoning(self):
         plan = plan_capacity(
@@ -261,14 +267,16 @@ class TestSeqLenScaling(unittest.TestCase):
         reasoning = " ".join(plan.reasoning)
         self.assertIn("500 tokens", reasoning)
 
-    def test_domain_warning_without_rates(self):
+    def test_estimated_rate_noted_in_reasoning(self):
+        """When no measured rate, estimated rate is noted in reasoning."""
         plan = plan_capacity(
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             target_throughput=1.0, target_ttft_ms=500,
             gpu_type="t4", seq_len=500,
         )
         reasoning = " ".join(plan.reasoning)
-        self.assertIn("may diverge", reasoning)
+        self.assertIn("estimated", reasoning)
+        self.assertIn("ms/token", reasoning)
 
     def test_no_warning_near_ref_seq_len(self):
         plan = plan_capacity(
@@ -309,39 +317,39 @@ class TestEstimateKvBytes(unittest.TestCase):
 class TestEstimateNixlMs(unittest.TestCase):
 
     def test_zero_seq_len_returns_protocol_only(self):
-        ms = _estimate_nixl_ms(393_216, seq_len=0)
+        ms = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=0)
         self.assertAlmostEqual(ms, NIXL_PROTOCOL_MS)
 
     def test_seq_len_increases_transfer_time(self):
-        ms_short = _estimate_nixl_ms(393_216, seq_len=10)
-        ms_long = _estimate_nixl_ms(393_216, seq_len=1000)
+        ms_short = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=10)
+        ms_long = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=1000)
         self.assertGreater(ms_long, ms_short)
 
     def test_data_term_scales_linearly_with_seq_len(self):
-        ms_128 = _estimate_nixl_ms(393_216, seq_len=128)
-        ms_256 = _estimate_nixl_ms(393_216, seq_len=256)
+        ms_128 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=128)
+        ms_256 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=256)
         data_128 = ms_128 - NIXL_PROTOCOL_MS
         data_256 = ms_256 - NIXL_PROTOCOL_MS
         self.assertAlmostEqual(data_256 / data_128, 2.0, places=3)
 
     def test_data_term_scales_with_kv_bytes(self):
-        ms_small = _estimate_nixl_ms(14_336, seq_len=1000)
-        ms_large = _estimate_nixl_ms(393_216, seq_len=1000)
+        ms_small = _estimate_nixl_ms(BytesPerToken(14_336), seq_len=1000)
+        ms_large = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=1000)
         data_small = ms_small - NIXL_PROTOCOL_MS
         data_large = ms_large - NIXL_PROTOCOL_MS
         self.assertAlmostEqual(data_large / data_small, 393_216 / 14_336, places=1)
 
     def test_moe_correction_on_data_term(self):
         """MOE correction scales data term only, not protocol overhead."""
-        ms_base = _estimate_nixl_ms(65_536, seq_len=100)
-        ms_moe = _estimate_nixl_ms(65_536, seq_len=100, is_moe=True)
+        ms_base = _estimate_nixl_ms(BytesPerToken(65_536), seq_len=100)
+        ms_moe = _estimate_nixl_ms(BytesPerToken(65_536), seq_len=100, is_moe=True)
         data_base = ms_base - NIXL_PROTOCOL_MS
         data_moe = ms_moe - NIXL_PROTOCOL_MS
         self.assertAlmostEqual(data_moe / data_base, MOE_NIXL_CORRECTION, places=2)
 
     def test_h100_faster_nic(self):
-        ms_t4 = _estimate_nixl_ms(393_216, seq_len=1000, gpu_type="t4")
-        ms_h100 = _estimate_nixl_ms(393_216, seq_len=1000, gpu_type="h100")
+        ms_t4 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=1000, gpu_type="t4")
+        ms_h100 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=1000, gpu_type="h100")
         self.assertLess(ms_h100, ms_t4)
         data_t4 = ms_t4 - NIXL_PROTOCOL_MS
         data_h100 = ms_h100 - NIXL_PROTOCOL_MS
@@ -349,22 +357,22 @@ class TestEstimateNixlMs(unittest.TestCase):
 
     def test_protocol_dominates_at_short_seq(self):
         """For small-KV models at L=1, protocol overhead > data term."""
-        ms = _estimate_nixl_ms(14_336, seq_len=1)
+        ms = _estimate_nixl_ms(BytesPerToken(14_336), seq_len=1)
         data_ms = ms - NIXL_PROTOCOL_MS
         self.assertGreater(NIXL_PROTOCOL_MS, data_ms)
 
     def test_block_alignment(self):
         """L=15 and L=16 both round to 16-token block; L=17 rounds to 32."""
-        ms_15 = _estimate_nixl_ms(393_216, seq_len=15)
-        ms_16 = _estimate_nixl_ms(393_216, seq_len=16)
-        ms_17 = _estimate_nixl_ms(393_216, seq_len=17)
+        ms_15 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=15)
+        ms_16 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=16)
+        ms_17 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=17)
         self.assertEqual(ms_15, ms_16)
         self.assertGreater(ms_17, ms_16)
 
     def test_gqa_visible_at_long_seq(self):
         """At L=1000, high-KV model should be much slower than low-KV model."""
-        ms_qwen = _estimate_nixl_ms(14_336, seq_len=1000)
-        ms_phi3 = _estimate_nixl_ms(393_216, seq_len=1000)
+        ms_qwen = _estimate_nixl_ms(BytesPerToken(14_336), seq_len=1000)
+        ms_phi3 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=1000)
         self.assertGreater(ms_phi3 - ms_qwen, 50)
 
 
@@ -1114,7 +1122,7 @@ class TestOverheadAsymptote(unittest.TestCase):
 
     def test_asymptote_function_directly(self):
         """_estimate_overhead_asymptote computes 1 + nixl_rate/prefill_rate."""
-        kv_bytes = 2 * 32 * 32 * 96 * 2  # Phi-3-like
+        kv_bytes = BytesPerToken(2 * 32 * 32 * 96 * 2)  # Phi-3-like
         prefill_rate = 1.70  # ms/token (measured)
         t_inf = _estimate_overhead_asymptote(kv_bytes, prefill_rate, "t4")
         self.assertGreater(t_inf, 1.0)
@@ -1599,9 +1607,9 @@ class TestPredictDeltaGamma(unittest.TestCase):
         self.assertGreater(dg_low, dg_high)
 
     def test_unit_overhead(self):
-        # T(∞)=1.0 → A term is zero, only B·ln(s)
+        # T(∞)=1.0 → A term is zero, only C_B·ln(s) at reference kv
         dg = _predict_delta_gamma(100, 1.0)
-        self.assertAlmostEqual(dg, CONTENTION_SCALE_B * math.log(100), places=3)
+        self.assertAlmostEqual(dg, CONTENTION_SCALE_B_REF * math.log(100), places=3)
 
 
 class TestPredictContentionRatio(unittest.TestCase):
@@ -1647,9 +1655,9 @@ class TestPredictCrossoverC(unittest.TestCase):
 class TestPredictSCross(unittest.TestCase):
 
     def test_basic(self):
-        # T(∞)=1.86 → s_cross = exp(C_A*(1.86-1)/C_B) = exp(0.889*0.86/0.144)
+        # T(∞)=1.86 → s_cross = exp(C_A*(1.86-1)/C_B_REF) at reference kv
         s = _predict_s_cross(1.86)
-        expected = math.exp(CONTENTION_SCALE_A * 0.86 / CONTENTION_SCALE_B)
+        expected = math.exp(CONTENTION_SCALE_A * 0.86 / CONTENTION_SCALE_B_REF)
         self.assertAlmostEqual(s, expected, places=0)
 
     def test_unit_overhead(self):
@@ -1844,7 +1852,8 @@ class TestOverheadAsymptoteFallback(unittest.TestCase):
             "Qwen/Qwen2.5-3B-Instruct",
             target_throughput=1.0, gpu_type="t4")
         self.assertGreater(plan.overhead_asymptote, 1.0)
-        self.assertGreater(plan.predicted_delta_gamma, 0)
+        # GQA model: architecture-aware C_B is very small → Δγ near zero
+        self.assertAlmostEqual(plan.predicted_delta_gamma, 0, delta=0.1)
 
     def test_gqa_lower_tinf_than_mha(self):
         """GQA models (few KV heads) have less NIXL overhead → lower T(∞)."""
@@ -1927,6 +1936,83 @@ class TestAnalyzeWorkload(unittest.TestCase):
         mono_c32 = ca_c32["mono_ttft_at_c"]
         self.assertGreater(mono_c32, mono_c1,
                            "Contention should raise expected mono TTFT")
+
+
+# ── Unit types ──────────────────────────────────────────────────────────
+
+class TestUnitTypes(unittest.TestCase):
+
+    def test_bytes_per_token_is_int(self):
+        b = BytesPerToken(393216)
+        self.assertIsInstance(b, int)
+        self.assertIsInstance(b, BytesPerToken)
+
+    def test_isinstance_distinguishes_types(self):
+        b = BytesPerToken(100)
+        self.assertIsInstance(b, BytesPerToken)
+        self.assertNotIsInstance(100, BytesPerToken)
+
+    def test_estimate_kv_bytes_returns_typed(self):
+        profile = ModelProfile(model_id="microsoft/Phi-3-mini-4k-instruct")
+        result = _estimate_kv_bytes(profile)
+        self.assertIsInstance(result, BytesPerToken)
+
+    def test_contention_scale_b_rejects_raw_int(self):
+        with self.assertRaises(AssertionError):
+            _contention_scale_b(393216)
+
+    def test_estimate_nixl_ms_rejects_raw_int(self):
+        with self.assertRaises(AssertionError):
+            _estimate_nixl_ms(393216, seq_len=128)
+
+    def test_estimate_overhead_asymptote_rejects_raw_int(self):
+        with self.assertRaises(AssertionError):
+            _estimate_overhead_asymptote(393216, 1.70, "t4")
+
+
+# ── Architecture-aware C_B ─────────────────────────────────────────────
+
+class TestContentionScaleB(unittest.TestCase):
+
+    def test_phi3_matches_ref(self):
+        c_b = _contention_scale_b(CONTENTION_KV_REF)
+        self.assertAlmostEqual(c_b, CONTENTION_SCALE_B_REF, places=6)
+
+    def test_gqa_lower(self):
+        qwen_kv = BytesPerToken(2 * 36 * 2 * 128 * 2)  # Qwen 3B: 36864
+        c_b = _contention_scale_b(qwen_kv)
+        self.assertAlmostEqual(c_b, CONTENTION_SCALE_B_REF * 36864 / 393216,
+                               places=5)
+        self.assertLess(c_b, CONTENTION_SCALE_B_REF / 5)
+
+    def test_proportional(self):
+        c_b_1x = _contention_scale_b(BytesPerToken(100000))
+        c_b_2x = _contention_scale_b(BytesPerToken(200000))
+        self.assertAlmostEqual(c_b_2x / c_b_1x, 2.0, places=5)
+
+
+class TestArchitectureAwarePredictions(unittest.TestCase):
+
+    def test_gqa_higher_s_cross_same_tinf(self):
+        """At same T(∞), smaller C_B (GQA) → higher s_cross."""
+        phi3_kv = CONTENTION_KV_REF
+        qwen_kv = BytesPerToken(36864)
+        t_inf = 1.77
+        s_cross_phi3 = _predict_s_cross(t_inf, phi3_kv)
+        s_cross_qwen = _predict_s_cross(t_inf, qwen_kv)
+        self.assertGreater(s_cross_qwen, s_cross_phi3 * 5)
+
+    def test_gqa_delta_gamma_near_zero(self):
+        """At s=128, GQA model should have Δγ ≈ 0."""
+        qwen_kv = BytesPerToken(36864)
+        dg = _predict_delta_gamma(128, 1.05, qwen_kv)
+        self.assertAlmostEqual(dg, 0, delta=0.05)
+
+    def test_mha_matches_original(self):
+        """Phi-3 predictions unchanged at reference kv_bytes."""
+        dg_new = _predict_delta_gamma(500, 1.77, CONTENTION_KV_REF)
+        dg_default = _predict_delta_gamma(500, 1.77)
+        self.assertAlmostEqual(dg_new, dg_default, places=6)
 
 
 if __name__ == "__main__":

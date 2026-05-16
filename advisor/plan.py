@@ -33,6 +33,24 @@ except ImportError:
     )
 
 
+# ---------------------------------------------------------------------------
+# Unit types — subclass int/float for isinstance() + static type checking.
+# Arithmetic degrades to base type; we assert at function boundaries.
+# ---------------------------------------------------------------------------
+
+class BytesPerToken(int):
+    """KV cache size [B/token]."""
+
+class Milliseconds(float):
+    """Time duration [ms]."""
+
+class GBPerSec(float):
+    """Bandwidth [GB/s]."""
+
+class Dimensionless(float):
+    """Ratio or exponent — no physical unit."""
+
+
 DTYPE_BYTES = {"float32": 4, "float16": 2, "bfloat16": 2}
 
 
@@ -147,33 +165,42 @@ MEASURED_BASELINES = {
 
 # KV cache bytes per token = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
 KV_BYTES_PER_TOKEN = {
-    "Qwen/Qwen2.5-0.5B-Instruct": 2 * 24 * 2 * 64 * 2,
-    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": 2 * 22 * 4 * 64 * 2,
-    "Qwen/Qwen2.5-1.5B-Instruct": 2 * 28 * 2 * 64 * 2,
-    "stabilityai/stablelm-2-1_6b-chat": 2 * 24 * 32 * 64 * 2,
-    "HuggingFaceTB/SmolLM2-1.7B-Instruct": 2 * 24 * 32 * 64 * 2,
-    "Qwen/Qwen2.5-3B-Instruct": 2 * 36 * 2 * 128 * 2,
-    "microsoft/Phi-3.5-mini-instruct": 2 * 32 * 32 * 96 * 2,
-    "allenai/OLMoE-1B-7B-0924-Instruct": 2 * 16 * 16 * 128 * 2,
-    "microsoft/Phi-3-mini-4k-instruct": 2 * 32 * 32 * 96 * 2,
+    "Qwen/Qwen2.5-0.5B-Instruct": BytesPerToken(2 * 24 * 2 * 64 * 2),
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": BytesPerToken(2 * 22 * 4 * 64 * 2),
+    "Qwen/Qwen2.5-1.5B-Instruct": BytesPerToken(2 * 28 * 2 * 64 * 2),
+    "stabilityai/stablelm-2-1_6b-chat": BytesPerToken(2 * 24 * 32 * 64 * 2),
+    "HuggingFaceTB/SmolLM2-1.7B-Instruct": BytesPerToken(2 * 24 * 32 * 64 * 2),
+    "Qwen/Qwen2.5-3B-Instruct": BytesPerToken(2 * 36 * 2 * 128 * 2),
+    "microsoft/Phi-3.5-mini-instruct": BytesPerToken(2 * 32 * 32 * 96 * 2),
+    "allenai/OLMoE-1B-7B-0924-Instruct": BytesPerToken(2 * 16 * 16 * 128 * 2),
+    "microsoft/Phi-3-mini-4k-instruct": BytesPerToken(2 * 32 * 32 * 96 * 2),
 }
+
+# Dimensional chain (each arrow = a function in this module):
+#   Architecture → kv_bytes [B/token]          (_estimate_kv_bytes)
+#   kv_bytes × seq_len → transfer [B]          (_estimate_nixl_ms)
+#   transfer / bw → nixl_ms [ms]               (_estimate_nixl_ms)
+#   nixl_rate / prefill_rate → T(∞) [·]        (_estimate_overhead_asymptote)
+#   -C_A·(T(∞)-1) + C_B·ln(s) → Δγ(s) [·]    (_predict_delta_gamma)
+#   c^Δγ → R(c,s) [·]                          (_predict_contention_ratio)
+#   T(s)^(1/Δγ) → c_cross [·]                  (_predict_crossover_c)
 
 # NIXL transfer model: T_transfer = protocol_ms + (kv_bytes * seq_len) / eff_bw
 # Measured via exp5b direct NIXL prometheus scraping on T4 cluster (R²=0.999).
-# protocol_ms is fixed overhead (NIXL handshake, buffer setup) — model-independent.
-# eff_bw is effective NIC throughput in GB/s — hardware-dependent.
-NIXL_PROTOCOL_MS = 4.3         # regression intercept (exp5b, 180 points, Phi-3 on T4)
-NIXL_EFF_BW_GBS = 0.299        # regression slope -> effective bandwidth (10 Gbps OVN/TCP)
-MOE_NIXL_CORRECTION = 1.0      # MoE uses dense attention → KV transfer is identical to dense
+NIXL_PROTOCOL_MS = Milliseconds(4.3)     # [ms] regression intercept (exp5b, Phi-3/T4)
+NIXL_EFF_BW_GBS = GBPerSec(0.299)        # [GB/s] effective NIC throughput (10 Gbps OVN/TCP)
+MOE_NIXL_CORRECTION = Dimensionless(1.0) # [·] MoE dense attention → same KV transfer
 
-# Contention model: R(c,s) = c^Δγ(s), Δγ(s) = -C_A·(T(∞)-1) + C_B·ln(s)
+# Contention model: R(c,s) = c^Δγ(s), Δγ(s) = -C_A·(T(∞)-1) + C_B(kv)·ln(s)
 # Power-law scaling: α_mono ~ c^γ_mono(s), α_disagg ~ c^γ_disagg (constant).
 # Δγ = γ_mono - γ_disagg captures two competing effects:
-#   C_A: NIXL serialization (hurts disagg at short s, per unit T(∞) overhead)
-#   C_B: decode interference (helps disagg at long s, O(s) attention)
+#   C_A: NIXL serialization [·] — hurts disagg, hardware-dependent
+#   C_B: decode interference [1/ln(tokens)] — helps disagg, architecture-dependent
+#        C_B ∝ kv_bytes_per_token (GQA models have fewer KV heads → lower C_B)
 # Calibrated from Phi-3/T4/TCP (N=1). Valid for c ≤ ~32.
-CONTENTION_SCALE_A = 0.889   # NIXL serialization rate (Phi-3/T4/TCP, N=1)
-CONTENTION_SCALE_B = 0.144   # decode interference rate per ln(s)
+CONTENTION_SCALE_A = Dimensionless(0.889)       # [·] NIXL serialization rate
+CONTENTION_SCALE_B_REF = Dimensionless(0.144)   # [1/ln(tokens)] Phi-3 reference
+CONTENTION_KV_REF = BytesPerToken(393216)        # [B/token] Phi-3: 2×32L×32KV×96d×2B
 
 
 @dataclass
@@ -276,7 +303,7 @@ def plan_capacity(
     elif (model_id, gpu_type) in MEASURED_BASELINES:
         plan.confidence = "measured"
         _plan_from_measured(plan, MEASURED_BASELINES[(model_id, gpu_type)],
-                           target_throughput, price, seq_len)
+                           target_throughput, price, seq_len, profile, gpu_type)
     else:
         _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp, seq_len)
 
@@ -296,18 +323,18 @@ def plan_capacity(
 
     if plan.overhead_asymptote > 0:
         plan.predicted_delta_gamma = round(
-            _predict_delta_gamma(seq_len, plan.overhead_asymptote), 3)
+            _predict_delta_gamma(seq_len, plan.overhead_asymptote, kv_bytes), 3)
         plan.predicted_s_cross = round(
-            _predict_s_cross(plan.overhead_asymptote), 0)
+            _predict_s_cross(plan.overhead_asymptote, kv_bytes), 0)
         for t in plan.overhead_thresholds:
-            dg = _predict_delta_gamma(t["seq_len"], plan.overhead_asymptote)
+            dg = _predict_delta_gamma(t["seq_len"], plan.overhead_asymptote, kv_bytes)
             if "predicted_crossover_c" not in t:
                 c_cross = _predict_crossover_c(t["threshold"], dg)
                 t["predicted_crossover_c"] = round(c_cross, 1)
         if plan.predicted_crossover_c == 0:
             if plan.overhead_thresholds:
                 t0 = plan.overhead_thresholds[0]
-                dg0 = _predict_delta_gamma(t0["seq_len"], plan.overhead_asymptote)
+                dg0 = _predict_delta_gamma(t0["seq_len"], plan.overhead_asymptote, kv_bytes)
                 plan.predicted_crossover_c = round(
                     _predict_crossover_c(t0["threshold"], dg0), 1)
             elif plan.mono_est_ttft_ms > 0 and plan.disagg_est_ttft_ms > 0:
@@ -320,13 +347,22 @@ def plan_capacity(
     return plan
 
 
-def _baseline_ttft(baseline, seq_len, field="mono"):
-    """Get TTFT from a baseline, seq_len-aware if rate data available."""
+def _baseline_ttft(baseline, seq_len, field="mono", estimated_rate: float = 0):
+    """Get TTFT from a baseline, scaling with seq_len.
+
+    Priority: (1) measured base+rate from experiment, (2) estimated rate
+    from model size, (3) flat TTFT (only valid near ref_seq_len).
+    """
     base_key = f"{field}_ttft_base_ms"
     rate_key = f"{field}_ttft_rate"
     if base_key in baseline and rate_key in baseline:
         return baseline[base_key] + baseline[rate_key] * seq_len
-    return baseline[f"{field}_ttft_ms"]
+    flat_ttft = baseline[f"{field}_ttft_ms"]
+    if estimated_rate > 0:
+        ref_seq = baseline.get("ref_seq_len", 100)
+        base_ms = max(flat_ttft - estimated_rate * ref_seq, 10)
+        return base_ms + estimated_rate * seq_len
+    return flat_ttft
 
 
 def _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price):
@@ -509,14 +545,32 @@ def _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price):
         f"({plan.measured_conditions})")
 
 
-def _plan_from_measured(plan, measured, target_throughput, price, seq_len=128):
+def _plan_from_measured(plan, measured, target_throughput, price, seq_len=128,
+                        profile=None, gpu_type="t4"):
     """Plan using actual measured data from our experiments."""
     mono_rps = measured["mono_throughput"]
     disagg_rps = measured["disagg_throughput"]
     gpus_per = plan.mono_gpus_per_instance
 
-    mono_ttft = _baseline_ttft(measured, seq_len)
-    disagg_ttft = _baseline_ttft(measured, seq_len, "disagg")
+    est_rate = 0.0
+    has_rates = "mono_ttft_base_ms" in measured
+    if profile and not has_rates:
+        est_rate = _estimate_prefill_rate(profile, gpu_type)
+
+    mono_ttft = _baseline_ttft(measured, seq_len, estimated_rate=est_rate)
+
+    if has_rates:
+        disagg_ttft = _baseline_ttft(measured, seq_len, "disagg")
+    elif profile:
+        ref_seq = measured.get("ref_seq_len", 100)
+        overhead_ref = measured["disagg_ttft_ms"] - measured["mono_ttft_ms"]
+        kv_bytes = _estimate_kv_bytes(profile)
+        nixl_ref = float(_estimate_nixl_ms(kv_bytes, ref_seq, gpu_type, profile.is_moe))
+        nixl_s = float(_estimate_nixl_ms(kv_bytes, seq_len, gpu_type, profile.is_moe))
+        disagg_ttft = max(mono_ttft + overhead_ref + (nixl_s - nixl_ref),
+                         mono_ttft)
+    else:
+        disagg_ttft = _baseline_ttft(measured, seq_len, "disagg")
 
     plan.mono_instances = max(1, math.ceil(target_throughput / mono_rps)) if mono_rps > 0 else 1
     plan.mono_total_gpus = plan.mono_instances * gpus_per
@@ -534,11 +588,14 @@ def _plan_from_measured(plan, measured, target_throughput, price, seq_len=128):
     plan.disagg_est_throughput = disagg_rps * disagg_instances
     plan.disagg_cost_per_hr = plan.disagg_total_gpus * price
 
-    has_rates = "mono_ttft_base_ms" in measured
     if has_rates:
         plan.reasoning.append(
             f"TTFT scaled for {seq_len} tokens "
             f"(linear model, valid 50-1000 tokens)")
+    elif est_rate > 0:
+        plan.reasoning.append(
+            f"TTFT scaled for {seq_len} tokens "
+            f"(estimated {est_rate:.2f} ms/token from model size)")
     elif seq_len > 150 or seq_len < 50:
         ref = measured.get("ref_seq_len", 100)
         plan.reasoning.append(
@@ -568,25 +625,22 @@ def _find_nearest_baselines(params_b, gpu_type, is_moe=False):
     return [(c[1], c[2]) for c in candidates[:2]]
 
 
-def _estimate_kv_bytes(profile) -> int:
-    """Estimate KV cache bytes per token from model profile."""
+def _estimate_kv_bytes(profile) -> BytesPerToken:
+    """Estimate KV cache bytes per token from model profile. Returns [B/token]."""
     known = KV_BYTES_PER_TOKEN.get(profile.model_id)
     if known:
         return known
     if profile.num_kv_heads and profile.head_dim and profile.num_layers:
         dtype_bytes = DTYPE_BYTES.get(profile.torch_dtype, 2)
-        return 2 * profile.num_layers * profile.num_kv_heads * profile.head_dim * dtype_bytes
+        return BytesPerToken(2 * profile.num_layers * profile.num_kv_heads * profile.head_dim * dtype_bytes)
     return KV_BYTES_PER_TOKEN["microsoft/Phi-3.5-mini-instruct"]
 
 
-def _estimate_nixl_ms(kv_bytes_per_token: int, seq_len: int = 128,
-                      gpu_type: str = "t4", is_moe: bool = False) -> float:
-    """Estimate NIXL transfer time from KV cache size and NIC bandwidth.
-
-    T = protocol_ms + (kv_bytes_per_token * ceil(seq_len/16)*16) / eff_bw
-    NIXL transfers KV in 16-token blocks; block alignment eliminates
-    quantization error at short sequences (exp5b: 180/180 exact multiples).
-    """
+def _estimate_nixl_ms(kv_bytes_per_token: BytesPerToken, seq_len: int = 128,
+                      gpu_type: str = "t4", is_moe: bool = False) -> Milliseconds:
+    """NIXL transfer time [ms] = protocol_ms + (kv_bytes × aligned_seq) / eff_bw."""
+    assert isinstance(kv_bytes_per_token, BytesPerToken), \
+        f"expected BytesPerToken, got {type(kv_bytes_per_token).__name__}"
     t4_nic = GPU_NIC_BW_GBPS.get("t4", 25)
     target_nic = GPU_NIC_BW_GBPS.get(gpu_type, t4_nic)
     scaled_bw = NIXL_EFF_BW_GBS * (target_nic / t4_nic)
@@ -594,26 +648,23 @@ def _estimate_nixl_ms(kv_bytes_per_token: int, seq_len: int = 128,
     data_ms = (kv_bytes_per_token * block_aligned) / (scaled_bw * 1e9) * 1000
     if is_moe:
         data_ms *= MOE_NIXL_CORRECTION
-    return NIXL_PROTOCOL_MS + data_ms
+    return Milliseconds(NIXL_PROTOCOL_MS + data_ms)
 
 
-def _estimate_overhead_asymptote(kv_bytes_per_token: int, prefill_rate: float,
-                                 gpu_type: str = "t4", is_moe: bool = False) -> float:
-    """T(∞) = 1 + nixl_rate / prefill_rate.
-
-    As seq_len → ∞, protocol overhead and base TTFT become negligible.
-    T(∞) is the per-token overhead ratio — the minimum contention advantage
-    disagg needs at very long prompts.
-    """
+def _estimate_overhead_asymptote(kv_bytes_per_token: BytesPerToken, prefill_rate: float,
+                                 gpu_type: str = "t4", is_moe: bool = False) -> Dimensionless:
+    """T(∞) [·] = 1 + nixl_rate [ms/token] / prefill_rate [ms/token]."""
+    assert isinstance(kv_bytes_per_token, BytesPerToken), \
+        f"expected BytesPerToken, got {type(kv_bytes_per_token).__name__}"
     if prefill_rate <= 0:
-        return 0.0
+        return Dimensionless(0.0)
     t4_nic = GPU_NIC_BW_GBPS.get("t4", 25)
     target_nic = GPU_NIC_BW_GBPS.get(gpu_type, t4_nic)
     scaled_bw = NIXL_EFF_BW_GBS * (target_nic / t4_nic)
     nixl_rate_ms = kv_bytes_per_token / (scaled_bw * 1e9) * 1000
     if is_moe:
         nixl_rate_ms *= MOE_NIXL_CORRECTION
-    return 1 + nixl_rate_ms / prefill_rate
+    return Dimensionless(1 + nixl_rate_ms / prefill_rate)
 
 
 PREFILL_RATE_CONSTANT = 143.2  # ms/token × GB/s / B_params, from Phi-3/T4 (N=1)
@@ -646,30 +697,52 @@ def _linreg(points):
     return intercept, slope
 
 
-def _predict_delta_gamma(seq_len: int, overhead_asymptote: float) -> float:
+def _contention_scale_b(kv_bytes_per_token: BytesPerToken) -> Dimensionless:
+    """C_B [1/ln(tokens)] ∝ kv_bytes_per_token. GQA → fewer KV heads → lower C_B."""
+    assert isinstance(kv_bytes_per_token, BytesPerToken), \
+        f"expected BytesPerToken, got {type(kv_bytes_per_token).__name__}"
+    return Dimensionless(
+        CONTENTION_SCALE_B_REF * kv_bytes_per_token / CONTENTION_KV_REF)
+
+
+def _predict_delta_gamma(seq_len: int, overhead_asymptote: float,
+                         kv_bytes_per_token: BytesPerToken = CONTENTION_KV_REF
+                         ) -> Dimensionless:
+    """Δγ(s) [·] = -C_A·(T(∞)-1) + C_B(kv)·ln(s)."""
     t_inf = max(overhead_asymptote, 1.0)
-    return -CONTENTION_SCALE_A * (t_inf - 1) + CONTENTION_SCALE_B * math.log(max(seq_len, 1))
+    c_b = _contention_scale_b(kv_bytes_per_token)
+    return Dimensionless(
+        -CONTENTION_SCALE_A * (t_inf - 1) + c_b * math.log(max(seq_len, 1)))
 
 
-def _predict_contention_ratio(delta_gamma: float, concurrency: int) -> float:
+def _predict_contention_ratio(delta_gamma: float, concurrency: int) -> Dimensionless:
+    """R(c,s) [·] = c^Δγ(s)."""
     if concurrency <= 1:
-        return 1.0
-    return concurrency ** delta_gamma
+        return Dimensionless(1.0)
+    return Dimensionless(concurrency ** delta_gamma)
 
 
 def _predict_crossover_c(threshold: float, delta_gamma: float) -> float:
+    """c_cross [·] = T(s)^(1/Δγ)."""
     if delta_gamma <= 0:
         return float('inf')
     if threshold <= 1:
         return 1.0
-    return threshold ** (1.0 / delta_gamma)
-
-
-def _predict_s_cross(overhead_asymptote: float) -> float:
-    t_inf = max(overhead_asymptote, 1.0)
-    if CONTENTION_SCALE_B <= 0:
+    try:
+        return threshold ** (1.0 / delta_gamma)
+    except OverflowError:
         return float('inf')
-    return math.exp(CONTENTION_SCALE_A * (t_inf - 1) / CONTENTION_SCALE_B)
+
+
+def _predict_s_cross(overhead_asymptote: float,
+                     kv_bytes_per_token: BytesPerToken = CONTENTION_KV_REF
+                     ) -> float:
+    """s_cross [tokens] where Δγ(s) = 0."""
+    t_inf = max(overhead_asymptote, 1.0)
+    c_b = _contention_scale_b(kv_bytes_per_token)
+    if c_b <= 0:
+        return float('inf')
+    return math.exp(CONTENTION_SCALE_A * (t_inf - 1) / c_b)
 
 
 def _fit_measured_delta_gamma(contention_table: list) -> tuple:
@@ -741,7 +814,7 @@ def _check_vram_feasibility(weight_gb, kv_bytes_per_token, seq_len, gpus_per_ins
             f"Increase TP or use a larger GPU.")
 
 
-def _proportional_scale(ref, params_b, plan, seq_len=128):
+def _proportional_scale(ref, params_b, plan, seq_len=128, estimated_rate: float = 0):
     """Scale TTFT and throughput proportionally from a reference baseline."""
     scale = params_b / ref["params_b"] if ref["params_b"] > 0 else 1
     if scale > 5:
@@ -749,7 +822,8 @@ def _proportional_scale(ref, params_b, plan, seq_len=128):
             f"LOW CONFIDENCE: extrapolating {scale:.0f}x beyond nearest baseline "
             f"({ref['params_b']:.1f}B -> {params_b:.1f}B). TTFT estimate is unreliable.")
         plan.confidence = "low"
-    return _baseline_ttft(ref, seq_len) * scale, ref["mono_throughput"] / max(scale, 0.5)
+    return (_baseline_ttft(ref, seq_len, estimated_rate=estimated_rate) * scale,
+            ref["mono_throughput"] / max(scale, 0.5))
 
 
 def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, tp, seq_len=128):
@@ -768,6 +842,8 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
     target_nic = GPU_NIC_BW_GBPS.get(gpu_type, t4_nic)
     nic_speedup = target_nic / t4_nic
 
+    est_rate = _estimate_prefill_rate(profile, gpu_type)
+
     nearest = _find_nearest_baselines(params_b, gpu_type, is_moe)
     used_cross_gpu = not nearest
     if not nearest:
@@ -785,8 +861,8 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
 
             if lo_b <= params_b <= hi_b:
                 t = (params_b - lo_b) / range_b
-                lo_ttft = _baseline_ttft(lo, seq_len)
-                hi_ttft = _baseline_ttft(hi, seq_len)
+                lo_ttft = _baseline_ttft(lo, seq_len, estimated_rate=est_rate)
+                hi_ttft = _baseline_ttft(hi, seq_len, estimated_rate=est_rate)
                 mono_ttft = lo_ttft + t * (hi_ttft - lo_ttft)
                 mono_rps = lo["mono_throughput"] + t * (hi["mono_throughput"] - lo["mono_throughput"])
                 interpolated = True
@@ -794,13 +870,15 @@ def _plan_from_extrapolation(plan, profile, gpu_type, target_throughput, price, 
                     f"Interpolated between {lo_b:.1f}B and {hi_b:.1f}B baselines")
             else:
                 ref = lo if abs(lo_b - params_b) < abs(hi_b - params_b) else hi
-                mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan, seq_len)
+                mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan, seq_len,
+                                                          estimated_rate=est_rate)
                 plan.reasoning.append(
                     f"Proportional scaling from {ref['params_b']:.1f}B baseline "
                     f"(target {params_b:.1f}B is outside measured range)")
         else:
             (ref, _) = nearest[0]
-            mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan, seq_len)
+            mono_ttft, mono_rps = _proportional_scale(ref, params_b, plan, seq_len,
+                                                      estimated_rate=est_rate)
             plan.reasoning.append(f"Scaled from single baseline ({ref['params_b']:.1f}B)")
 
         if gpu_type != "t4":
@@ -981,7 +1059,10 @@ def _generate_recommendation(plan):
             f"Below c* mono is deterministic; above c* tail latency explodes")
 
 
-def print_plan(plan: CapacityPlan):
+def print_plan(plan: CapacityPlan, kv_bytes: BytesPerToken | None = None):
+    if kv_bytes is None:
+        profile = fetch_model_profile(plan.model)
+        kv_bytes = _estimate_kv_bytes(profile)
     is_experiment = plan.confidence == "experiment"
     header = "DEPLOYMENT RECOMMENDATION" if is_experiment else "FEASIBILITY ESTIMATE"
 
@@ -1143,9 +1224,11 @@ def print_plan(plan: CapacityPlan):
                     print(f"  Disagg needs >{asym_pct}% contention advantage to win")
         if plan.predicted_delta_gamma != 0:
             dg = plan.predicted_delta_gamma
+            c_b = _contention_scale_b(kv_bytes)
             print("  Contention model: R(c,s) = c^Δγ(s)")
-            print(f"    Δγ(s) = -{CONTENTION_SCALE_A:.3f}·(T(∞)-1) + "
-                  f"{CONTENTION_SCALE_B:.3f}·ln(s)")
+            print(f"    Δγ(s) = -{CONTENTION_SCALE_A:.3f}·(T(∞)-1) + C_B·ln(s)")
+            print(f"    C_B = {CONTENTION_SCALE_B_REF:.3f} × "
+                  f"(kv/{CONTENTION_KV_REF}) = {c_b:.4f}")
             print(f"    At s={plan.seq_len}: Δγ = {dg:.3f}")
             if dg > 0:
                 for c in [2, 4, 8, 16]:
@@ -1184,6 +1267,9 @@ def sweep_seq_lens(
     seq_lens: list | None = None,
 ) -> dict:
     """Run plan_capacity across multiple seq_lens to map the phase boundary."""
+    profile = fetch_model_profile(model_id)
+    kv_bytes = _estimate_kv_bytes(profile)
+
     ref_plan = plan_capacity(
         model_id, target_throughput=1.0, gpu_type=gpu_type,
         provider=provider, seq_len=128, data_dir=data_dir)
@@ -1192,7 +1278,7 @@ def sweep_seq_lens(
         seq_lens = [50, 100, 200, 500, 1000, 2000, 4000]
 
     t_inf = ref_plan.overhead_asymptote
-    s_cross = _predict_s_cross(t_inf) if t_inf > 0 else float('inf')
+    s_cross = _predict_s_cross(t_inf, kv_bytes) if t_inf > 0 else float('inf')
 
     results = []
     for s in seq_lens:
@@ -1202,7 +1288,7 @@ def sweep_seq_lens(
         mono = plan.mono_est_ttft_ms
         disagg = plan.disagg_est_ttft_ms
         t_s = disagg / mono if mono > 0 else 0
-        dg = _predict_delta_gamma(s, t_inf) if t_inf > 0 else 0
+        dg = _predict_delta_gamma(s, t_inf, kv_bytes) if t_inf > 0 else 0
         c_cross = _predict_crossover_c(t_s, dg) if dg != 0 else float('inf')
         results.append({
             "seq_len": s,
@@ -1318,11 +1404,14 @@ def analyze_workload(
     data_dir: str = "",
 ) -> WorkloadResult:
     """Analyze a workload distribution across sequence lengths."""
+    profile = fetch_model_profile(model_id)
+    kv_bytes = _estimate_kv_bytes(profile)
+
     ref_plan = plan_capacity(
         model_id, target_throughput=1.0, gpu_type=gpu_type,
         provider=provider, seq_len=128, data_dir=data_dir)
     t_inf = ref_plan.overhead_asymptote
-    s_cross = _predict_s_cross(t_inf) if t_inf > 0 else float('inf')
+    s_cross = _predict_s_cross(t_inf, kv_bytes) if t_inf > 0 else float('inf')
 
     buckets = []
     w_mono = 0.0
@@ -1336,7 +1425,7 @@ def analyze_workload(
         mono = plan.mono_est_ttft_ms
         disagg = plan.disagg_est_ttft_ms
         t_s = disagg / mono if mono > 0 else 0
-        dg = _predict_delta_gamma(s, t_inf) if t_inf > 0 else 0
+        dg = _predict_delta_gamma(s, t_inf, kv_bytes) if t_inf > 0 else 0
         c_cross = _predict_crossover_c(t_s, dg) if dg > 0 else float('inf')
         buckets.append({
             "seq_len": s, "weight": weight,
