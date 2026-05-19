@@ -157,7 +157,7 @@ class TestCompare(unittest.TestCase):
     def test_good_prediction(self):
         predictions = {100: {
             "mono_ttft_ms": 105, "disagg_ttft_ms": 200,
-            "nixl_ms": 50, "sidecar_ms": 12,
+            "nixl_ms": 50,
         }}
         measurements = {
             "exp11": {
@@ -174,7 +174,7 @@ class TestCompare(unittest.TestCase):
     def test_wrong_prediction(self):
         predictions = {100: {
             "mono_ttft_ms": 174, "disagg_ttft_ms": 338,
-            "nixl_ms": 152, "sidecar_ms": 12,
+            "nixl_ms": 152,
         }}
         measurements = {
             "exp11": {
