@@ -1852,8 +1852,8 @@ class TestOverheadAsymptoteFallback(unittest.TestCase):
             "Qwen/Qwen2.5-3B-Instruct",
             target_throughput=1.0, gpu_type="t4")
         self.assertGreater(plan.overhead_asymptote, 1.0)
-        # GQA model: architecture-aware C_B is very small → Δγ near zero
-        self.assertAlmostEqual(plan.predicted_delta_gamma, 0, delta=0.1)
+        # GQA model: architecture-aware C_B is very small → |Δγ| < 0.2
+        self.assertAlmostEqual(plan.predicted_delta_gamma, 0, delta=0.2)
 
     def test_gqa_lower_tinf_than_mha(self):
         """GQA models (few KV heads) have less NIXL overhead → lower T(∞)."""
@@ -2013,6 +2013,35 @@ class TestArchitectureAwarePredictions(unittest.TestCase):
         dg_new = _predict_delta_gamma(500, 1.77, CONTENTION_KV_REF)
         dg_default = _predict_delta_gamma(500, 1.77)
         self.assertAlmostEqual(dg_new, dg_default, places=6)
+
+
+class TestComputeDominance(unittest.TestCase):
+
+    def test_qwen_overhead_bound(self):
+        """Qwen 3B on T4 is overhead-bound (η < 1)."""
+        plan = plan_capacity(
+            "Qwen/Qwen2.5-3B-Instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=500)
+        self.assertGreater(plan.compute_dominance, 0)
+        self.assertLess(plan.compute_dominance, 1.0)
+
+    def test_phi3_compute_bound(self):
+        """Phi-3 on T4 is compute-bound (η > 1) at s=500."""
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=500)
+        self.assertGreater(plan.compute_dominance, 1.0)
+
+    def test_eta_scales_with_seq_len(self):
+        """η increases with sequence length (more compute relative to fixed overhead)."""
+        plan_short = plan_capacity(
+            "Qwen/Qwen2.5-3B-Instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=100)
+        plan_long = plan_capacity(
+            "Qwen/Qwen2.5-3B-Instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=1000)
+        self.assertGreater(plan_long.compute_dominance,
+                           plan_short.compute_dominance)
 
 
 if __name__ == "__main__":

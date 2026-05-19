@@ -47,6 +47,7 @@ class ValidationResult:
     error_pct: float
     grade: str
     unit: str = "ms"
+    caveat: str = ""
 
 
 def _grade(error_pct: float) -> str:
@@ -180,10 +181,14 @@ def compare(predictions: dict, measurements: dict) -> list:
                 predicted_r = _predict_contention_ratio(
                     pred["predicted_delta_gamma"], conc)
                 err = (predicted_r - measured_r) / measured_r * 100
+                caveat = ""
+                if alpha_mono < 1.0:
+                    caveat = (f"α_mono={alpha_mono:.2f}<1 "
+                              f"(TTFT decreases with load — overhead-bound)")
                 results.append(ValidationResult(
                     f"R(c={conc},{disagg_cfg})", sl, conc,
                     predicted_r, measured_r, err, _grade(err),
-                    unit=""))
+                    unit="", caveat=caveat))
 
     return results
 
@@ -210,20 +215,24 @@ def print_report(model: str, gpu_type: str, results: list, measurements: dict):
         else:
             pred_s = f"{r.predicted:>9.3f}"
             meas_s = f"{r.measured:>9.3f}"
+        grade_s = f"{r.grade:>5}" if not r.caveat else f"{r.grade:>4}*"
         print(f"  {r.metric:>25} | {r.seq_len:>5} | {r.concurrency:>2} | "
               f"{pred_s:>10} | {meas_s:>10} | "
-              f"{r.error_pct:>+7.0f}% | {r.grade:>5}")
+              f"{r.error_pct:>+7.0f}% | {grade_s}")
     print()
 
-    grades = [r.grade for r in results]
+    valid_results = [r for r in results if not r.caveat]
+    grades = [r.grade for r in valid_results]
     good = grades.count("GOOD")
     fair = grades.count("FAIR")
     poor = grades.count("POOR")
     wrong = grades.count("WRONG")
     total = len(grades)
 
+    n_caveated = len(results) - len(valid_results)
+    caveat_note = f" ({n_caveated} excluded: α<1)" if n_caveated > 0 else ""
     print(f"  Summary: {good}/{total} GOOD, {fair}/{total} FAIR, "
-          f"{poor}/{total} POOR, {wrong}/{total} WRONG")
+          f"{poor}/{total} POOR, {wrong}/{total} WRONG{caveat_note}")
 
     if wrong > total * 0.3:
         print("  VERDICT: Advisor predictions are UNRELIABLE for this model/GPU.")
@@ -280,6 +289,21 @@ def print_report(model: str, gpu_type: str, results: list, measurements: dict):
             print(f"    s={sl}, c={conc}, {cfg}: n={n}")
         print("  Median from <10 samples is unreliable. "
               "Grades at these points should be discounted.")
+        print()
+
+    caveated = [r for r in results if r.caveat]
+    if caveated:
+        print("  VALIDITY WARNING — α(c) < 1 detected:")
+        print("  The contention model assumes TTFT increases with concurrency")
+        print("  (α(c) = TTFT(c)/TTFT(1) > 1). When α < 1, the system is")
+        print("  overhead-bound and R = α_mono/α_disagg is not meaningful.")
+        seen = set()
+        for r in caveated:
+            key = (r.seq_len, r.concurrency)
+            if key not in seen:
+                seen.add(key)
+                print(f"    s={r.seq_len}, c={r.concurrency}: {r.caveat}")
+        print(f"  {len(caveated)} R values marked * — grades disregarded in summary.")
         print()
 
     cal_seq_lens = sorted(set(k[2] for k in exp11 if k[1] == 1))

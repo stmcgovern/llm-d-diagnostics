@@ -132,11 +132,14 @@ MEASURED_BASELINES = {
         "overhead_ms": 51, "overhead_pct": 49.0,
     },
     ("Qwen/Qwen2.5-3B-Instruct", "t4"): {
-        "params_b": 3.0, "is_moe": False,
-        "mono_ttft_ms": 177, "disagg_ttft_ms": 239,
-        "mono_throughput": 0.21, "disagg_throughput": 0.18,
-        "overhead_ms": 62, "overhead_pct": 35.0,
-        "nixl_ms": 25,
+        "params_b": 3.1, "is_moe": False,
+        "mono_ttft_ms": 849, "disagg_ttft_ms": 705,
+        "mono_ttft_base_ms": 749, "mono_ttft_rate": 0.529,
+        "disagg_ttft_base_ms": 609, "disagg_ttft_rate": 0.706,
+        "ref_seq_len": 100,
+        "mono_throughput": 1.40, "disagg_throughput": 1.40,
+        "overhead_ms": -144, "overhead_pct": -17.0,
+        "nixl_ms": 18,
     },
     ("microsoft/Phi-3.5-mini-instruct", "t4"): {
         "params_b": 3.8, "is_moe": False,
@@ -243,6 +246,7 @@ class CapacityPlan:
     measured_fit_a: float = 0.0
     measured_fit_b: float = 0.0
     measured_fit_r2: float = 0.0
+    compute_dominance: float = 0.0
 
 
 def plan_capacity(
@@ -434,6 +438,10 @@ def _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price):
             _, overhead_rate = _linreg(overhead_pts)
             if prefill_rate > 0 and overhead_rate > 0:
                 plan.overhead_asymptote = round(1 + overhead_rate / prefill_rate, 2)
+            mono_base, _ = _linreg(mono_pts)
+            if mono_base > 0 and prefill_rate > 0:
+                plan.compute_dominance = round(
+                    prefill_rate * seq_len / mono_base, 3)
 
     for (cfg, conc, pt), dg_stats in exp11.items():
         if not cfg.startswith("DISAGG"):
@@ -602,6 +610,12 @@ def _plan_from_measured(plan, measured, target_throughput, price, seq_len=128,
             f"TTFT measured at ~{ref} tokens; prediction at {seq_len} "
             f"tokens may diverge — run experiments to calibrate")
     plan.reasoning.append(f"Based on measured data: mono {mono_rps:.2f} req/s, disagg {disagg_rps:.2f} req/s")
+
+    if has_rates:
+        base_ms = measured["mono_ttft_base_ms"]
+        rate = measured["mono_ttft_rate"]
+        if base_ms > 0 and rate > 0:
+            plan.compute_dominance = round(rate * seq_len / base_ms, 3)
 
 
 def _find_nearest_baselines(params_b, gpu_type, is_moe=False):
@@ -1042,6 +1056,10 @@ def _generate_recommendation(plan):
             plan.recommendation = "DISAGGREGATE (c=1 estimate)"
             plan.reasoning.append(
                 f"Disagg already faster at c=1 by {-overhead_pct}% (Δγ={dg:.2f})")
+        if plan.compute_dominance > 0 and plan.compute_dominance < 1:
+            plan.reasoning.append(
+                f"Overhead-bound regime (η={plan.compute_dominance:.2f}): "
+                f"contention predictions may be unreliable")
         plan.reasoning.append(
             "To measure: ./toolkit/run.sh <cluster> tput-seqlen")
 
@@ -1110,6 +1128,15 @@ def print_plan(plan: CapacityPlan, kv_bytes: BytesPerToken | None = None):
                      for t in plan.overhead_thresholds]
             print(f"    T(s):  {',  '.join(parts)}")
         print()
+
+        if plan.compute_dominance > 0 and plan.compute_dominance < 1:
+            eta = plan.compute_dominance
+            print(f"  WARNING: overhead-bound regime (η = {eta:.2f})")
+            print(f"    GPU compute is {eta:.0%} of total TTFT; "
+                  f"vLLM serving overhead dominates")
+            print("    Contention model assumes compute-bound operation — "
+                  "R(c,s) predictions may be unreliable")
+            print()
 
         if plan.measured_fit_r2 > 0 and plan.predicted_delta_gamma != 0:
             pred_dg = plan.predicted_delta_gamma
@@ -1222,6 +1249,16 @@ def print_plan(plan: CapacityPlan, kv_bytes: BytesPerToken | None = None):
                     print(f"  T(∞) = {plan.overhead_asymptote:.2f} — long-prompt "
                           f"floor is {asym_pct}% overhead")
                     print(f"  Disagg needs >{asym_pct}% contention advantage to win")
+        if plan.compute_dominance > 0:
+            eta = plan.compute_dominance
+            if eta < 1:
+                print(f"  WARNING: overhead-bound regime (η = {eta:.2f})")
+                print(f"    GPU compute is {eta:.0%} of total TTFT; "
+                      f"vLLM serving overhead dominates")
+                print("    Contention model assumes compute-bound operation — "
+                      "predictions below may be unreliable")
+                print()
+
         if plan.predicted_delta_gamma != 0:
             dg = plan.predicted_delta_gamma
             c_b = _contention_scale_b(kv_bytes)
