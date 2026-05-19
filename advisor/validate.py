@@ -46,6 +46,7 @@ class ValidationResult:
     measured: float
     error_pct: float
     grade: str
+    unit: str = "ms"
 
 
 def _grade(error_pct: float) -> str:
@@ -181,7 +182,8 @@ def compare(predictions: dict, measurements: dict) -> list:
                 err = (predicted_r - measured_r) / measured_r * 100
                 results.append(ValidationResult(
                     f"R(c={conc},{disagg_cfg})", sl, conc,
-                    predicted_r, measured_r, err, _grade(err)))
+                    predicted_r, measured_r, err, _grade(err),
+                    unit=""))
 
     return results
 
@@ -202,8 +204,14 @@ def print_report(model: str, gpu_type: str, results: list, measurements: dict):
           f"{'-'*10}-+-{'-'*8}-+-{'-'*5}")
 
     for r in results:
+        if r.unit == "ms":
+            pred_s = f"{r.predicted:>8.0f}ms"
+            meas_s = f"{r.measured:>8.0f}ms"
+        else:
+            pred_s = f"{r.predicted:>9.3f}"
+            meas_s = f"{r.measured:>9.3f}"
         print(f"  {r.metric:>25} | {r.seq_len:>5} | {r.concurrency:>2} | "
-              f"{r.predicted:>8.0f}ms | {r.measured:>8.0f}ms | "
+              f"{pred_s:>10} | {meas_s:>10} | "
               f"{r.error_pct:>+7.0f}% | {r.grade:>5}")
     print()
 
@@ -260,6 +268,30 @@ def print_report(model: str, gpu_type: str, results: list, measurements: dict):
     else:
         print("  No crossover detected: mono wins at all measured conditions.")
     print()
+
+    sparse = []
+    for key, st in sorted(exp11.items()):
+        cfg, conc, sl = key
+        if st["n"] < 10:
+            sparse.append((sl, conc, cfg, st["n"]))
+    if sparse:
+        print("  DATA QUALITY WARNING — sparse samples (n < 10):")
+        for sl, conc, cfg, n in sparse:
+            print(f"    s={sl}, c={conc}, {cfg}: n={n}")
+        print("  Median from <10 samples is unreliable. "
+              "Grades at these points should be discounted.")
+        print()
+
+    cal_seq_lens = sorted(set(k[2] for k in exp11 if k[1] == 1))
+    if cal_seq_lens:
+        cal_max = cal_seq_lens[-1]
+        extrap = [r for r in results if r.seq_len > cal_max * 0.8
+                  and r.metric.startswith(("mono_", "disagg_"))]
+        if extrap:
+            print(f"  VALIDITY NOTE: Calibration data extends to s={cal_max}.")
+            print(f"  Prefill time is superlinear in seq_len (attention O(s*d)).")
+            print(f"  TTFT predictions degrade outside the calibration range.")
+            print()
 
     print(f"{'='*70}")
 
