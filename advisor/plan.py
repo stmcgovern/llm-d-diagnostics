@@ -760,8 +760,8 @@ def _predict_s_cross(overhead_asymptote: float,
 
 
 def _fit_measured_delta_gamma(contention_table: list) -> tuple:
-    by_s = {}
-    by_cfg_s = {}
+    by_s: dict = {}
+    by_cfg_s: dict = {}
     for e in contention_table:
         c, sl = e["concurrency"], e["seq_len"]
         cfg = e.get("config", "")
@@ -1151,7 +1151,7 @@ def print_plan(plan: CapacityPlan, kv_bytes: BytesPerToken | None = None):
 
             pooled = {k: v for k, v in plan.measured_delta_gamma_by_s.items()
                       if isinstance(k, int)}
-            per_cfg = {}
+            per_cfg: dict = {}
             for k, v in plan.measured_delta_gamma_by_s.items():
                 if isinstance(k, tuple):
                     cfg, sl = k
