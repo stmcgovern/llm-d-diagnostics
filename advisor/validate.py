@@ -114,7 +114,7 @@ def get_predictions(model: str, gpu_type: str, seq_lens: list) -> dict:
             "disagg_ttft_ms": plan.disagg_est_ttft_ms,
             "confidence": plan.confidence,
             "nixl_ms": nixl_ms,
-            "predicted_delta_gamma": _predict_delta_gamma(sl, overhead_asym),
+            "predicted_delta_gamma": _predict_delta_gamma(sl, overhead_asym, kv_bytes),
         }
     return preds
 
