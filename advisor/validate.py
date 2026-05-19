@@ -313,8 +313,8 @@ def print_report(model: str, gpu_type: str, results: list, measurements: dict):
                   and r.metric.startswith(("mono_", "disagg_"))]
         if extrap:
             print(f"  VALIDITY NOTE: Calibration data extends to s={cal_max}.")
-            print(f"  Prefill time is superlinear in seq_len (attention O(s*d)).")
-            print(f"  TTFT predictions degrade outside the calibration range.")
+            print("  Prefill time is superlinear in seq_len (attention O(s*d)).")
+            print("  TTFT predictions degrade outside the calibration range.")
             print()
 
     print(f"{'='*70}")

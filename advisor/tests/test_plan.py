@@ -10,15 +10,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from plan import (
-    BytesPerToken,
+    CONTENTION_KV_REF,
     CONTENTION_SCALE_A,
     CONTENTION_SCALE_B_REF,
-    CONTENTION_KV_REF,
     KV_BYTES_PER_TOKEN,
     MEASURED_BASELINES,
     MOE_NIXL_CORRECTION,
     NIXL_PROTOCOL_MS,
     WORKLOAD_PROFILES,
+    BytesPerToken,
     CapacityPlan,
     ModelProfile,
     _baseline_ttft,
@@ -1683,7 +1683,7 @@ class TestFitMeasuredDeltaGamma(unittest.TestCase):
                 r = c ** dg
                 table.append({"concurrency": c, "seq_len": s,
                               "contention_ratio": r})
-        a, b, r2, dg_by_s = _fit_measured_delta_gamma(table)
+        a, b, r2, _dg_by_s = _fit_measured_delta_gamma(table)
         self.assertAlmostEqual(a, -0.5, places=1)
         self.assertAlmostEqual(b, 0.15, places=2)
         self.assertGreater(r2, 0.95)
@@ -1695,7 +1695,7 @@ class TestFitMeasuredDeltaGamma(unittest.TestCase):
             {"concurrency": 4, "seq_len": 100, "contention_ratio": 1.4},
             {"concurrency": 8, "seq_len": 100, "contention_ratio": 1.6},
         ]
-        a, b, r2, _ = _fit_measured_delta_gamma(table)
+        _a, b, _r2, _ = _fit_measured_delta_gamma(table)
         self.assertEqual(b, 0.0)
 
     def test_c1_entries_filtered(self):
@@ -1706,7 +1706,7 @@ class TestFitMeasuredDeltaGamma(unittest.TestCase):
             for c in [2, 4, 8]:
                 table.append({"concurrency": c, "seq_len": s,
                               "contention_ratio": c ** dg})
-        a, b, r2, _ = _fit_measured_delta_gamma(table)
+        _a, b, _r2, _ = _fit_measured_delta_gamma(table)
         # Δγ is constant at 0.3, so b should be ~0
         self.assertAlmostEqual(b, 0.0, places=1)
 
