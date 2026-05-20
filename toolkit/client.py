@@ -46,6 +46,7 @@ def env(name, default):
 
 SIM = env("SIM", "") == "1"
 NS = env("NS", "default")
+GPU_TYPE = env("GPU_TYPE", "t4")
 
 if SIM:
     MODEL = env("MODEL", env("MODEL_NAME", "sim-model"))
@@ -798,6 +799,7 @@ def write_run_info(experiment, extra=None):
     existing["toolkit"] = {
         "model": MODEL,
         "namespace": NS,
+        "gpu_type": GPU_TYPE,
         "sim_mode": SIM,
         "transport": detect_transport(),
         "baseline_url": BASELINE_URL,

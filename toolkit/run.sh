@@ -30,6 +30,7 @@
 #     health        Continuous health monitoring + trend detection
 #     plan          GPU capacity planning + cost model
 #     rebalance     P/D ratio recommendation + watch mode
+#     calibrate     Extract baselines from experiment data
 #
 #   Infrastructure:
 #     deploy        Deploy P/D topology from env.sh
@@ -147,7 +148,7 @@ DECODE_IPS=$(oc get pods -l app=vllm-decode -n "$NS" \
     -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{":"}{.status.podIP}{","}{end}' \
     2>/dev/null | sed 's/,$//')
 
-REMOTE_ENV="MODEL=$MODEL NS=$NS DATA_DIR=$REMOTE_DIR/data PREFILL_HOST=$PREFILL_HOST"
+REMOTE_ENV="MODEL=$MODEL NS=$NS GPU_TYPE=${GPU_TYPE:-t4} DATA_DIR=$REMOTE_DIR/data PREFILL_HOST=$PREFILL_HOST"
 [ -n "$PREFILL_IPS" ] && REMOTE_ENV="$REMOTE_ENV PODS_VLLM_PREFILL=$PREFILL_IPS"
 [ -n "$DECODE_IPS" ] && REMOTE_ENV="$REMOTE_ENV PODS_VLLM_DECODE=$DECODE_IPS"
 [ -n "${SIM:-}" ] && REMOTE_ENV="$REMOTE_ENV SIM=$SIM"
@@ -273,6 +274,10 @@ case "$COMMAND" in
 
         copy_results
         run_analyze
+        echo ""
+        echo "=== Calibrate Advisor ==="
+        python3 "$REPO_ROOT/advisor/calibrate.py" "$DATA_DIR" \
+            --gpu-type "${GPU_TYPE:-t4}" || true
         ;;
 
     fault-test|fault|exp4)
@@ -374,7 +379,14 @@ case "$COMMAND" in
 
     validate)
         shift 2
-        python3 "$REPO_ROOT/advisor/validate.py" "$DATA_DIR" "$@"
+        python3 "$REPO_ROOT/advisor/validate.py" "$DATA_DIR" \
+            --gpu-type "${GPU_TYPE:-t4}" "$@"
+        ;;
+
+    calibrate)
+        shift 2
+        python3 "$REPO_ROOT/advisor/calibrate.py" "$DATA_DIR" \
+            --gpu-type "${GPU_TYPE:-t4}" "$@"
         ;;
 
     *)
@@ -409,6 +421,7 @@ case "$COMMAND" in
         echo "  plan            GPU capacity planning"
         echo "  rebalance       P/D ratio recommendation"
         echo "  validate        Validate advisor predictions against data"
+        echo "  calibrate       Extract baselines from experiment data"
         echo ""
         echo "  analyze         Run analysis on collected data"
         echo "  preflight       Verify cluster is ready"

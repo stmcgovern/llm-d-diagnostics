@@ -324,7 +324,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Validate advisor predictions against experiment data")
     parser.add_argument("data_dir", help="Path to data directory with exp results")
-    parser.add_argument("--gpu-type", default="t4", help="GPU type (default: t4)")
+    parser.add_argument("--gpu-type", default=None,
+                        help="GPU type (auto-detected from run-info.json, fallback: t4)")
     args = parser.parse_args()
 
     info = load_run_info(args.data_dir)
@@ -333,7 +334,8 @@ def main():
         print("ERROR: run-info.json missing or has no toolkit.model")
         sys.exit(1)
 
-    print(f"Validating advisor for: {model} on {args.gpu_type.upper()}")
+    gpu_type = args.gpu_type or info.get("toolkit", {}).get("gpu_type", "t4")
+    print(f"Validating advisor for: {model} on {gpu_type.upper()}")
 
     measurements = load_exp_baselines(args.data_dir)
     if not measurements["exp11"] and not measurements["exp14"]:
@@ -349,9 +351,9 @@ def main():
         print("ERROR: Could not determine sequence lengths from data")
         sys.exit(1)
 
-    predictions = get_predictions(model, args.gpu_type, seq_lens)
+    predictions = get_predictions(model, gpu_type, seq_lens)
     results = compare(predictions, measurements)
-    print_report(model, args.gpu_type, results, measurements)
+    print_report(model, gpu_type, results, measurements)
 
 
 if __name__ == "__main__":

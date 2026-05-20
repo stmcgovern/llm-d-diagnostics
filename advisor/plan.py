@@ -249,6 +249,34 @@ class CapacityPlan:
     compute_dominance: float = 0.0
 
 
+def _load_file_baselines(data_dir: str | None, model_id: str,
+                         gpu_type: str) -> dict | None:
+    """Load baselines from baselines.json if present and matching."""
+    if not data_dir:
+        return None
+    path = os.path.join(data_dir, "baselines.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        print(f"  WARNING: malformed {path} — skipping file baselines")
+        return None
+    file_model = data.get("model", "")
+    file_gpu = data.get("gpu_type", "")
+    if file_model != model_id or file_gpu != gpu_type:
+        print(f"  NOTE: baselines.json model/gpu mismatch "
+              f"(expected {model_id}/{gpu_type}, "
+              f"got {file_model}/{file_gpu}) — skipping")
+        return None
+    bl = data.get("baselines")
+    if not isinstance(bl, dict) or "mono_ttft_ms" not in bl:
+        print("  WARNING: baselines.json missing required fields — skipping")
+        return None
+    return bl
+
+
 def plan_capacity(
     model_id: str,
     target_throughput: float,
@@ -301,9 +329,14 @@ def plan_capacity(
         )
 
     exp11_path = os.path.join(data_dir, "exp11-results.csv") if data_dir else ""
+    file_bl = _load_file_baselines(data_dir, model_id, gpu_type)
     if data_dir and os.path.exists(exp11_path):
         plan.confidence = "experiment"
         _plan_from_experiments(plan, data_dir, seq_len, target_throughput, price)
+    elif file_bl:
+        plan.confidence = "measured"
+        _plan_from_measured(plan, file_bl,
+                           target_throughput, price, seq_len, profile, gpu_type)
     elif (model_id, gpu_type) in MEASURED_BASELINES:
         plan.confidence = "measured"
         _plan_from_measured(plan, MEASURED_BASELINES[(model_id, gpu_type)],
