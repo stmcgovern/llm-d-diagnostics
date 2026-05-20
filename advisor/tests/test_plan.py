@@ -2,6 +2,7 @@
 
 import csv
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -9,22 +10,37 @@ from pathlib import Path
 from unittest.mock import patch
 
 from plan import (
+    CONTENTION_KV_REF,
+    CONTENTION_SCALE_A,
+    CONTENTION_SCALE_B_REF,
     KV_BYTES_PER_TOKEN,
     MEASURED_BASELINES,
     MOE_NIXL_CORRECTION,
     NIXL_PROTOCOL_MS,
+    WORKLOAD_PROFILES,
+    BytesPerToken,
     CapacityPlan,
     ModelProfile,
     _baseline_ttft,
     _check_vram_feasibility,
+    _contention_scale_b,
     _estimate_kv_bytes,
     _estimate_nixl_ms,
     _estimate_overhead_asymptote,
+    _estimate_prefill_rate,
     _find_nearest_baselines,
+    _fit_measured_delta_gamma,
     _generate_recommendation,
+    _predict_contention_ratio,
+    _predict_crossover_c,
+    _predict_delta_gamma,
+    _predict_s_cross,
     _validate_profile,
+    analyze_workload,
+    parse_workload,
     plan_capacity,
     save_plan,
+    sweep_seq_lens,
 )
 
 
@@ -37,8 +53,10 @@ class TestPlanCapacityMeasured(unittest.TestCase):
             target_throughput=1.0, target_ttft_ms=500, gpu_type="t4",
         )
         self.assertEqual(plan.confidence, "measured")
-        self.assertEqual(plan.mono_est_ttft_ms, 73)
-        self.assertEqual(plan.disagg_est_ttft_ms, 109)
+        # TTFT scales with seq_len (default 128) via estimated prefill rate
+        self.assertGreater(plan.mono_est_ttft_ms, 73)
+        self.assertLess(plan.mono_est_ttft_ms, 120)
+        self.assertGreater(plan.disagg_est_ttft_ms, 109)
         self.assertGreater(plan.mono_total_gpus, 0)
         self.assertGreater(plan.disagg_total_gpus, 0)
 
@@ -48,7 +66,9 @@ class TestPlanCapacityMeasured(unittest.TestCase):
             target_throughput=0.5, target_ttft_ms=5000, gpu_type="t4",
         )
         self.assertEqual(plan.confidence, "measured")
-        self.assertEqual(plan.mono_est_ttft_ms, 2999)
+        # OLMoE at s=128 scales from measured 2999ms at ref ~100 tokens
+        self.assertGreater(plan.mono_est_ttft_ms, 2999)
+        self.assertLess(plan.mono_est_ttft_ms, 4000)
 
     def test_recommendation_is_set(self):
         plan = plan_capacity(
@@ -223,7 +243,8 @@ class TestSeqLenScaling(unittest.TestCase):
         self.assertLess(plan_short.disagg_est_ttft_ms, 900)
         self.assertGreater(plan_long.disagg_est_ttft_ms, 3000)
 
-    def test_constant_baseline_unchanged_by_seq_len(self):
+    def test_baseline_scales_with_seq_len(self):
+        """TTFT scales with seq_len via estimated prefill rate."""
         plan_50 = plan_capacity(
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             target_throughput=1.0, target_ttft_ms=500,
@@ -234,10 +255,8 @@ class TestSeqLenScaling(unittest.TestCase):
             target_throughput=1.0, target_ttft_ms=500,
             gpu_type="t4", seq_len=1000,
         )
-        self.assertEqual(plan_50.mono_est_ttft_ms, 73)
-        self.assertEqual(plan_1000.mono_est_ttft_ms, 73)
-        self.assertEqual(plan_50.disagg_est_ttft_ms, 109)
-        self.assertEqual(plan_1000.disagg_est_ttft_ms, 109)
+        self.assertGreater(plan_1000.mono_est_ttft_ms, plan_50.mono_est_ttft_ms)
+        self.assertGreater(plan_1000.disagg_est_ttft_ms, plan_50.disagg_est_ttft_ms)
 
     def test_seq_len_noted_in_reasoning(self):
         plan = plan_capacity(
@@ -248,14 +267,16 @@ class TestSeqLenScaling(unittest.TestCase):
         reasoning = " ".join(plan.reasoning)
         self.assertIn("500 tokens", reasoning)
 
-    def test_domain_warning_without_rates(self):
+    def test_estimated_rate_noted_in_reasoning(self):
+        """When no measured rate, estimated rate is noted in reasoning."""
         plan = plan_capacity(
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             target_throughput=1.0, target_ttft_ms=500,
             gpu_type="t4", seq_len=500,
         )
         reasoning = " ".join(plan.reasoning)
-        self.assertIn("may diverge", reasoning)
+        self.assertIn("estimated", reasoning)
+        self.assertIn("ms/token", reasoning)
 
     def test_no_warning_near_ref_seq_len(self):
         plan = plan_capacity(
@@ -296,39 +317,39 @@ class TestEstimateKvBytes(unittest.TestCase):
 class TestEstimateNixlMs(unittest.TestCase):
 
     def test_zero_seq_len_returns_protocol_only(self):
-        ms = _estimate_nixl_ms(393_216, seq_len=0)
+        ms = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=0)
         self.assertAlmostEqual(ms, NIXL_PROTOCOL_MS)
 
     def test_seq_len_increases_transfer_time(self):
-        ms_short = _estimate_nixl_ms(393_216, seq_len=10)
-        ms_long = _estimate_nixl_ms(393_216, seq_len=1000)
+        ms_short = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=10)
+        ms_long = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=1000)
         self.assertGreater(ms_long, ms_short)
 
     def test_data_term_scales_linearly_with_seq_len(self):
-        ms_128 = _estimate_nixl_ms(393_216, seq_len=128)
-        ms_256 = _estimate_nixl_ms(393_216, seq_len=256)
+        ms_128 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=128)
+        ms_256 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=256)
         data_128 = ms_128 - NIXL_PROTOCOL_MS
         data_256 = ms_256 - NIXL_PROTOCOL_MS
         self.assertAlmostEqual(data_256 / data_128, 2.0, places=3)
 
     def test_data_term_scales_with_kv_bytes(self):
-        ms_small = _estimate_nixl_ms(14_336, seq_len=1000)
-        ms_large = _estimate_nixl_ms(393_216, seq_len=1000)
+        ms_small = _estimate_nixl_ms(BytesPerToken(14_336), seq_len=1000)
+        ms_large = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=1000)
         data_small = ms_small - NIXL_PROTOCOL_MS
         data_large = ms_large - NIXL_PROTOCOL_MS
         self.assertAlmostEqual(data_large / data_small, 393_216 / 14_336, places=1)
 
     def test_moe_correction_on_data_term(self):
         """MOE correction scales data term only, not protocol overhead."""
-        ms_base = _estimate_nixl_ms(65_536, seq_len=100)
-        ms_moe = _estimate_nixl_ms(65_536, seq_len=100, is_moe=True)
+        ms_base = _estimate_nixl_ms(BytesPerToken(65_536), seq_len=100)
+        ms_moe = _estimate_nixl_ms(BytesPerToken(65_536), seq_len=100, is_moe=True)
         data_base = ms_base - NIXL_PROTOCOL_MS
         data_moe = ms_moe - NIXL_PROTOCOL_MS
         self.assertAlmostEqual(data_moe / data_base, MOE_NIXL_CORRECTION, places=2)
 
     def test_h100_faster_nic(self):
-        ms_t4 = _estimate_nixl_ms(393_216, seq_len=1000, gpu_type="t4")
-        ms_h100 = _estimate_nixl_ms(393_216, seq_len=1000, gpu_type="h100")
+        ms_t4 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=1000, gpu_type="t4")
+        ms_h100 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=1000, gpu_type="h100")
         self.assertLess(ms_h100, ms_t4)
         data_t4 = ms_t4 - NIXL_PROTOCOL_MS
         data_h100 = ms_h100 - NIXL_PROTOCOL_MS
@@ -336,22 +357,22 @@ class TestEstimateNixlMs(unittest.TestCase):
 
     def test_protocol_dominates_at_short_seq(self):
         """For small-KV models at L=1, protocol overhead > data term."""
-        ms = _estimate_nixl_ms(14_336, seq_len=1)
+        ms = _estimate_nixl_ms(BytesPerToken(14_336), seq_len=1)
         data_ms = ms - NIXL_PROTOCOL_MS
         self.assertGreater(NIXL_PROTOCOL_MS, data_ms)
 
     def test_block_alignment(self):
         """L=15 and L=16 both round to 16-token block; L=17 rounds to 32."""
-        ms_15 = _estimate_nixl_ms(393_216, seq_len=15)
-        ms_16 = _estimate_nixl_ms(393_216, seq_len=16)
-        ms_17 = _estimate_nixl_ms(393_216, seq_len=17)
+        ms_15 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=15)
+        ms_16 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=16)
+        ms_17 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=17)
         self.assertEqual(ms_15, ms_16)
         self.assertGreater(ms_17, ms_16)
 
     def test_gqa_visible_at_long_seq(self):
         """At L=1000, high-KV model should be much slower than low-KV model."""
-        ms_qwen = _estimate_nixl_ms(14_336, seq_len=1000)
-        ms_phi3 = _estimate_nixl_ms(393_216, seq_len=1000)
+        ms_qwen = _estimate_nixl_ms(BytesPerToken(14_336), seq_len=1000)
+        ms_phi3 = _estimate_nixl_ms(BytesPerToken(393_216), seq_len=1000)
         self.assertGreater(ms_phi3 - ms_qwen, 50)
 
 
@@ -380,7 +401,7 @@ class TestGenerateRecommendationBranches(unittest.TestCase):
         )
         _generate_recommendation(plan)
         reasoning = " ".join(plan.reasoning)
-        self.assertIn("run experiments", reasoning.lower())
+        self.assertIn("to measure", reasoning.lower())
 
     def test_experiment_no_crossover(self):
         """With experiment data but no crossover → MONOLITHIC."""
@@ -940,16 +961,16 @@ class TestPreExperimentHonesty(unittest.TestCase):
             gpu_type="t4", seq_len=500,
         )
         reasoning = " ".join(plan.reasoning)
-        self.assertIn("run experiments", reasoning.lower())
+        self.assertIn("to measure", reasoning.lower())
 
-    def test_no_data_dir_reports_contention_threshold(self):
+    def test_no_data_dir_reports_overhead(self):
         plan = plan_capacity(
             "microsoft/Phi-3-mini-4k-instruct",
             target_throughput=1.0, target_ttft_ms=99999,
             gpu_type="t4", seq_len=500,
         )
         reasoning = " ".join(plan.reasoning)
-        self.assertIn("contention advantage", reasoning.lower())
+        self.assertIn("overhead", reasoning.lower())
 
     def test_never_recommends_disagg_without_data(self):
         plan = plan_capacity(
@@ -1101,7 +1122,7 @@ class TestOverheadAsymptote(unittest.TestCase):
 
     def test_asymptote_function_directly(self):
         """_estimate_overhead_asymptote computes 1 + nixl_rate/prefill_rate."""
-        kv_bytes = 2 * 32 * 32 * 96 * 2  # Phi-3-like
+        kv_bytes = BytesPerToken(2 * 32 * 32 * 96 * 2)  # Phi-3-like
         prefill_rate = 1.70  # ms/token (measured)
         t_inf = _estimate_overhead_asymptote(kv_bytes, prefill_rate, "t4")
         self.assertGreater(t_inf, 1.0)
@@ -1236,15 +1257,15 @@ class TestAsymptoteGuard(unittest.TestCase):
         )
         self.assertGreater(plan.overhead_asymptote, 1.0)
 
-    def test_model_without_rate_no_asymptote(self):
-        """TinyLlama has no mono_ttft_rate → T(∞) stays 0."""
+    def test_model_without_rate_gets_estimated_asymptote(self):
+        """TinyLlama has no mono_ttft_rate → T(∞) estimated from model physics."""
         plan = plan_capacity(
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             target_throughput=1.0, target_ttft_ms=99999,
             gpu_type="t4", seq_len=128,
         )
-        self.assertEqual(plan.overhead_asymptote, 0.0,
-                         "Model without mono_ttft_rate should NOT get T(∞)")
+        self.assertGreater(plan.overhead_asymptote, 1.0,
+                           "Estimated T(∞) should be > 1")
 
     def test_experiment_data_overrides_guard(self):
         """With ≥2 experiment overhead thresholds, T(∞) comes from data."""
@@ -1414,8 +1435,8 @@ class TestSignificance(unittest.TestCase):
         )
         self.assertEqual(plan.confidence, "experiment")
         self.assertEqual(len(plan.overhead_thresholds), 1)
-        self.assertEqual(plan.overhead_asymptote, 0.0,
-                         "1 threshold + no rate → T(∞) should stay 0")
+        self.assertGreater(plan.overhead_asymptote, 1.0,
+                           "1 threshold → T(∞) estimated from model physics")
 
 
 class TestCriticalConcurrency(unittest.TestCase):
@@ -1562,6 +1583,465 @@ class TestCriticalConcurrency(unittest.TestCase):
         self.assertTrue(len(p90_crosses) > 0)
         self.assertTrue(any(c["concurrency"] <= 4 for c in p90_crosses))
         self.assertIn("DISAGGREGATE", plan.recommendation)
+
+
+# ── R(c,s) = c^Δγ(s) power-law contention model ─────────────────────
+
+
+class TestPredictDeltaGamma(unittest.TestCase):
+
+    def test_long_sequence_positive(self):
+        # T(∞)=1.86, s=1000: -0.889*(1.86-1) + 0.144*ln(1000) ≈ -0.765 + 0.994 = 0.229
+        dg = _predict_delta_gamma(1000, 1.86)
+        self.assertGreater(dg, 0)
+        self.assertAlmostEqual(dg, 0.229, places=2)
+
+    def test_short_sequence_negative(self):
+        # T(∞)=1.86, s=50: -0.889*0.86 + 0.144*ln(50) ≈ -0.765 + 0.563 = -0.202
+        dg = _predict_delta_gamma(50, 1.86)
+        self.assertLess(dg, 0)
+
+    def test_low_overhead_more_positive(self):
+        dg_low = _predict_delta_gamma(500, 1.2)
+        dg_high = _predict_delta_gamma(500, 2.5)
+        self.assertGreater(dg_low, dg_high)
+
+    def test_unit_overhead(self):
+        # T(∞)=1.0 → A term is zero, only C_B·ln(s) at reference kv
+        dg = _predict_delta_gamma(100, 1.0)
+        self.assertAlmostEqual(dg, CONTENTION_SCALE_B_REF * math.log(100), places=3)
+
+
+class TestPredictContentionRatio(unittest.TestCase):
+
+    def test_c1_identity(self):
+        self.assertEqual(_predict_contention_ratio(0.3, 1), 1.0)
+
+    def test_positive_dg_grows(self):
+        # Δγ > 0 → R grows with c (disagg scales better)
+        r2 = _predict_contention_ratio(0.3, 2)
+        r8 = _predict_contention_ratio(0.3, 8)
+        self.assertGreater(r8, r2)
+        self.assertGreater(r2, 1.0)
+
+    def test_negative_dg_shrinks(self):
+        # Δγ < 0 → R shrinks with c (mono scales better)
+        r8 = _predict_contention_ratio(-0.2, 8)
+        self.assertLess(r8, 1.0)
+
+    def test_power_law(self):
+        # R(c) = c^Δγ
+        self.assertAlmostEqual(
+            _predict_contention_ratio(0.5, 4), 4 ** 0.5, places=5)
+
+
+class TestPredictCrossoverC(unittest.TestCase):
+
+    def test_basic(self):
+        # T=2.0, Δγ=0.5 → c = 2^(1/0.5) = 4
+        c = _predict_crossover_c(2.0, 0.5)
+        self.assertAlmostEqual(c, 4.0, places=1)
+
+    def test_negative_dg(self):
+        self.assertEqual(_predict_crossover_c(1.5, -0.1), float('inf'))
+
+    def test_zero_dg(self):
+        self.assertEqual(_predict_crossover_c(1.5, 0), float('inf'))
+
+    def test_threshold_one(self):
+        self.assertAlmostEqual(_predict_crossover_c(1.0, 0.5), 1.0)
+
+
+class TestPredictSCross(unittest.TestCase):
+
+    def test_basic(self):
+        # T(∞)=1.86 → s_cross = exp(C_A*(1.86-1)/C_B_REF) at reference kv
+        s = _predict_s_cross(1.86)
+        expected = math.exp(CONTENTION_SCALE_A * 0.86 / CONTENTION_SCALE_B_REF)
+        self.assertAlmostEqual(s, expected, places=0)
+
+    def test_unit_overhead(self):
+        # T(∞)=1.0 → s_cross = exp(0) = 1
+        self.assertAlmostEqual(_predict_s_cross(1.0), 1.0, places=1)
+
+    def test_higher_overhead_higher_scross(self):
+        s_low = _predict_s_cross(1.5)
+        s_high = _predict_s_cross(2.5)
+        self.assertGreater(s_high, s_low)
+
+
+class TestFitMeasuredDeltaGamma(unittest.TestCase):
+
+    def test_perfect_power_law(self):
+        # R(c,s) = c^Δγ(s) with Δγ = -0.5 + 0.15·ln(s)
+        # At s=100: Δγ = -0.5 + 0.15*4.605 = 0.191
+        # At s=500: Δγ = -0.5 + 0.15*6.215 = 0.432
+        table = []
+        for s in [100, 500]:
+            dg = -0.5 + 0.15 * math.log(s)
+            for c in [2, 4, 8]:
+                r = c ** dg
+                table.append({"concurrency": c, "seq_len": s,
+                              "contention_ratio": r})
+        a, b, r2, _dg_by_s = _fit_measured_delta_gamma(table)
+        self.assertAlmostEqual(a, -0.5, places=1)
+        self.assertAlmostEqual(b, 0.15, places=2)
+        self.assertGreater(r2, 0.95)
+
+    def test_insufficient_seq_lens(self):
+        # Only one seq_len → can't regress Δγ(s)
+        table = [
+            {"concurrency": 2, "seq_len": 100, "contention_ratio": 1.2},
+            {"concurrency": 4, "seq_len": 100, "contention_ratio": 1.4},
+            {"concurrency": 8, "seq_len": 100, "contention_ratio": 1.6},
+        ]
+        _a, b, _r2, _ = _fit_measured_delta_gamma(table)
+        self.assertEqual(b, 0.0)
+
+    def test_c1_entries_filtered(self):
+        table = []
+        for s in [100, 500]:
+            dg = 0.3
+            table.append({"concurrency": 1, "seq_len": s, "contention_ratio": 1.0})
+            for c in [2, 4, 8]:
+                table.append({"concurrency": c, "seq_len": s,
+                              "contention_ratio": c ** dg})
+        _a, b, _r2, _ = _fit_measured_delta_gamma(table)
+        # Δγ is constant at 0.3, so b should be ~0
+        self.assertAlmostEqual(b, 0.0, places=1)
+
+
+class TestExperimentCrossoverC(TestPlanFromExperiments):
+
+    def test_crossover_c_from_experiment(self):
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 100, [100] * 10)
+            + _make_exp11_rows("DISAGG-1D", 1, 100, [200] * 10)
+            + _make_exp11_rows("BASELINE", 2, 100, [250] * 10)
+            + _make_exp11_rows("DISAGG-1D", 2, 100, [450] * 10)
+            + _make_exp11_rows("BASELINE", 4, 100, [500] * 10)
+            + _make_exp11_rows("DISAGG-1D", 4, 100, [900] * 10)
+            + _make_exp11_rows("BASELINE", 1, 500, [500] * 10)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [800] * 10)
+            + _make_exp11_rows("BASELINE", 2, 500, [1200] * 10)
+            + _make_exp11_rows("DISAGG-1D", 2, 500, [1000] * 10)
+            + _make_exp11_rows("BASELINE", 4, 500, [2000] * 10)
+            + _make_exp11_rows("DISAGG-1D", 4, 500, [1500] * 10)
+            + _make_exp11_rows("BASELINE", 8, 500, [3000] * 10)
+            + _make_exp11_rows("DISAGG-1D", 8, 500, [2000] * 10)
+        )
+        d = self._make_data_dir(rows)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct", target_throughput=1.0,
+            target_ttft_ms=99999, gpu_type="t4", seq_len=500, data_dir=d,
+        )
+        self.assertEqual(plan.confidence, "experiment")
+        self.assertGreater(plan.predicted_delta_gamma, 0)
+        self.assertGreater(plan.measured_fit_r2, 0)
+        if plan.overhead_thresholds:
+            has_cross_c = any("predicted_crossover_c" in t
+                             for t in plan.overhead_thresholds)
+            self.assertTrue(has_cross_c)
+
+
+class TestSweepSeqLens(unittest.TestCase):
+
+    def test_returns_entries_for_each_seq_len(self):
+        seq_lens = [100, 500, 1000]
+        result = sweep_seq_lens(
+            "microsoft/Phi-3-mini-4k-instruct", gpu_type="t4",
+            seq_lens=seq_lens)
+        self.assertEqual(len(result["entries"]), 3)
+        self.assertEqual([e["seq_len"] for e in result["entries"]], seq_lens)
+
+    def test_delta_gamma_increases_with_s(self):
+        result = sweep_seq_lens(
+            "microsoft/Phi-3-mini-4k-instruct", gpu_type="t4",
+            seq_lens=[50, 200, 1000])
+        dgs = [e["delta_gamma"] for e in result["entries"]]
+        self.assertLess(dgs[0], dgs[1])
+        self.assertLess(dgs[1], dgs[2])
+
+    def test_c_cross_decreases_with_s(self):
+        result = sweep_seq_lens(
+            "microsoft/Phi-3-mini-4k-instruct", gpu_type="t4",
+            seq_lens=[500, 1000, 2000])
+        entries = [e for e in result["entries"] if e["c_cross"] < 1e6]
+        self.assertGreater(len(entries), 1)
+        for i in range(len(entries) - 1):
+            self.assertGreater(entries[i]["c_cross"], entries[i + 1]["c_cross"])
+
+    def test_s_cross_reported(self):
+        result = sweep_seq_lens(
+            "microsoft/Phi-3-mini-4k-instruct", gpu_type="t4",
+            seq_lens=[50, 500])
+        self.assertGreater(result["s_cross"], 0)
+        self.assertLess(result["s_cross"], 1e6)
+
+    def test_model_and_gpu_in_result(self):
+        result = sweep_seq_lens(
+            "microsoft/Phi-3-mini-4k-instruct", gpu_type="t4",
+            seq_lens=[100])
+        self.assertEqual(result["model"], "microsoft/Phi-3-mini-4k-instruct")
+        self.assertEqual(result["gpu_type"], "t4")
+
+
+class TestWorkloadProfiles(unittest.TestCase):
+
+    def test_predefined_profiles_sum_to_one(self):
+        for name, dist in WORKLOAD_PROFILES.items():
+            total = sum(w for _, w in dist)
+            self.assertAlmostEqual(total, 1.0, places=2,
+                                   msg=f"Profile '{name}' sums to {total}")
+
+    def test_parse_named_profile(self):
+        name, dist = parse_workload("chat")
+        self.assertEqual(name, "chat")
+        self.assertEqual(dist, WORKLOAD_PROFILES["chat"])
+
+    def test_parse_custom_workload(self):
+        name, dist = parse_workload("50:0.3,200:0.5,1000:0.2")
+        self.assertEqual(name, "custom")
+        self.assertEqual(len(dist), 3)
+        self.assertEqual(dist[0][0], 50)
+        self.assertAlmostEqual(sum(w for _, w in dist), 1.0)
+
+    def test_custom_workload_normalizes(self):
+        name, dist = parse_workload("100:1,200:1,300:1")
+        self.assertEqual(name, "custom")
+        for _, w in dist:
+            self.assertAlmostEqual(w, 1 / 3, places=5)
+
+
+class TestEstimatePrefillRate(unittest.TestCase):
+
+    def test_phi3_matches_calibration(self):
+        profile = ModelProfile(model_id="test", num_params=int(3.8e9))
+        rate = _estimate_prefill_rate(profile, "t4")
+        self.assertAlmostEqual(rate, 1.70, places=0)
+
+    def test_scales_with_model_size(self):
+        small = ModelProfile(model_id="s", num_params=int(0.5e9))
+        large = ModelProfile(model_id="l", num_params=int(3.0e9))
+        self.assertGreater(
+            _estimate_prefill_rate(large, "t4"),
+            _estimate_prefill_rate(small, "t4"))
+
+    def test_faster_gpu_lower_rate(self):
+        profile = ModelProfile(model_id="test", num_params=int(3e9))
+        t4_rate = _estimate_prefill_rate(profile, "t4")
+        a100_rate = _estimate_prefill_rate(profile, "a100_80")
+        self.assertGreater(t4_rate, a100_rate)
+
+    def test_fallback_when_no_params(self):
+        profile = ModelProfile(model_id="test", num_params=0)
+        rate = _estimate_prefill_rate(profile, "t4")
+        self.assertGreater(rate, 0)
+
+
+class TestOverheadAsymptoteFallback(unittest.TestCase):
+
+    def test_phi3_uses_measured_rate(self):
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4")
+        self.assertAlmostEqual(plan.overhead_asymptote, 1.77, places=1)
+
+    def test_qwen3b_gets_nonzero_tinf(self):
+        plan = plan_capacity(
+            "Qwen/Qwen2.5-3B-Instruct",
+            target_throughput=1.0, gpu_type="t4")
+        self.assertGreater(plan.overhead_asymptote, 1.0)
+        # GQA model: architecture-aware C_B is very small → |Δγ| < 0.2
+        self.assertAlmostEqual(plan.predicted_delta_gamma, 0, delta=0.2)
+
+    def test_gqa_lower_tinf_than_mha(self):
+        """GQA models (few KV heads) have less NIXL overhead → lower T(∞)."""
+        qwen = plan_capacity(
+            "Qwen/Qwen2.5-3B-Instruct",
+            target_throughput=1.0, gpu_type="t4")
+        phi3 = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4")
+        self.assertLess(qwen.overhead_asymptote, phi3.overhead_asymptote)
+
+    def test_sweep_works_for_non_phi3(self):
+        sweep = sweep_seq_lens("Qwen/Qwen2.5-3B-Instruct", gpu_type="t4",
+                               seq_lens=[100, 500, 1000])
+        self.assertGreater(sweep["t_inf"], 1.0)
+        for e in sweep["entries"]:
+            self.assertNotEqual(e["delta_gamma"], 0)
+
+
+class TestAnalyzeWorkload(unittest.TestCase):
+
+    def test_chat_workload_mono_at_low_c(self):
+        result = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=WORKLOAD_PROFILES["chat"],
+            workload_name="chat", gpu_type="t4")
+        ca_c4 = next(ca for ca in result.concurrency_analysis
+                     if ca["concurrency"] == 4)
+        self.assertEqual(ca_c4["verdict"], "MONO")
+
+    def test_summarization_differs_from_chat(self):
+        chat = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=WORKLOAD_PROFILES["chat"],
+            workload_name="chat", gpu_type="t4")
+        summ = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=WORKLOAD_PROFILES["summarization"],
+            workload_name="summarization", gpu_type="t4")
+        self.assertGreater(summ.frac_above_scross, chat.frac_above_scross)
+
+    def test_weighted_mono_less_than_disagg_at_c1(self):
+        result = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=[(100, 0.5), (1000, 0.5)],
+            gpu_type="t4")
+        self.assertLess(result.weighted_mono_ttft, result.weighted_disagg_ttft)
+
+    def test_all_long_prompts_eventually_disagg(self):
+        result = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=[(2000, 0.5), (4000, 0.5)],
+            workload_name="long", gpu_type="t4")
+        self.assertAlmostEqual(result.frac_above_scross, 1.0)
+        disagg_at_some_c = any(ca["verdict"] == "DISAGG"
+                               for ca in result.concurrency_analysis)
+        self.assertTrue(disagg_at_some_c)
+
+    def test_concurrency_analysis_has_entries(self):
+        result = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=[(100, 1.0)],
+            gpu_type="t4")
+        self.assertGreater(len(result.concurrency_analysis), 0)
+        for ca in result.concurrency_analysis:
+            self.assertIn("concurrency", ca)
+            self.assertIn("mono_ttft_at_c", ca)
+            self.assertIn("disagg_ttft", ca)
+            self.assertIn("verdict", ca)
+
+    def test_ttft_weighted_not_ratio_weighted(self):
+        """Long prompts should dominate the aggregate, not get equal weight."""
+        result = analyze_workload(
+            "microsoft/Phi-3-mini-4k-instruct",
+            workload_dist=[(100, 0.8), (4000, 0.2)],
+            workload_name="mixed", gpu_type="t4")
+        ca_c32 = next(ca for ca in result.concurrency_analysis
+                      if ca["concurrency"] == 32)
+        mono_c1 = result.weighted_mono_ttft
+        mono_c32 = ca_c32["mono_ttft_at_c"]
+        self.assertGreater(mono_c32, mono_c1,
+                           "Contention should raise expected mono TTFT")
+
+
+# ── Unit types ──────────────────────────────────────────────────────────
+
+class TestUnitTypes(unittest.TestCase):
+
+    def test_bytes_per_token_is_int(self):
+        b = BytesPerToken(393216)
+        self.assertIsInstance(b, int)
+        self.assertIsInstance(b, BytesPerToken)
+
+    def test_isinstance_distinguishes_types(self):
+        b = BytesPerToken(100)
+        self.assertIsInstance(b, BytesPerToken)
+        self.assertNotIsInstance(100, BytesPerToken)
+
+    def test_estimate_kv_bytes_returns_typed(self):
+        profile = ModelProfile(model_id="microsoft/Phi-3-mini-4k-instruct")
+        result = _estimate_kv_bytes(profile)
+        self.assertIsInstance(result, BytesPerToken)
+
+    def test_contention_scale_b_rejects_raw_int(self):
+        with self.assertRaises(AssertionError):
+            _contention_scale_b(393216)
+
+    def test_estimate_nixl_ms_rejects_raw_int(self):
+        with self.assertRaises(AssertionError):
+            _estimate_nixl_ms(393216, seq_len=128)
+
+    def test_estimate_overhead_asymptote_rejects_raw_int(self):
+        with self.assertRaises(AssertionError):
+            _estimate_overhead_asymptote(393216, 1.70, "t4")
+
+
+# ── Architecture-aware C_B ─────────────────────────────────────────────
+
+class TestContentionScaleB(unittest.TestCase):
+
+    def test_phi3_matches_ref(self):
+        c_b = _contention_scale_b(CONTENTION_KV_REF)
+        self.assertAlmostEqual(c_b, CONTENTION_SCALE_B_REF, places=6)
+
+    def test_gqa_lower(self):
+        qwen_kv = BytesPerToken(2 * 36 * 2 * 128 * 2)  # Qwen 3B: 36864
+        c_b = _contention_scale_b(qwen_kv)
+        self.assertAlmostEqual(c_b, CONTENTION_SCALE_B_REF * 36864 / 393216,
+                               places=5)
+        self.assertLess(c_b, CONTENTION_SCALE_B_REF / 5)
+
+    def test_proportional(self):
+        c_b_1x = _contention_scale_b(BytesPerToken(100000))
+        c_b_2x = _contention_scale_b(BytesPerToken(200000))
+        self.assertAlmostEqual(c_b_2x / c_b_1x, 2.0, places=5)
+
+
+class TestArchitectureAwarePredictions(unittest.TestCase):
+
+    def test_gqa_higher_s_cross_same_tinf(self):
+        """At same T(∞), smaller C_B (GQA) → higher s_cross."""
+        phi3_kv = CONTENTION_KV_REF
+        qwen_kv = BytesPerToken(36864)
+        t_inf = 1.77
+        s_cross_phi3 = _predict_s_cross(t_inf, phi3_kv)
+        s_cross_qwen = _predict_s_cross(t_inf, qwen_kv)
+        self.assertGreater(s_cross_qwen, s_cross_phi3 * 5)
+
+    def test_gqa_delta_gamma_near_zero(self):
+        """At s=128, GQA model should have Δγ ≈ 0."""
+        qwen_kv = BytesPerToken(36864)
+        dg = _predict_delta_gamma(128, 1.05, qwen_kv)
+        self.assertAlmostEqual(dg, 0, delta=0.05)
+
+    def test_mha_matches_original(self):
+        """Phi-3 predictions unchanged at reference kv_bytes."""
+        dg_new = _predict_delta_gamma(500, 1.77, CONTENTION_KV_REF)
+        dg_default = _predict_delta_gamma(500, 1.77)
+        self.assertAlmostEqual(dg_new, dg_default, places=6)
+
+
+class TestComputeDominance(unittest.TestCase):
+
+    def test_qwen_overhead_bound(self):
+        """Qwen 3B on T4 is overhead-bound (η < 1)."""
+        plan = plan_capacity(
+            "Qwen/Qwen2.5-3B-Instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=500)
+        self.assertGreater(plan.compute_dominance, 0)
+        self.assertLess(plan.compute_dominance, 1.0)
+
+    def test_phi3_compute_bound(self):
+        """Phi-3 on T4 is compute-bound (η > 1) at s=500."""
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=500)
+        self.assertGreater(plan.compute_dominance, 1.0)
+
+    def test_eta_scales_with_seq_len(self):
+        """η increases with sequence length (more compute relative to fixed overhead)."""
+        plan_short = plan_capacity(
+            "Qwen/Qwen2.5-3B-Instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=100)
+        plan_long = plan_capacity(
+            "Qwen/Qwen2.5-3B-Instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=1000)
+        self.assertGreater(plan_long.compute_dominance,
+                           plan_short.compute_dominance)
 
 
 if __name__ == "__main__":

@@ -157,7 +157,7 @@ class TestCompare(unittest.TestCase):
     def test_good_prediction(self):
         predictions = {100: {
             "mono_ttft_ms": 105, "disagg_ttft_ms": 200,
-            "nixl_ms": 50, "sidecar_ms": 12,
+            "nixl_ms": 50,
         }}
         measurements = {
             "exp11": {
@@ -174,7 +174,7 @@ class TestCompare(unittest.TestCase):
     def test_wrong_prediction(self):
         predictions = {100: {
             "mono_ttft_ms": 174, "disagg_ttft_ms": 338,
-            "nixl_ms": 152, "sidecar_ms": 12,
+            "nixl_ms": 152,
         }}
         measurements = {
             "exp11": {
@@ -186,22 +186,26 @@ class TestCompare(unittest.TestCase):
         mono_r = next(r for r in results if r.metric == "mono_ttft")
         self.assertEqual(mono_r.grade, "POOR")
 
-    def test_sidecar_comparison(self):
+
+class TestCompareR(unittest.TestCase):
+
+    def test_r_validation(self):
         predictions = {100: {
-            "mono_ttft_ms": 770, "disagg_ttft_ms": 1022,
-            "nixl_ms": 152, "sidecar_ms": 12,
+            "mono_ttft_ms": 100, "disagg_ttft_ms": 200,
+            "nixl_ms": 50, "predicted_delta_gamma": 0.3,
         }}
         measurements = {
-            "exp11": {},
-            "exp14": {
-                ("B-decode-direct", 100): {"median": 500, "n": 24},
-                ("C-sidecar-only", 100): {"median": 503, "n": 24},
+            "exp11": {
+                ("BASELINE", 1, 100): {"median": 100, "n": 10, "p90": 110},
+                ("DISAGG-1D", 1, 100): {"median": 200, "n": 10, "p90": 220},
+                ("BASELINE", 4, 100): {"median": 300, "n": 10, "p90": 350},
+                ("DISAGG-1D", 4, 100): {"median": 260, "n": 10, "p90": 310},
             },
+            "exp14": {},
         }
         results = compare(predictions, measurements)
-        sidecar_r = next(r for r in results if r.metric == "sidecar_ms")
-        self.assertEqual(sidecar_r.measured, 3.0)
-        self.assertEqual(sidecar_r.predicted, 12)
+        r_results = [r for r in results if r.metric.startswith("R(")]
+        self.assertGreater(len(r_results), 0)
 
 
 if __name__ == "__main__":

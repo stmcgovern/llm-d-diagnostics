@@ -28,9 +28,10 @@ from analyze import get_status, load_csv, safe_float, safe_int, stats  # noqa: E
 
 from plan import (  # noqa: E402
     MEASURED_BASELINES,
-    SCALING_SIDECAR_MS,
     _estimate_kv_bytes,
     _estimate_nixl_ms,
+    _predict_contention_ratio,
+    _predict_delta_gamma,
     fetch_model_profile,
     plan_capacity,
 )
@@ -45,6 +46,8 @@ class ValidationResult:
     measured: float
     error_pct: float
     grade: str
+    unit: str = "ms"
+    caveat: str = ""
 
 
 def _grade(error_pct: float) -> str:
@@ -105,12 +108,14 @@ def get_predictions(model: str, gpu_type: str, seq_lens: list) -> dict:
         kv_bytes = _estimate_kv_bytes(profile)
         nixl_ms = _estimate_nixl_ms(kv_bytes, sl, gpu_type, profile.is_moe)
 
+        overhead_asym = (plan.overhead_asymptote if plan.overhead_asymptote > 0
+                         else 1 + nixl_ms / max(plan.mono_est_ttft_ms, 1))
         preds[sl] = {
             "mono_ttft_ms": plan.mono_est_ttft_ms,
             "disagg_ttft_ms": plan.disagg_est_ttft_ms,
             "confidence": plan.confidence,
             "nixl_ms": nixl_ms,
-            "sidecar_ms": SCALING_SIDECAR_MS,
+            "predicted_delta_gamma": _predict_delta_gamma(sl, overhead_asym, kv_bytes),
         }
     return preds
 
@@ -145,19 +150,8 @@ def compare(predictions: dict, measurements: dict) -> list:
                     f"disagg_ttft({disagg_cfg})", sl, 1,
                     predicted, measured, err, _grade(err)))
 
-        cfg_b = next((k for k in exp14 if k[0].startswith("B-") and k[1] == sl), None)
         cfg_c = next((k for k in exp14 if k[0].startswith("C-") and k[1] == sl), None)
         cfg_d = next((k for k in exp14 if k[0].startswith("D-") and k[1] == sl), None)
-
-        if cfg_c and cfg_b:
-            measured_sidecar = exp14[cfg_c]["median"] - exp14[cfg_b]["median"]
-            predicted_sidecar = pred["sidecar_ms"]
-            err = ((predicted_sidecar - measured_sidecar) / max(abs(measured_sidecar), 1)
-                   * 100)
-            conc = 8
-            results.append(ValidationResult(
-                "sidecar_ms", sl, conc, predicted_sidecar,
-                measured_sidecar, err, _grade(err)))
 
         if cfg_d and cfg_c:
             measured_nixl = exp14[cfg_d]["median"] - exp14[cfg_c]["median"]
@@ -168,6 +162,33 @@ def compare(predictions: dict, measurements: dict) -> list:
             results.append(ValidationResult(
                 "nixl_ms", sl, conc, predicted_nixl,
                 measured_nixl, err, _grade(err)))
+
+        for disagg_cfg in ["DISAGG-1D", "DISAGG-2D"]:
+            for conc in sorted(set(k[1] for k in exp11 if k[1] > 1)):
+                bl_c1 = exp11.get(("BASELINE", 1, sl))
+                dg_c1 = exp11.get((disagg_cfg, 1, sl))
+                bl_cn = exp11.get(("BASELINE", conc, sl))
+                dg_cn = exp11.get((disagg_cfg, conc, sl))
+                if not all([bl_c1, dg_c1, bl_cn, dg_cn]):
+                    continue
+                if bl_c1["median"] <= 0 or dg_c1["median"] <= 0:
+                    continue
+                alpha_mono = bl_cn["median"] / bl_c1["median"]
+                alpha_disagg = dg_cn["median"] / dg_c1["median"]
+                if alpha_disagg <= 0:
+                    continue
+                measured_r = alpha_mono / alpha_disagg
+                predicted_r = _predict_contention_ratio(
+                    pred["predicted_delta_gamma"], conc)
+                err = (predicted_r - measured_r) / measured_r * 100
+                caveat = ""
+                if alpha_mono < 1.0:
+                    caveat = (f"α_mono={alpha_mono:.2f}<1 "
+                              f"(TTFT decreases with load — overhead-bound)")
+                results.append(ValidationResult(
+                    f"R(c={conc},{disagg_cfg})", sl, conc,
+                    predicted_r, measured_r, err, _grade(err),
+                    unit="", caveat=caveat))
 
     return results
 
@@ -188,20 +209,30 @@ def print_report(model: str, gpu_type: str, results: list, measurements: dict):
           f"{'-'*10}-+-{'-'*8}-+-{'-'*5}")
 
     for r in results:
+        if r.unit == "ms":
+            pred_s = f"{r.predicted:>8.0f}ms"
+            meas_s = f"{r.measured:>8.0f}ms"
+        else:
+            pred_s = f"{r.predicted:>9.3f}"
+            meas_s = f"{r.measured:>9.3f}"
+        grade_s = f"{r.grade:>5}" if not r.caveat else f"{r.grade:>4}*"
         print(f"  {r.metric:>25} | {r.seq_len:>5} | {r.concurrency:>2} | "
-              f"{r.predicted:>8.0f}ms | {r.measured:>8.0f}ms | "
-              f"{r.error_pct:>+7.0f}% | {r.grade:>5}")
+              f"{pred_s:>10} | {meas_s:>10} | "
+              f"{r.error_pct:>+7.0f}% | {grade_s}")
     print()
 
-    grades = [r.grade for r in results]
+    valid_results = [r for r in results if not r.caveat]
+    grades = [r.grade for r in valid_results]
     good = grades.count("GOOD")
     fair = grades.count("FAIR")
     poor = grades.count("POOR")
     wrong = grades.count("WRONG")
     total = len(grades)
 
+    n_caveated = len(results) - len(valid_results)
+    caveat_note = f" ({n_caveated} excluded: α<1)" if n_caveated > 0 else ""
     print(f"  Summary: {good}/{total} GOOD, {fair}/{total} FAIR, "
-          f"{poor}/{total} POOR, {wrong}/{total} WRONG")
+          f"{poor}/{total} POOR, {wrong}/{total} WRONG{caveat_note}")
 
     if wrong > total * 0.3:
         print("  VERDICT: Advisor predictions are UNRELIABLE for this model/GPU.")
@@ -246,6 +277,45 @@ def print_report(model: str, gpu_type: str, results: list, measurements: dict):
     else:
         print("  No crossover detected: mono wins at all measured conditions.")
     print()
+
+    sparse = []
+    for key, st in sorted(exp11.items()):
+        cfg, conc, sl = key
+        if st["n"] < 10:
+            sparse.append((sl, conc, cfg, st["n"]))
+    if sparse:
+        print("  DATA QUALITY WARNING — sparse samples (n < 10):")
+        for sl, conc, cfg, n in sparse:
+            print(f"    s={sl}, c={conc}, {cfg}: n={n}")
+        print("  Median from <10 samples is unreliable. "
+              "Grades at these points should be discounted.")
+        print()
+
+    caveated = [r for r in results if r.caveat]
+    if caveated:
+        print("  VALIDITY WARNING — α(c) < 1 detected:")
+        print("  The contention model assumes TTFT increases with concurrency")
+        print("  (α(c) = TTFT(c)/TTFT(1) > 1). When α < 1, the system is")
+        print("  overhead-bound and R = α_mono/α_disagg is not meaningful.")
+        seen = set()
+        for r in caveated:
+            key = (r.seq_len, r.concurrency)
+            if key not in seen:
+                seen.add(key)
+                print(f"    s={r.seq_len}, c={r.concurrency}: {r.caveat}")
+        print(f"  {len(caveated)} R values marked * — grades disregarded in summary.")
+        print()
+
+    cal_seq_lens = sorted(set(k[2] for k in exp11 if k[1] == 1))
+    if cal_seq_lens:
+        cal_max = cal_seq_lens[-1]
+        extrap = [r for r in results if r.seq_len > cal_max * 0.8
+                  and r.metric.startswith(("mono_", "disagg_"))]
+        if extrap:
+            print(f"  VALIDITY NOTE: Calibration data extends to s={cal_max}.")
+            print("  Prefill time is superlinear in seq_len (attention O(s*d)).")
+            print("  TTFT predictions degrade outside the calibration range.")
+            print()
 
     print(f"{'='*70}")
 
