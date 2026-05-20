@@ -54,6 +54,11 @@ MODEL_CACHE_SIZE="${MODEL_CACHE_SIZE:-50Gi}"
 # NIXL side channel port (upstream default: 5557)
 NIXL_PORT="${NIXL_PORT:-5557}"
 
+# Resource requests (can be overridden in env.sh for MIG / constrained clusters)
+GPU_RESOURCE="${GPU_RESOURCE:-nvidia.com/gpu}"
+POD_CPU="${POD_CPU:-4}"
+POD_MEMORY="${POD_MEMORY:-16Gi}"
+
 # Validate image names (prevent injection via env.sh)
 for var in VLLM_IMAGE SIDECAR_IMAGE; do
     val="${!var}"
@@ -70,6 +75,9 @@ echo "Topology:    ${PREFILL_REPLICAS}P + ${DECODE_REPLICAS}D"
 echo "vLLM image:  $VLLM_IMAGE"
 echo "Sidecar:     $SIDECAR_IMAGE"
 echo "PVC size:    $MODEL_CACHE_SIZE"
+echo "GPU:         $GPU_RESOURCE"
+echo "Pod CPU:     $POD_CPU"
+echo "Pod Memory:  $POD_MEMORY"
 echo ""
 
 # Create namespace if it doesn't exist
@@ -214,13 +222,13 @@ spec:
           protocol: TCP
         resources:
           requests:
-            cpu: "4"
-            memory: 16Gi
-            nvidia.com/gpu: "1"
+            cpu: "$POD_CPU"
+            memory: $POD_MEMORY
+            $GPU_RESOURCE: "1"
           limits:
-            cpu: "4"
-            memory: 16Gi
-            nvidia.com/gpu: "1"
+            cpu: "$POD_CPU"
+            memory: $POD_MEMORY
+            $GPU_RESOURCE: "1"
         startupProbe:
           httpGet:
             path: /health
@@ -432,13 +440,13 @@ spec:
           protocol: TCP
         resources:
           requests:
-            cpu: "4"
-            memory: 16Gi
-            nvidia.com/gpu: "1"
+            cpu: "$POD_CPU"
+            memory: $POD_MEMORY
+            $GPU_RESOURCE: "1"
           limits:
-            cpu: "4"
-            memory: 16Gi
-            nvidia.com/gpu: "1"
+            cpu: "$POD_CPU"
+            memory: $POD_MEMORY
+            $GPU_RESOURCE: "1"
         startupProbe:
           httpGet:
             path: /health
