@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from calibrate import extract_baselines, save_baselines
+
 from plan import (
     CONTENTION_KV_REF,
     CONTENTION_SCALE_A,
@@ -31,6 +33,7 @@ from plan import (
     _find_nearest_baselines,
     _fit_measured_delta_gamma,
     _generate_recommendation,
+    _load_file_baselines,
     _predict_contention_ratio,
     _predict_crossover_c,
     _predict_delta_gamma,
@@ -42,6 +45,7 @@ from plan import (
     save_plan,
     sweep_seq_lens,
 )
+from schemas import Exp11Row, Exp14Row, fields_for
 
 
 class TestPlanCapacityMeasured(unittest.TestCase):
@@ -763,11 +767,7 @@ class TestConfidenceLabels(unittest.TestCase):
 
 # ── Experiment-aware planning ──────────────────────────────────────────
 
-EXP11_FIELDS = [
-    "experiment", "config", "prompt_tokens_target", "max_tokens",
-    "concurrency", "run", "ttft_ms", "total_ms", "status_code",
-    "prompt_tokens_actual", "completion_tokens", "target", "error",
-]
+EXP11_FIELDS = fields_for(Exp11Row)
 
 
 def _write_csv(path, fieldnames, rows):
@@ -787,6 +787,20 @@ def _make_exp11_rows(config, concurrency, prompt_tokens, ttft_values):
             "ttft_ms": ttft, "total_ms": ttft + 5,
             "status_code": 200, "prompt_tokens_actual": prompt_tokens + 10,
             "completion_tokens": 20, "target": "d1", "error": "",
+        })
+    return rows
+
+
+def _make_exp14_rows(config, concurrency, prompt_tokens, ttft_values):
+    rows = []
+    for i, ttft in enumerate(ttft_values):
+        rows.append({
+            "experiment": "exp14", "config": config,
+            "pod": "p0", "prompt_tokens_target": prompt_tokens,
+            "concurrency": concurrency, "run": i + 1,
+            "ttft_ms": ttft, "total_ms": ttft + 5,
+            "status_code": 200, "prompt_tokens_actual": prompt_tokens + 10,
+            "completion_tokens": 20, "error": "",
         })
     return rows
 
@@ -2042,6 +2056,260 @@ class TestComputeDominance(unittest.TestCase):
             target_throughput=1.0, gpu_type="t4", seq_len=1000)
         self.assertGreater(plan_long.compute_dominance,
                            plan_short.compute_dominance)
+
+
+class TestFileBaselines(unittest.TestCase):
+    """Test _load_file_baselines and plan_capacity integration."""
+
+    def _make_baselines_dir(self, model, gpu_type, baselines):
+        d = tempfile.mkdtemp()
+        data = {"model": model, "gpu_type": gpu_type, "baselines": baselines}
+        with open(os.path.join(d, "baselines.json"), "w") as f:
+            json.dump(data, f)
+        return d
+
+    def _minimal_baselines(self):
+        return {
+            "params_b": 3.8, "is_moe": False,
+            "mono_ttft_ms": 850, "disagg_ttft_ms": 1050,
+            "mono_throughput": 1.4, "disagg_throughput": 1.3,
+            "overhead_ms": 200, "overhead_pct": 23.5,
+        }
+
+    def test_loads_matching_baselines(self):
+        bl = self._minimal_baselines()
+        d = self._make_baselines_dir("test/model", "t4", bl)
+        result = _load_file_baselines(d, "test/model", "t4")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["mono_ttft_ms"], 850)
+
+    def test_model_mismatch_returns_none(self):
+        bl = self._minimal_baselines()
+        d = self._make_baselines_dir("test/model", "t4", bl)
+        result = _load_file_baselines(d, "other/model", "t4")
+        self.assertIsNone(result)
+
+    def test_gpu_mismatch_returns_none(self):
+        bl = self._minimal_baselines()
+        d = self._make_baselines_dir("test/model", "t4", bl)
+        result = _load_file_baselines(d, "test/model", "a100_80")
+        self.assertIsNone(result)
+
+    def test_missing_file_returns_none(self):
+        d = tempfile.mkdtemp()
+        result = _load_file_baselines(d, "test/model", "t4")
+        self.assertIsNone(result)
+
+    def test_malformed_json_returns_none(self):
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "baselines.json"), "w") as f:
+            f.write("{bad json")
+        result = _load_file_baselines(d, "test/model", "t4")
+        self.assertIsNone(result)
+
+    def test_missing_required_fields_returns_none(self):
+        d = self._make_baselines_dir("test/model", "t4", {"overhead_ms": 10})
+        result = _load_file_baselines(d, "test/model", "t4")
+        self.assertIsNone(result)
+
+    def test_plan_capacity_uses_file_baselines(self):
+        bl = self._minimal_baselines()
+        d = self._make_baselines_dir(
+            "microsoft/Phi-3-mini-4k-instruct", "t4", bl)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4", data_dir=d)
+        self.assertEqual(plan.confidence, "measured")
+        self.assertAlmostEqual(plan.mono_est_ttft_ms, 850, delta=100)
+
+    def test_file_baselines_override_hardcoded(self):
+        bl = self._minimal_baselines()
+        bl["mono_ttft_ms"] = 9999
+        d = self._make_baselines_dir(
+            "microsoft/Phi-3-mini-4k-instruct", "t4", bl)
+        plan = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4", data_dir=d)
+        self.assertEqual(plan.confidence, "measured")
+        self.assertGreater(plan.mono_est_ttft_ms, 5000)
+
+    def test_no_rate_fields_uses_estimated_rate(self):
+        bl = self._minimal_baselines()
+        d = self._make_baselines_dir(
+            "microsoft/Phi-3-mini-4k-instruct", "t4", bl)
+        plan_s100 = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=100, data_dir=d)
+        plan_s500 = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=500, data_dir=d)
+        self.assertGreater(plan_s500.mono_est_ttft_ms,
+                           plan_s100.mono_est_ttft_ms)
+
+    def test_with_rate_fields_uses_explicit_rate(self):
+        bl_no_rate = self._minimal_baselines()
+        d_no = self._make_baselines_dir(
+            "microsoft/Phi-3-mini-4k-instruct", "t4", bl_no_rate)
+        bl_rate = self._minimal_baselines()
+        bl_rate["mono_ttft_base_ms"] = 500.0
+        bl_rate["mono_ttft_rate"] = 3.0
+        bl_rate["ref_seq_len"] = 100
+        d_rate = self._make_baselines_dir(
+            "microsoft/Phi-3-mini-4k-instruct", "t4", bl_rate)
+        plan_no = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=1000, data_dir=d_no)
+        plan_rate = plan_capacity(
+            "microsoft/Phi-3-mini-4k-instruct",
+            target_throughput=1.0, gpu_type="t4", seq_len=1000, data_dir=d_rate)
+        self.assertGreater(plan_rate.mono_est_ttft_ms,
+                           plan_no.mono_est_ttft_ms)
+
+    def test_none_data_dir_returns_none(self):
+        result = _load_file_baselines(None, "test/model", "t4")
+        self.assertIsNone(result)
+
+
+class TestCalibrate(unittest.TestCase):
+    """Test calibrate.extract_baselines()."""
+
+    def _make_calibration_dir(self, exp11_rows, model="test/model-3b",
+                              gpu_type="t4", exp14_rows=None):
+        d = tempfile.mkdtemp()
+        info = {"toolkit": {"model": model, "gpu_type": gpu_type}}
+        with open(os.path.join(d, "run-info.json"), "w") as f:
+            json.dump(info, f)
+        _write_csv(os.path.join(d, "exp11-results.csv"),
+                   EXP11_FIELDS, exp11_rows)
+        if exp14_rows:
+            _write_csv(os.path.join(d, "exp14-results.csv"),
+                       fields_for(Exp14Row), exp14_rows)
+        return d
+
+    def test_extract_single_seq_len(self):
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 100, [800] * 5)
+            + _make_exp11_rows("DISAGG-1D", 1, 100, [1000] * 5)
+        )
+        d = self._make_calibration_dir(rows)
+        result = extract_baselines(d, "t4")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["baselines"]["mono_ttft_ms"], 800)
+        self.assertEqual(result["baselines"]["disagg_ttft_ms"], 1000)
+        self.assertNotIn("mono_ttft_rate", result["baselines"])
+
+    def test_extract_multiple_seq_lens_fits_rate(self):
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 100, [500] * 5)
+            + _make_exp11_rows("BASELINE", 1, 500, [900] * 5)
+            + _make_exp11_rows("BASELINE", 1, 1000, [1400] * 5)
+            + _make_exp11_rows("DISAGG-1D", 1, 100, [600] * 5)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1100] * 5)
+            + _make_exp11_rows("DISAGG-1D", 1, 1000, [1700] * 5)
+        )
+        d = self._make_calibration_dir(rows)
+        result = extract_baselines(d, "t4")
+        self.assertIsNotNone(result)
+        self.assertIn("mono_ttft_rate", result["baselines"])
+        self.assertGreater(result["baselines"]["mono_ttft_rate"], 0)
+
+    def test_missing_run_info_returns_none(self):
+        d = tempfile.mkdtemp()
+        rows = _make_exp11_rows("BASELINE", 1, 100, [800] * 5)
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+        result = extract_baselines(d, "t4")
+        self.assertIsNone(result)
+
+    def test_missing_csv_returns_none(self):
+        d = tempfile.mkdtemp()
+        info = {"toolkit": {"model": "test/model", "gpu_type": "t4"}}
+        with open(os.path.join(d, "run-info.json"), "w") as f:
+            json.dump(info, f)
+        result = extract_baselines(d, "t4")
+        self.assertIsNone(result)
+
+    def test_insufficient_samples_returns_none(self):
+        rows = _make_exp11_rows("BASELINE", 1, 100, [800] * 2)
+        d = self._make_calibration_dir(rows)
+        result = extract_baselines(d, "t4")
+        self.assertIsNone(result)
+
+    def test_save_baselines_writes_json(self):
+        d = tempfile.mkdtemp()
+        bl = {"model": "test/m", "gpu_type": "t4", "baselines": {"mono_ttft_ms": 100}}
+        path = save_baselines(d, bl)
+        self.assertTrue(os.path.exists(path))
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(data["model"], "test/m")
+        self.assertIn("calibrated_at", data)
+
+    def test_exp14_nixl_extraction(self):
+        exp11_rows = (
+            _make_exp11_rows("BASELINE", 1, 100, [800] * 5)
+            + _make_exp11_rows("DISAGG-1D", 1, 100, [1000] * 5)
+        )
+        exp14_rows = (
+            _make_exp14_rows("C-sidecar", 8, 100, [300] * 5)
+            + _make_exp14_rows("D-disagg", 8, 100, [320] * 5)
+        )
+        d = self._make_calibration_dir(exp11_rows, exp14_rows=exp14_rows)
+        result = extract_baselines(d, "t4")
+        self.assertIsNotNone(result)
+        self.assertIn("nixl_ms", result["baselines"])
+        self.assertEqual(result["baselines"]["nixl_ms"], 20)
+
+    def test_throughput_computed(self):
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 100, [800] * 5)
+            + _make_exp11_rows("DISAGG-1D", 1, 100, [1000] * 5)
+        )
+        d = self._make_calibration_dir(rows)
+        result = extract_baselines(d, "t4")
+        self.assertIsNotNone(result)
+        self.assertGreater(result["baselines"]["mono_throughput"], 0)
+        self.assertGreater(result["baselines"]["disagg_throughput"], 0)
+
+
+class TestCalibrateRoundTrip(unittest.TestCase):
+    """End-to-end: exp CSV → calibrate → save → load → plan_capacity."""
+
+    def test_full_pipeline(self):
+        d = tempfile.mkdtemp()
+        model = "microsoft/Phi-3-mini-4k-instruct"
+        gpu = "t4"
+
+        info = {"toolkit": {"model": model, "gpu_type": gpu}}
+        with open(os.path.join(d, "run-info.json"), "w") as f:
+            json.dump(info, f)
+
+        rows = (
+            _make_exp11_rows("BASELINE", 1, 100, [500] * 5)
+            + _make_exp11_rows("BASELINE", 1, 500, [900] * 5)
+            + _make_exp11_rows("DISAGG-1D", 1, 100, [600] * 5)
+            + _make_exp11_rows("DISAGG-1D", 1, 500, [1100] * 5)
+        )
+        _write_csv(os.path.join(d, "exp11-results.csv"), EXP11_FIELDS, rows)
+
+        result = extract_baselines(d, gpu)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["baselines"]["mono_ttft_ms"], 500)
+        self.assertEqual(result["baselines"]["disagg_ttft_ms"], 600)
+
+        save_baselines(d, result)
+        self.assertTrue(os.path.exists(os.path.join(d, "baselines.json")))
+
+        os.remove(os.path.join(d, "exp11-results.csv"))
+
+        loaded = _load_file_baselines(d, model, gpu)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["mono_ttft_ms"],
+                         result["baselines"]["mono_ttft_ms"])
+
+        plan = plan_capacity(model, target_throughput=1.0, gpu_type=gpu,
+                             data_dir=d)
+        self.assertEqual(plan.confidence, "measured")
+        self.assertAlmostEqual(plan.mono_est_ttft_ms, 528, delta=100)
 
 
 if __name__ == "__main__":
